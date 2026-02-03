@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "label": "sklearn-flask-cpu",
+  "message": "passing",
+  "color": "brightgreen",
+  "namedLogo": "amazon-aws",
+  "logoColor": "white"
+}

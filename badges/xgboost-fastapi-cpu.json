@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "label": "xgboost-fastapi-cpu",
+  "message": "passing",
+  "color": "brightgreen",
+  "namedLogo": "amazon-aws",
+  "logoColor": "white"
+}
