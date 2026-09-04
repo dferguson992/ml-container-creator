@@ -313,6 +313,10 @@ _run_athena_recommendations() {
     local instance_type="${DEPLOYED_INSTANCE_TYPE:-${INSTANCE_TYPE:-}}"
     local quantization="${IC_ENV_VLLM_QUANTIZATION:-${IC_ENV_QUANTIZATION:-bf16}}"
     local tp="${IC_ENV_VLLM_TENSOR_PARALLEL_SIZE:-1}"
+    # BL046: This 4096 is a runtime shell fallback only, retained intentionally.
+    # The authoritative default now lives in the exported IC_ENV_VLLM_MAX_MODEL_LEN
+    # from the rendered do/config (sizer-computed when available); this fires only
+    # when the variable is genuinely unset in the environment.
     local max_len="${IC_ENV_VLLM_MAX_MODEL_LEN:-4096}"
     local kv_dtype="${IC_ENV_VLLM_KV_CACHE_DTYPE:-auto}"
 

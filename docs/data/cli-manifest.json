@@ -1,7 +1,13 @@
 {
-  "generatedAt": "2026-07-24T21:34:14.948Z",
-  "version": "1.4.0",
-  "cliOptions": [],
+  "generatedAt": "2026-09-04T14:26:03.533Z",
+  "version": "1.5.2",
+  "cliOptions": [
+    {
+      "flag": "--backend",
+      "argName": "config",
+      "description": "Deployment configuration: architecture+engine pair (e.g. transformers-vllm, diffusors-vllm-omni, http-flask). Alias for --deployment-config."
+    }
+  ],
   "deploymentConfigs": [
     {
       "id": "transformers-vllm",
@@ -1045,8 +1051,8 @@
   },
   "deploymentTargets": [
     {
-      "id": "managed-inference",
-      "label": "Managed Inference (Real-Time)"
+      "id": "realtime-inference",
+      "label": "Real-Time Inference"
     },
     {
       "id": "async-inference",
@@ -1142,6 +1148,10 @@
   ],
   "adapterCommands": [
     {
+      "name": "list",
+      "flags": []
+    },
+    {
       "name": "add",
       "flags": [
         {
@@ -1165,10 +1175,6 @@
           "argName": null
         }
       ]
-    },
-    {
-      "name": "list",
-      "flags": []
     },
     {
       "name": "remove",

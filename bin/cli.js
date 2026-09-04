@@ -44,6 +44,20 @@ for (const opt of cliOptions) {
     program.addOption(option);
 }
 
+// BL084: --backend is a hand-added alias for --deployment-config.
+// It is NOT in parameter-schema-v2.json / cli-options.js because codegen-cli.js
+// has no alias concept. Reuse the SAME choices as --deployment-config to prevent drift.
+// NOTE: registered via the inline addOption(new Option(...)) form (see line below)
+// so scripts/sync-command-generator.js (which regex-extracts that exact pattern
+// from this file) auto-detects it for the docs command manifest (BL083).
+const deploymentConfigOpt = cliOptions.find(o => o.flag.startsWith('--deployment-config'));
+program.addOption(new Option('--backend <config>', 'Deployment configuration: architecture+engine pair (e.g. transformers-vllm, diffusors-vllm-omni, http-flask). Alias for --deployment-config.'));
+// Apply the shared choices enum to the just-added option (sourced from cliOptions to prevent drift).
+if (deploymentConfigOpt?.choices) {
+    const backendOpt = program.options.find(o => o.long === '--backend');
+    if (backendOpt) backendOpt.choices(deploymentConfigOpt.choices);
+}
+
 program.action((projectNameArgs, options) => {
     // Mutual exclusion validation: plaintext token and ARN flags cannot both be provided
     if (options.hfToken && options.hfTokenArn) {
@@ -55,6 +69,16 @@ program.action((projectNameArgs, options) => {
         process.exit(1);
     }
 
+    // BL084: resolve the --backend alias into deploymentConfig before the
+    // explicit-options filter runs, mirroring the hf-token mutual-exclusion pattern.
+    if (options.backend && options.deploymentConfig && options.backend !== options.deploymentConfig) {
+        console.error('❌ --backend and --deployment-config cannot both be specified with different values');
+        process.exit(1);
+    }
+    if (options.backend && !options.deploymentConfig) {
+        options.deploymentConfig = options.backend;
+    }
+
     // Strip Commander default values from options so they don't override
     // environment variables in the config precedence chain.
     // Only pass options that were explicitly provided on the command line.
@@ -63,6 +87,15 @@ program.action((projectNameArgs, options) => {
         if (program.getOptionValueSource(key) !== 'default') {
             explicitOptions[key] = value;
         }
+    }
+
+    // BL084: ensure the resolved deploymentConfig survives the default-stripping
+    // filter. When --backend was used, deploymentConfig was set programmatically
+    // (source is not 'cli'), so include it explicitly. Also drop the raw alias key
+    // so it is not mistaken for the derived architecture engine (answers.backend).
+    if (options.backend && options.deploymentConfig) {
+        explicitOptions.deploymentConfig = options.deploymentConfig;
+        delete explicitOptions.backend;
     }
 
     return run(projectNameArgs?.[0] || null, explicitOptions);
@@ -116,7 +149,9 @@ program.configureHelp({
 
         for (const opt of allOptions) {
             const long = opt.long || '';
-            const section = helpGroups[long] || 'general';
+            // BL084: --backend is hand-added and absent from the generated helpGroups.
+            // Group it with --deployment-config (the 'model' group) since it is an alias.
+            const section = (long === '--backend') ? 'model' : (helpGroups[long] || 'general');
             if (groups[section]) {
                 groups[section].push(opt);
             } else {
@@ -228,40 +263,6 @@ program
             }
         };
         const handler = new McpCommandHandler(generatorAdapter);
-        await handler.handle([action, ...args], options);
-    });
-
-program
-    .command('registry')
-    .description('Registry operations (list, get, remove, replay, export, import, search, log)')
-    .argument('<action>', 'Registry action (log, list, get, remove, replay, export, import, search)')
-    .argument('[args...]', 'Additional arguments')
-    .option('--backend <backend>', 'Filter by backend')
-    .option('--architecture <arch>', 'Filter by architecture')
-    .option('--model <model>', 'Filter by model name')
-    .option('--instance-type <type>', 'Filter by instance type')
-    .option('--status <status>', 'Filter by status')
-    .option('--merge', 'Merge on import')
-    .option('--replace', 'Replace on import')
-    // Options used by `registry log` (called from do/register)
-    .option('--deployment-config <config>', 'Deployment configuration')
-    .option('--region <region>', 'AWS region')
-    .option('--deployment-target <target>', 'Deployment target')
-    .option('--build-target <target>', 'Build target')
-    .option('--model-name <name>', 'Model name')
-    .option('--model-format <format>', 'Model format')
-    .option('--base-image <image>', 'Base container image')
-    .option('--notes <text>', 'Deployment notes')
-    .option('--project', 'Use project-level registry')
-    .option('--parameters <json>', 'Parameters JSON string')
-    .option('--ic-list <json>', 'IC list JSON string')
-    .option('--generator-version <version>', 'Generator version')
-    // Options used by `registry list-architectures`
-    .option('--server <name>', 'Filter by server name (for list-architectures)')
-    .option('--verbose', 'Show full list of supported model types (for list-architectures)')
-    .action(async (action, args, options) => {
-        const { default: RegistryCommandHandler } = await import('../src/lib/registry-command-handler.js');
-        const handler = new RegistryCommandHandler();
         await handler.handle([action, ...args], options);
     });
 
