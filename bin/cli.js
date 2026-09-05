@@ -4,6 +4,7 @@
 
 import { createRequire } from 'module';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
 import { program, Option, Help } from 'commander';
@@ -284,15 +285,224 @@ program
         await handler.handle(allArgs, options);
     });
 
+// ─── BL079: `mcc hey init` — advisory agent environment provisioning ──────────
+
+const HEY_VENV_REL = '.mlcc/hey-venv';
+
+/**
+ * Detect whether the `uv` tool is available on PATH.
+ * @returns {boolean}
+ */
+function _hasUv() {
+    try {
+        execSync('uv --version', { stdio: 'ignore' });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Resolve the absolute path to src/agent/requirements-agent.txt relative to the
+ * MLCC package root (NOT the project cwd), per Requirement 1.2.
+ * @returns {string}
+ */
+function _requirementsAgentPath() {
+    return path.join(__dirname, '..', 'src', 'agent', 'requirements-agent.txt');
+}
+
+/**
+ * Compute the venv Python interpreter path for a given venv directory,
+ * accounting for platform layout differences.
+ * @param {string} venvDir Absolute path to the venv directory.
+ * @returns {string}
+ */
+function _venvPython(venvDir) {
+    return process.platform === 'win32'
+        ? path.join(venvDir, 'Scripts', 'python.exe')
+        : path.join(venvDir, 'bin', 'python3');
+}
+
+/**
+ * Merge `venv_path` into .mlcc/agent-config.json, creating the file/dir if absent.
+ * @param {string} projectDir Absolute project directory.
+ * @param {string} venvPathValue Relative venv path to persist.
+ */
+function _writeVenvPathToConfig(projectDir, venvPathValue) {
+    const mlccDir = path.join(projectDir, '.mlcc');
+    const configPath = path.join(mlccDir, 'agent-config.json');
+    fs.mkdirSync(mlccDir, { recursive: true });
+
+    let config = {};
+    if (fs.existsSync(configPath)) {
+        try {
+            config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+            if (config === null || typeof config !== 'object' || Array.isArray(config)) {
+                config = {};
+            }
+        } catch {
+            // Malformed existing config — start fresh rather than crash.
+            config = {};
+        }
+    }
+
+    config.venv_path = venvPathValue;
+    fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)  }\n`, 'utf8');
+}
+
+/**
+ * Read `venv_path` from .mlcc/agent-config.json, if present.
+ * @param {string} projectDir Absolute project directory.
+ * @returns {string|null}
+ */
+function _readVenvPath(projectDir) {
+    const configPath = path.join(projectDir, '.mlcc', 'agent-config.json');
+    if (!fs.existsSync(configPath)) return null;
+    try {
+        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        const value = config && config.venv_path;
+        return typeof value === 'string' && value ? value : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Resolve which Python interpreter `mcc hey` should spawn (Requirement 2).
+ * Prefers the dedicated hey-venv when `venv_path` is set and exists; otherwise
+ * warns (when configured-but-missing) and falls back to system python3.
+ * @param {string} projectDir Absolute project directory.
+ * @returns {string} Path/name of the Python interpreter to use.
+ */
+function _resolveHeyPython(projectDir) {
+    const venvPathRel = _readVenvPath(projectDir);
+    if (!venvPathRel) {
+        return 'python3';
+    }
+
+    const venvDir = path.isAbsolute(venvPathRel)
+        ? venvPathRel
+        : path.join(projectDir, venvPathRel);
+    const venvPython = _venvPython(venvDir);
+
+    if (fs.existsSync(venvPython)) {
+        return venvPython;
+    }
+
+    console.warn(`⚠️  Venv not found at ${venvPathRel}. Run: mcc hey init`);
+    return 'python3';
+}
+
+/**
+ * Count the number of package requirements declared in requirements-agent.txt
+ * (non-empty, non-comment lines).
+ * @param {string} requirementsPath
+ * @returns {string[]} List of package base names.
+ */
+function _parseRequirementNames(requirementsPath) {
+    const raw = fs.readFileSync(requirementsPath, 'utf8');
+    return raw
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => l && !l.startsWith('#'))
+        .map(l => l.split(/[<>=!~ ]/)[0].trim())
+        .filter(Boolean);
+}
+
+/**
+ * BL079 Requirement 1: provision (or upgrade) the dedicated advisory-agent venv
+ * at .mlcc/hey-venv, install the agent requirements, persist `venv_path`, and
+ * print a success summary.
+ *
+ * Environment creation / package installation are delegated to `execSync` so
+ * unit tests can mock them.
+ *
+ * @param {string} projectDir Absolute (or cwd-relative) project directory.
+ * @param {object} [deps] Injectable dependencies for testing.
+ * @param {(cmd: string, opts?: object) => void} [deps.exec] Command executor.
+ * @param {() => boolean} [deps.hasUv] uv-availability detector.
+ * @param {typeof fs} [deps.fsImpl] filesystem implementation.
+ */
+function _initHeyEnvironment(projectDir, deps = {}) {
+    const exec = deps.exec || ((cmd) => execSync(cmd, { stdio: 'inherit' }));
+    const hasUv = deps.hasUv || _hasUv;
+    const fsImpl = deps.fsImpl || fs;
+
+    const resolvedProjectDir = path.resolve(projectDir);
+    const venvDir = path.join(resolvedProjectDir, HEY_VENV_REL);
+    const venvPython = _venvPython(venvDir);
+    const requirementsPath = _requirementsAgentPath();
+
+    if (!fsImpl.existsSync(requirementsPath)) {
+        console.error(`❌ requirements-agent.txt not found at ${requirementsPath}`);
+        process.exit(1);
+    }
+
+    const isUpgrade = fsImpl.existsSync(venvPython);
+    const useUv = hasUv();
+
+    // 1. Create the venv (idempotent — safe to re-run on an existing venv).
+    if (!isUpgrade) {
+        if (useUv) {
+            exec(`uv venv ${JSON.stringify(venvDir)}`);
+        } else {
+            exec(`python3 -m venv ${JSON.stringify(venvDir)}`);
+        }
+    }
+
+    // 2. Install (or upgrade) the agent requirements.
+    const upgradeFlag = isUpgrade ? ' -U' : '';
+    if (useUv) {
+        exec(`uv pip install${upgradeFlag} -r ${JSON.stringify(requirementsPath)} --python ${JSON.stringify(venvPython)}`);
+    } else {
+        const pipBin = process.platform === 'win32'
+            ? path.join(venvDir, 'Scripts', 'pip.exe')
+            : path.join(venvDir, 'bin', 'pip');
+        exec(`${JSON.stringify(pipBin)} install${upgradeFlag} -r ${JSON.stringify(requirementsPath)}`);
+    }
+
+    // 3. Persist venv_path into .mlcc/agent-config.json (create/merge).
+    _writeVenvPathToConfig(resolvedProjectDir, HEY_VENV_REL);
+
+    // 4. Print the success summary.
+    let names = [];
+    try {
+        names = _parseRequirementNames(requirementsPath);
+    } catch {
+        names = [];
+    }
+    const highlighted = ['strands-agents', 'sagemaker', 'huggingface_hub', 'boto3'];
+    const others = Math.max(names.length - highlighted.length, 0);
+    const verb = isUpgrade ? 'updated' : 'ready';
+    console.log(`✅ mcc hey environment ${verb}`);
+    console.log(`   Venv: ${HEY_VENV_REL}/`);
+    console.log(`   Packages: ${highlighted.join(', ')} (and ${others} others)`);
+    console.log('   Run: mcc hey --goal "..."');
+}
+
 program
     .command('hey')
     .description('Chat with the ml-container-creator advisor')
+    .argument('[subcommand]', 'Optional subcommand: "init" to provision the advisory agent venv')
     .option('--project-dir <dir>', 'Project directory to analyze', process.cwd())
     .option('-o, --offline', 'Static reference mode (no Bedrock calls)')
     .option('--goal <goal>', 'Plan and execute toward a specific goal')
+    .option('--from-plan [file]', 'Execute a saved plan.json without re-planning (defaults to ./plan.json)')
     .option('--auto', 'Fully autonomous goal execution (no confirmation prompts)')
     .option('--dry-run', 'Preview the plan without executing anything')
-    .action(async (options) => {
+    .action(async (subcommand, options) => {
+        // BL079: `mcc hey init` provisions the dedicated advisory-agent venv.
+        if (subcommand === 'init') {
+            _initHeyEnvironment(options.projectDir);
+            return;
+        }
+
+        // BL080: --from-plan and --goal are mutually exclusive.
+        if (options.fromPlan && options.goal) {
+            console.error('❌ --from-plan and --goal are mutually exclusive');
+            process.exit(1);
+        }
+
         // 1. Check python3 is available
         try {
             execSync('python3 --version', { stdio: 'ignore' });
@@ -303,21 +513,25 @@ program
             process.exit(1);
         }
 
-        // 2. If not offline, check strands-agents is installed
+        // 2. Resolve the Python interpreter — prefer the dedicated hey-venv (BL079).
+        const pythonBin = _resolveHeyPython(options.projectDir);
+
+        // 3. If not offline, check strands-agents is installed in the chosen interpreter
         if (!options.offline) {
             try {
-                execSync('python3 -c "import strands"', { stdio: 'ignore' });
+                execSync(`${JSON.stringify(pythonBin)} -c "import strands"`, { stdio: 'ignore' });
             } catch {
                 console.error('❌ strands-agents not installed. Run:');
-                console.error('   pip install -r src/agent/requirements-agent.txt');
+                console.error('   mcc hey init');
+                console.error('   (or: pip install -r src/agent/requirements-agent.txt)');
                 process.exit(1);
             }
         }
 
-        // 3. Resolve agent script path
+        // 4. Resolve agent script path
         const agentScript = path.join(__dirname, '..', 'src', 'agent', 'agent.py');
 
-        // 4. Build args and spawn
+        // 5. Build args and spawn
         const args = [agentScript, '--project-dir', options.projectDir];
         if (options.offline) {
             args.push('--offline');
@@ -332,12 +546,25 @@ program
             args.push('--dry-run');
         }
 
-        const child = spawn('python3', args, {
+        // BL080: resolve and pass through --from-plan.
+        if (options.fromPlan) {
+            let planPath;
+            if (options.fromPlan === true) {
+                // Flag provided without a value → default to <projectDir>/plan.json.
+                planPath = path.join(options.projectDir, 'plan.json');
+            } else {
+                // Absolute path stays as-is; relative resolves against cwd.
+                planPath = path.resolve(process.cwd(), options.fromPlan);
+            }
+            args.push('--from-plan', planPath);
+        }
+
+        const child = spawn(pythonBin, args, {
             stdio: 'inherit',
             env: { ...process.env, PYTHONUNBUFFERED: '1' }
         });
 
-        // 5. Forward exit code
+        // 6. Forward exit code
         child.on('close', (code) => {
             process.exit(code ?? 0);
         });
@@ -408,4 +635,28 @@ program
         await handler.handle();
     });
 
-program.parse();
+// Only parse argv when executed directly as a CLI (not when imported by tests).
+// Resolve symlinks on both sides: under `npm link`, process.argv[1] is the
+// symlink in the global bin while __filename is the real file — a plain string
+// compare would never match, silently skipping program.parse().
+const _invokedAsScript = process.argv[1] && (() => {
+    try {
+        return fs.realpathSync(process.argv[1]) === fs.realpathSync(__filename);
+    } catch {
+        return path.resolve(process.argv[1]) === __filename;
+    }
+})();
+if (_invokedAsScript) {
+    program.parse();
+}
+
+// Exported for unit testing (BL079). These are internal helpers; not a public API.
+export {
+    _initHeyEnvironment,
+    _resolveHeyPython,
+    _readVenvPath,
+    _writeVenvPathToConfig,
+    _venvPython,
+    _parseRequirementNames,
+    HEY_VENV_REL
+};
