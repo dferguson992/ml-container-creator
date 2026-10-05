@@ -167,8 +167,8 @@ const deploymentConfigPrompts = [
             }
             // AWS Marketplace deployment config is deprecated and hard-refused
             // (see src/lib/marketplace-refusal.js). The menu choice is removed so
-            // users cannot select a dead option; the flow file stays dormant for
-            // one release before removal.
+            // users cannot select a dead option; the generation surface was removed
+            // in BL120, leaving only the hard-refusal.
         ]
     }
 ];

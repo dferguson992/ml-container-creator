@@ -672,7 +672,7 @@ The `serve.d/` plugin system grew up around transformers LLM engines, so the
 checklist's language (`transformers-<engine>`, speculative algorithms, the
 `--help`-introspection loop) reads as if every engine is one. It is not:
 - **Architecture matters.** An engine belongs to an *architecture*
-  (`transformers`, `diffusors`, `triton`, `http`, `marketplace`), and the
+  (`transformers`, `diffusors`, `triton`, `http`), and the
   deployment-config is `<architecture>-<engine>` — e.g. `diffusors-vllm-omni`,
   not `transformers-vllm-omni`. The resolver's `CANONICAL_CONFIGS` map is the
   source of truth for that pairing.

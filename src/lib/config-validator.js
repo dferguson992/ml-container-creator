@@ -201,11 +201,7 @@ export default class ConfigValidator {
                 const value = finalConfig[param];
                 const isEmpty = value === null || value === undefined || value === '';
 
-                if (param === 'modelFormat' && (finalConfig.architecture === 'transformers' || finalConfig.architecture === 'triton' || finalConfig.architecture === 'diffusors' || finalConfig.architecture === 'marketplace')) {
-                    return;
-                }
-
-                if (finalConfig.architecture === 'marketplace' && (param === 'includeSampleModel' || param === 'buildTarget')) {
+                if (param === 'modelFormat' && (finalConfig.architecture === 'transformers' || finalConfig.architecture === 'triton' || finalConfig.architecture === 'diffusors')) {
                     return;
                 }
 

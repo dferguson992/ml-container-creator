@@ -50,7 +50,7 @@ export default class TemplateManager {
      */
     validate() {
         const supportedOptions = {
-            // 17 canonical deployment-config values (2 http, 6 transformers, 7 triton, 1 diffusors, 1 marketplace)
+            // 16 canonical deployment-config values (2 http, 6 transformers, 7 triton, 1 diffusors)
             deploymentConfigs: [
                 // HTTP architecture (2)
                 'http-flask', 'http-fastapi',
@@ -62,9 +62,7 @@ export default class TemplateManager {
                 'triton-fil', 'triton-onnxruntime', 'triton-tensorflow',
                 'triton-pytorch', 'triton-vllm', 'triton-tensorrtllm', 'triton-python',
                 // Diffusors architecture (1)
-                'diffusors-vllm-omni',
-                // Marketplace architecture (1)
-                'marketplace'
+                'diffusors-vllm-omni'
             ],
             buildTargets: ['codebuild'],
             deploymentTargets: ['realtime-inference', 'async-inference', 'batch-transform', 'hyperpod-eks', 'eks'],
@@ -85,7 +83,7 @@ export default class TemplateManager {
             this._validateGpuRequirement();
         } else {
             // Fallback: validate architecture and backend separately (new canonical format)
-            const architectures = ['http', 'transformers', 'triton', 'diffusors', 'marketplace'];
+            const architectures = ['http', 'transformers', 'triton', 'diffusors'];
             const backends = [
                 // http backends
                 'flask', 'fastapi',
@@ -98,11 +96,7 @@ export default class TemplateManager {
             ];
             
             this._validateChoice('architecture', architectures);
-            
-            // Marketplace has no backend — skip backend validation
-            if (this.answers.architecture !== 'marketplace') {
-                this._validateChoice('backend', backends);
-            }
+            this._validateChoice('backend', backends);
             
             // Validate tensorrt-llm is only used with transformers architecture
             if (this.answers.backend === 'tensorrt-llm' && this.answers.architecture !== 'transformers') {

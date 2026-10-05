@@ -34,7 +34,6 @@ import { runPrompts } from '../prompt-adapter.js';
 import McpQueryRunner from './mcp-query-runner.js';
 import SecretsPromptRunner from './secrets-prompt-runner.js';
 import CudaResolver from './cuda-resolver.js';
-import MarketplaceFlow from './marketplace-flow.js';
 import { isMarketplaceConfig, isMarketplaceModelName, refuseMarketplaceAndExit } from './marketplace-refusal.js';
 import { engineFeature } from './serve-manifest-reader.js';
 
@@ -94,7 +93,6 @@ export default class PromptRunner {
         this.mcpQueryRunner = new McpQueryRunner(this);
         this.secretsPromptRunner = new SecretsPromptRunner(this);
         this.cudaResolver = new CudaResolver(this);
-        this.marketplaceFlow = new MarketplaceFlow(this);
     }
 
     // ── Sub-object delegations (backward compat for tests) ──────────
@@ -173,8 +171,9 @@ export default class PromptRunner {
 
         // ──────────────────────────────────────────────────────────────────────
         // Marketplace is deprecated and hard-refused (see marketplace-refusal.js).
-        // The dormant _runMarketplaceFlow path is kept in tree for one release but
-        // is no longer reachable — refuse here rather than run it.
+        // The generation surface was removed (BL120); this guard keeps an old
+        // wrapper passing a marketplace config refusing cleanly rather than erroring
+        // obscurely downstream. Mirrors the JumpStart precedent.
         // ──────────────────────────────────────────────────────────────────────
         if (isMarketplaceConfig(frameworkAnswers.architecture) ||
             isMarketplaceConfig(frameworkAnswers.deploymentConfig)) {
