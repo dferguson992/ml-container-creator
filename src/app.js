@@ -18,6 +18,7 @@ import RegistryLoader from './lib/registry-loader.js';
 import { resolvePrefixedEnvVars } from './lib/engine-prefix-resolver.js';
 import { isMarketplaceConfig, isMarketplaceModelName, refuseMarketplaceAndExit } from './lib/marketplace-refusal.js';
 import { readEnvVarPrefix, resolveEngineFeatureVars } from './lib/serve-manifest-reader.js';
+import { isLlm as tritonIsLlm, isKnownBackend as isTritonBackend } from './lib/triton-backend-reader.js';
 import {
     listPredictorFrameworks,
     pipDependencies as predictorPipDependencies,
@@ -1051,11 +1052,19 @@ function _generateTritonFiles(templateDir, destDir, templateVars, answers, _trit
     const modelName = answers.modelName || 'model';
     const backend = answers.backend;
 
+    // BL119: the Triton templates no longer hardcode a `vllm || tensorrtllm` name
+    // list. Derive the LLM-backend predicate from the catalog via the reader and
+    // inject it so config.pbtxt / Dockerfile branch on `isLlmBackend` instead.
+    // Unknown/legacy backends (not in the catalog) are treated as non-LLM, matching
+    // the templates' prior else-branch behavior for anything but vllm/tensorrtllm.
+    const isLlmBackend = isTritonBackend(backend) && tritonIsLlm(backend);
+    const tritonVars = { ...templateVars, isLlmBackend };
+
     // Copy Triton Dockerfile
     _renderTemplate(
         path.join(templateDir, 'triton/Dockerfile'),
         path.join(destDir, 'Dockerfile'),
-        templateVars
+        tritonVars
     );
 
     // Create model repository directory structure
@@ -1066,7 +1075,7 @@ function _generateTritonFiles(templateDir, destDir, templateVars, answers, _trit
     _renderTemplate(
         path.join(templateDir, 'triton/config.pbtxt'),
         path.join(modelRepoPath, 'config.pbtxt'),
-        templateVars
+        tritonVars
     );
 
     // Create version 1 directory with .gitkeep
@@ -1075,17 +1084,20 @@ function _generateTritonFiles(templateDir, destDir, templateVars, answers, _trit
         '# Placeholder for model artifacts\n'
     );
 
-    // For triton-python backend: copy model.py and requirements.txt
+    // For triton-python backend: copy model.py and requirements.txt. (The Python
+    // backend is the only one with a model.py / requirements.txt overlay — this is
+    // genuinely backend-specific, not a catalog-derivable fact, so it stays a
+    // backend check per route B.)
     if (backend === 'python') {
         _renderTemplate(
             path.join(templateDir, 'triton/model.py'),
             path.join(modelRepoPath, '1/model.py'),
-            templateVars
+            tritonVars
         );
         _renderTemplate(
             path.join(templateDir, 'triton/requirements.txt'),
             path.join(destDir, 'triton/requirements.txt'),
-            templateVars
+            tritonVars
         );
     }
 }

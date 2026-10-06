@@ -12,10 +12,19 @@
  * Requirements: 7.1, 7.2, 7.3, 7.4, 2.1
  */
 
+import { gpuRequiringBackends as tritonGpuRequiringBackends } from './triton-backend-reader.js';
+
 /**
- * GPU-requiring Triton backends that must use GPU instance types
+ * GPU-requiring deployment configs that must use GPU instance types.
+ *
+ * The triton-* entries derive from the triton-backends catalog (ADR-008) so a
+ * new GPU-requiring backend is picked up without editing this list. The
+ * diffusors-vllm-omni entry is not a Triton backend, so it stays explicit.
  */
-const GPU_REQUIRING_BACKENDS = ['triton-vllm', 'triton-tensorrtllm', 'diffusors-vllm-omni'];
+const GPU_REQUIRING_BACKENDS = [
+    ...tritonGpuRequiringBackends().map(b => `triton-${b}`),
+    'diffusors-vllm-omni'
+];
 
 /**
  * CPU-only instance type families (patterns that indicate non-GPU instances)
