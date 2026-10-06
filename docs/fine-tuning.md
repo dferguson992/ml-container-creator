@@ -243,14 +243,21 @@ The warning is non-blocking — tuning proceeds. In automated (`MLCC_AUTO_MODE=1
 
 ## Techniques
 
-`do/tune` supports four customization techniques. Each technique requires a different dataset format and produces different training dynamics.
+`do/tune` supports five managed customization techniques. Each requires a different
+dataset format, and the three reinforcement-fine-tuning (RFT) techniques also require
+a registered **evaluator** — see [Managed RL evaluators](#managed-rl-evaluators-rlvr-rlaif-mtrl).
 
-| Technique | Use Case | Dataset Format |
+| Technique | Use Case | Inputs (register these first) |
 |---|---|---|
-| **SFT** | Teach the model a specific style or task | Prompt/completion pairs |
-| **DPO** | Align the model with human preferences | Prompt with chosen/rejected responses |
-| **RLAIF** | Align using an AI judge | Prompts with reward prompt reference |
-| **RLVR** | Align using code-based verification | Prompts with reward function Lambda |
+| **SFT** | Teach the model a specific style or task | Dataset only — prompt/completion pairs |
+| **DPO** | Align the model with human preferences | Dataset only — prompt with chosen/rejected responses |
+| **RLVR** | Align using code-based verification | Prompt dataset **+** a reward **function** (`do/register evaluator`) |
+| **RLAIF** | Align using an AI judge | Prompt dataset **+** a reward **prompt** (`do/register prompt`) |
+| **MTRL** | Multi-turn reinforcement learning | Prompt-only dataset **+** a reward **function** (`do/register evaluator`) |
+
+SFT and DPO need a dataset only. Every RFT technique (RLVR, RLAIF, MTRL) needs
+**two** separately-registered inputs — a prompt dataset AND an evaluator — and
+`do/tune` fails before submission if either is missing, naming the one to register.
 
 Not all models support all techniques. Check what's available for your model:
 
@@ -336,6 +343,104 @@ Use the `--reward-prompt` flag to specify the reward prompt location:
 ./do/tune --technique rlaif \
   --dataset s3://my-bucket/prompts.jsonl \
   --reward-prompt s3://my-bucket/reward-prompts/clarity-judge.txt
+```
+
+## Managed RL evaluators (RLVR, RLAIF, MTRL)
+
+The RFT techniques score each generated response with an **evaluator** — a native
+SageMaker AI Registry asset. There are two evaluator types, registered with two
+verbs, and each technique uses one:
+
+| Technique | Evaluator type | Register with | Source |
+|---|---|---|---|
+| RLVR, MTRL | reward **function** (code) | `do/register evaluator` | a Lambda (ARN) |
+| RLAIF | reward **prompt** (LLM-as-judge) | `do/register prompt` | an S3 prompt file |
+
+Together with the dataset verb, that is the **three register verbs** of the RL
+workflow: `do/register dataset` (the prompt corpus), `do/register evaluator` (a
+code reward function), and `do/register prompt` (a reward prompt). Datasets and
+evaluators are separate assets in separate registries; `do/tune` resolves both.
+
+### Register a reward function (RLVR / MTRL)
+
+The lead path is **bring-your-own-Lambda** — reference an existing reward Lambda
+by ARN. SageMaker stores a reference; it provisions nothing and needs no extra
+role:
+
+```bash
+# Register an existing Lambda as a reward-function evaluator
+./do/register evaluator math-reward --arn arn:aws:lambda:us-west-2:123456789012:function:math-reward --technique rlvr
+
+# Then tune, resolving the evaluator by name (RLVR needs BOTH a dataset and this)
+./do/tune --technique rlvr --dataset math-prompts --evaluator-name math-reward
+```
+
+Don't have a Lambda yet? Start from an editable sample, then register the edited
+file:
+
+```bash
+./do/register evaluator math-reward --from-sample          # writes do/evaluators/math-reward.py — edit it
+./do/register evaluator math-reward --from-sample --finalize   # register the edited reward function
+```
+
+**ARN vs `--from-sample` tradeoff:** the ARN path provisions no Lambda and needs
+no extra role — prefer it. `--from-sample --finalize` makes SageMaker create and
+own a managed Lambda, which requires a **dual-trust reward-Lambda role** (trusted
+by both `sagemaker.amazonaws.com` and `lambda.amazonaws.com`, plus `iam:PassRole`)
+— NOT the plain training role. Set `MLCC_REWARD_LAMBDA_ROLE_ARN` to that role
+before `--finalize`, or the create fails with a Lambda trust error.
+
+#### Reward-function contract
+
+The Lambda is invoked once per sampled response. The editable sample normalizes
+the common producer payloads (verl / HuggingFace / SageMaker Evaluation) and
+returns a single scalar reward:
+
+```python
+def handler(event, context=None):
+    # event carries the prompt, the model's output, and the ground truth
+    # (field names vary by producer; the sample's _extract() normalizes them).
+    # Return a JSON-serializable dict with a float `reward` (0.0–1.0 is conventional).
+    return {"reward": 1.0}
+```
+
+A reward function must never raise — a crash fails the whole RL step, so catch
+errors and return a `0.0` floor.
+
+!!! info "Two different 'reward functions' in v1.9"
+    This BL117 reward function is a **registered Lambda evaluator asset** consumed
+    by managed RFT on `do/tune`. It is NOT the same as the GRPO reward in
+    [Custom Training](custom-training.md#grpo-group-relative-policy-optimization),
+    which is an **in-process Python callable** in your `do/train` recipe. Same
+    term, different mechanism — this page describes the managed Lambda-evaluator
+    kind.
+
+### Register a reward prompt (RLAIF)
+
+A reward prompt is an LLM-as-judge template stored in S3, registered as a native
+`REWARD_PROMPT` evaluator (no Lambda, no dual-trust role):
+
+```bash
+# Register the reward prompt
+./do/register prompt clarity-judge --prompt s3://my-bucket/reward-prompts/clarity-judge.txt
+
+# Then tune (RLAIF needs BOTH a dataset and this reward prompt)
+./do/tune --technique rlaif --dataset clarity-prompts --evaluator-name clarity-judge
+```
+
+#### Reward-prompt contract
+
+The prompt file is a text/Jinja template scored by an LLM judge. It references the
+ground truth and the model's output with placeholders, e.g.:
+
+```
+Score 0.0–1.0 how well the response answers the question.
+
+### Context
+{{ ground_truth }}
+
+### Model Response
+{{ model_output }}
 ```
 
 ### Model-specific formats

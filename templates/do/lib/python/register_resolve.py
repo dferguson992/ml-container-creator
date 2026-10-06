@@ -13,8 +13,6 @@ import os
 import sys
 
 from common import _output, _error_exit, _check_sagemaker_core
-from register_common import _load_registry
-import register_common
 import dataset_store
 from register_dataset import _resolve_core_bucket
 from register_model import _extract_version_from_arn, _check_ai_registry
@@ -238,18 +236,141 @@ def resolve_dataset_uri(name, *, version=None, region=None, core_bucket=None,
     }
 
 
+def _native_hub_name(sm_client, region):
+    """Resolve the computed native AI Registry hub name (AiRegistry-<region>-<acct>).
+
+    The SDK computes its own hub; we discover it by listing hubs and matching the
+    ``AiRegistry-`` prefix (falling back to deriving it from the caller account).
+    Returns None when it cannot be determined.
+    """
+    try:
+        token = None
+        while True:
+            kw = {"NextToken": token} if token else {}
+            resp = sm_client.list_hubs(**kw)
+            for h in resp.get("HubSummaries", []):
+                hub_name = h.get("HubName", "")
+                if hub_name.startswith("AiRegistry-"):
+                    return hub_name
+            token = resp.get("NextToken")
+            if not token:
+                break
+    except Exception:  # noqa: BLE001 — fall through to the derived name
+        pass
+
+    try:
+        import boto3
+        account = boto3.client("sts", region_name=region).get_caller_identity()["Account"]
+        return f"AiRegistry-{region}-{account}"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _resolve_evaluator_native(name, region):
+    """Resolve a native evaluator by name from the AI Registry hub.
+
+    Evaluators are ``JsonDoc`` hub content. Returns a dict
+    ``{name, type, reference, arn, version}`` or None when not found. ``type`` is
+    the MLCC-facing ``"reward_function"`` / ``"reward_prompt"`` string (derived
+    from the stored document) so ``do/tune`` can route it to the right job input.
+    Raises on transport/permission errors (distinct from not-found).
+    """
+    import boto3
+    import json as _json
+
+    sm = boto3.client("sagemaker", region_name=region)
+    hub = _native_hub_name(sm, region)
+    if not hub:
+        return None
+
+    try:
+        resp = sm.describe_hub_content(
+            HubName=hub, HubContentType="JsonDoc", HubContentName=name,
+        )
+    except sm.exceptions.ResourceNotFound:
+        return None
+    except Exception as e:  # noqa: BLE001
+        if "ResourceNotFound" in type(e).__name__ or "does not exist" in str(e):
+            return None
+        raise
+
+    document = resp.get("HubContentDocument") or "{}"
+    try:
+        doc = _json.loads(document) if isinstance(document, str) else dict(document)
+    except (ValueError, TypeError):
+        doc = {}
+
+    # The stored evaluator document carries its type + source reference. Field
+    # names vary across SDK/service versions; probe the common shapes.
+    raw_type = (
+        doc.get("Type") or doc.get("type")
+        or doc.get("EvaluatorType") or doc.get("evaluator_type") or ""
+    )
+    raw_type_l = str(raw_type).lower()
+    if "prompt" in raw_type_l:
+        mlcc_type = "reward_prompt"
+    else:
+        mlcc_type = "reward_function"
+
+    reference = (
+        doc.get("Reference") or doc.get("reference")
+        or doc.get("Source") or doc.get("source") or ""
+    )
+
+    return {
+        "name": name,
+        "type": mlcc_type,
+        "reference": reference,
+        "arn": resp.get("HubContentArn"),
+        "version": resp.get("HubContentVersion"),
+    }
+
+
 def cmd_resolve_evaluator(args):
-    """Resolve a registered evaluator by name."""
+    """Resolve a registered evaluator by name from the native AI Registry.
+
+    BL117 retired the local ``evaluators.json`` as the record of truth; evaluators
+    are native ``sagemaker.ai_registry`` assets. Resolution reads the native hub.
+    Returns ``{name, type, reference, arn, version}``; ``type`` is
+    ``reward_function`` (RLVR/MTRL) or ``reward_prompt`` (RLAIF) so ``do/tune``
+    threads the right job input.
+    """
     name = args.name
     if not name:
         _error_exit("--name is required", code="MISSING_ARGUMENT")
 
-    entries = _load_registry(register_common._EVALUATORS_REGISTRY)
-    for entry in entries:
-        if entry.get("name") == name:
-            _output(entry)
+    region = (
+        getattr(args, "region", None)
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or os.environ.get("AWS_REGION")
+    )
 
-    _error_exit(f"Evaluator not found: {name}", code="EVALUATOR_NOT_FOUND")
+    # SDK-floor / region guard: outside a supported region (or on an SDK without
+    # ai_registry) the native hub cannot be read — surface a clear not-supported
+    # error rather than a raw boto failure.
+    try:
+        import ai_registry_native as _arn
+        if not _arn.region_supports_ai_registry(region):
+            _error_exit(
+                f"Evaluators are not available in region '{region}'. "
+                f"Managed RL evaluators require one of: "
+                f"{', '.join(sorted(_arn.AI_REGISTRY_REGIONS))}.",
+                code="EVALUATOR_REGION_UNSUPPORTED",
+            )
+    except ImportError:
+        pass
+
+    try:
+        resolved = _resolve_evaluator_native(name, region)
+    except Exception as e:  # noqa: BLE001 — transport/permission (distinct from not-found)
+        print(json.dumps({"error": str(e), "code": "EVALUATOR_RESOLVE_FAILED"}))
+        print(f"\u26a0\ufe0f  Failed to resolve evaluator '{name}': {e}", file=sys.stderr)
+        sys.exit(3)
+
+    if resolved is None:
+        _error_exit(f"Evaluator not found: {name}", code="EVALUATOR_NOT_FOUND")
+
+    _output(resolved)
 
 
 def cmd_get_version(args):

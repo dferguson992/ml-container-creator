@@ -11,7 +11,7 @@
 # targets: all
 
 # Wraps SageMaker managed fine-tuning for supported foundation models.
-# Supports SFT, DPO, RLAIF, and RLVR techniques.
+# Supports SFT, DPO, RLAIF, RLVR, and MTRL techniques.
 
 set -e
 set -u
@@ -73,7 +73,7 @@ _parse_args() {
         case "$1" in
             --technique)
                 if [ -z "${2:-}" ]; then
-                    echo "❌ --technique requires a value (sft, dpo, rlaif, rlvr)"
+                    echo "❌ --technique requires a value (sft, dpo, rlaif, rlvr, mtrl)"
                     exit 1
                 fi
                 ARG_TECHNIQUE="$2"; shift 2 ;;
@@ -223,7 +223,7 @@ _show_help() {
     echo "       ./do/tune --help"
     echo ""
     echo "SageMaker AI Managed Model Customization — fine-tune supported foundation"
-    echo "models using SFT, DPO, RLAIF, or RLVR without managing infrastructure."
+    echo "models using SFT, DPO, RLAIF, RLVR, or MTRL without managing infrastructure."
     echo ""
     echo "How it works:"
     echo ""
@@ -258,7 +258,11 @@ _show_help() {
     echo "  Or use: ./do/tune --discover [filter]"
     echo ""
     echo "Required:"
-    echo "  --technique <t>       Customization technique: sft, dpo, rlaif, rlvr"
+    echo "  --technique <t>       Customization technique: sft, dpo, rlaif, rlvr, mtrl"
+    echo "                        sft/dpo need a dataset only. rlvr/rlaif/mtrl are managed RFT"
+    echo "                        techniques that ALSO need an evaluator (register it first):"
+    echo "                          rlvr, mtrl → reward function  (./do/register evaluator)"
+    echo "                          rlaif      → reward prompt     (./do/register prompt)"
     echo "  --dataset <source>    Dataset: s3://bucket/path.jsonl or hf://org/name[/split][?file=pattern]"
     echo "                        ⚠️  Quote the URI if it contains ? or * to prevent shell expansion"
     echo ""
@@ -279,9 +283,15 @@ _show_help() {
     echo "  --lora-alpha <n>      LoRA alpha scaling factor"
     echo "  --batch-size <n>      Global batch size"
     echo ""
-    echo "Evaluator (RLVR/RLAIF only):"
-    echo "  --reward-function <arn>  Lambda ARN for reward function"
-    echo "  --reward-prompt <uri>    S3 URI for reward prompt file"
+    echo "Evaluator (RFT techniques — rlvr, rlaif, mtrl — require ONE of these):"
+    echo "  --evaluator-name <name>  Registered evaluator to resolve from the AI Registry."
+    echo "                           rlvr/mtrl → a reward function (./do/register evaluator);"
+    echo "                           rlaif     → a reward prompt    (./do/register prompt)."
+    echo "  --reward-function <arn>  Lambda ARN for a reward function (RLVR/MTRL; bypasses the"
+    echo "                           registry — pass the ARN directly)"
+    echo "  --reward-prompt <uri>    S3 URI for a reward prompt file (RLAIF; bypasses registry)"
+    echo "  Note: every RFT technique needs BOTH a prompt --dataset AND an evaluator; do/tune"
+    echo "        fails before submission if either is missing."
     echo ""
     echo "Overrides:"
     echo "  --output-bucket <b>   Override output bucket (defaults to TUNE_S3_BUCKET)"
@@ -377,7 +387,7 @@ _show_status() {
     echo ""
 
     local found_any=false
-    for technique in sft dpo rlaif rlvr; do
+    for technique in sft dpo rlaif rlvr mtrl; do
         local var_name="TUNE_JOB_NAME_$(echo "${technique}" | tr '[:lower:]' '[:upper:]')"
         local job_name="${!var_name:-}"
 
@@ -726,12 +736,15 @@ for m in d.get('models', []):
 _validate_technique() {
     local technique="${ARG_TECHNIQUE}"
 
-    # Validate technique value
+    # Validate technique value. sft/dpo need a dataset only; rlvr/rlaif/mtrl are
+    # managed RFT techniques that ALSO need an evaluator (see _preflight_rft_inputs):
+    # rlvr/mtrl → a reward function (do/register evaluator), rlaif → a reward prompt
+    # (do/register prompt).
     case "${technique}" in
-        sft|dpo|rlaif|rlvr) ;;
+        sft|dpo|rlaif|rlvr|mtrl) ;;
         *)
             echo "❌ Invalid technique: ${technique}"
-            echo "   Valid techniques: sft, dpo, rlaif, rlvr"
+            echo "   Valid techniques: sft, dpo, rlaif, rlvr, mtrl"
             exit 1
             ;;
     esac
@@ -1102,8 +1115,89 @@ _check_idempotency() {
 
 # ── _submit_job() ─────────────────────────────────────────────────────────────
 # Invoke Python helper with all args to submit the customization job.
+# ── _preflight_rft_inputs() ───────────────────────────────────────────────────
+# Req 3A: a managed RFT technique (rlvr/rlaif/mtrl) needs BOTH a prompt dataset
+# AND an evaluator. Resolve both and fail BEFORE submission if either is missing,
+# naming WHICH input is absent and its register verb — not a partial submission
+# that errors server-side. Also resolves a registered --evaluator-name into the
+# right reward flag so the resolved reference is threaded in. SFT/DPO are
+# dataset-only and skip this entirely (no behavior change).
+#
+# On success for an RFT technique, sets ARG_REWARD_FUNCTION or ARG_REWARD_PROMPT.
+_preflight_rft_inputs() {
+    case "${ARG_TECHNIQUE}" in
+        rlvr|rlaif|mtrl) ;;
+        *) return 0 ;;  # sft/dpo: dataset only, nothing to check
+    esac
+
+    # (1) Dataset input — already resolved by the dataset-resolution step. If it
+    #     is empty, the prompt dataset could not be resolved.
+    if [ -z "${RESOLVED_DATASET_S3_URI:-}" ]; then
+        echo "❌ ${ARG_TECHNIQUE^^} requires a prompt dataset, but none could be resolved."
+        echo "   Register one first:  ./do/register dataset <name> --s3-uri <uri> --technique ${ARG_TECHNIQUE}"
+        echo "   then:                ./do/tune --technique ${ARG_TECHNIQUE} --dataset <name> ..."
+        exit 1
+    fi
+
+    # (2) Evaluator input — the technique's reward artifact. Determine the
+    #     expected kind + its register verb for clear messaging.
+    local reward_kind reward_verb
+    if [ "${ARG_TECHNIQUE}" = "rlaif" ]; then
+        reward_kind="reward prompt"
+        reward_verb="./do/register prompt <name> --prompt <s3-uri>"
+    else
+        reward_kind="reward function"
+        reward_verb="./do/register evaluator <name> --arn <lambda-arn>"
+    fi
+
+    # An explicit --reward-function / --reward-prompt already satisfies it.
+    if [ -n "${ARG_REWARD_FUNCTION}" ] || [ -n "${ARG_REWARD_PROMPT}" ]; then
+        return 0
+    fi
+
+    # Otherwise an evaluator MUST be named and resolvable from the registry.
+    if [ -z "${ARG_EVALUATOR_NAME}" ]; then
+        echo "❌ ${ARG_TECHNIQUE^^} requires a ${reward_kind} evaluator, but none was provided."
+        echo "   Register it first:   ${reward_verb}"
+        echo "   then pass it with:   --evaluator-name <name>  (or --reward-function/--reward-prompt directly)"
+        exit 1
+    fi
+
+    echo "🔍 Resolving evaluator '${ARG_EVALUATOR_NAME}' from the AI Registry..."
+    local ev_resolve_result ev_type ev_reference
+    ev_resolve_result=$(python3 "${SCRIPT_DIR}/.register_helper.py" resolve-evaluator \
+        --name "${ARG_EVALUATOR_NAME}" --region "${AWS_REGION}" 2>/dev/null) || ev_resolve_result=""
+
+    if [ -z "${ev_resolve_result}" ]; then
+        echo "❌ ${ARG_TECHNIQUE^^}: evaluator '${ARG_EVALUATOR_NAME}' is not registered."
+        echo "   Register the ${reward_kind} first:  ${reward_verb}"
+        exit 1
+    fi
+
+    ev_type=$(echo "${ev_resolve_result}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('type',''))" 2>/dev/null) || ev_type=""
+    ev_reference=$(echo "${ev_resolve_result}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('reference') or d.get('arn_or_uri') or '')" 2>/dev/null) || ev_reference=""
+
+    if [ -z "${ev_reference}" ]; then
+        echo "❌ ${ARG_TECHNIQUE^^}: evaluator '${ARG_EVALUATOR_NAME}' resolved but has no source reference."
+        echo "   Re-register the ${reward_kind}:  ${reward_verb}"
+        exit 1
+    fi
+
+    echo "   Resolved evaluator: ${ev_type} → ${ev_reference}"
+    # reward_function (RLVR/MTRL) vs reward_prompt (RLAIF). Tolerate legacy labels.
+    case "${ev_type}" in
+        reward_function|lambda) ARG_REWARD_FUNCTION="${ev_reference}" ;;
+        reward_prompt|model)    ARG_REWARD_PROMPT="${ev_reference}" ;;
+        *)                      ARG_REWARD_FUNCTION="${ev_reference}" ;;
+    esac
+    return 0
+}
+
 # Sets JOB_NAME on success.
 _submit_job() {
+    # Req 3A two-input pre-flight: RFT techniques need BOTH dataset + evaluator.
+    _preflight_rft_inputs
+
     local output_bucket
     output_bucket=$(_resolve_output_bucket)
 
@@ -1197,36 +1291,9 @@ print(entry.get('provider', ''))
         submit_args+=(--reward-prompt "${ARG_REWARD_PROMPT}")
     fi
 
-    # Resolve evaluator from registry if --evaluator-name is set (AC-2c.3, AC-2c.4)
-    if [ -n "${ARG_EVALUATOR_NAME}" ] && [ -z "${ARG_REWARD_FUNCTION}" ] && [ -z "${ARG_REWARD_PROMPT}" ]; then
-        echo "🔍 Resolving evaluator '${ARG_EVALUATOR_NAME}' from registry..."
-        local ev_resolve_result
-        ev_resolve_result=$(python3 "${SCRIPT_DIR}/.register_helper.py" resolve-evaluator \
-            --name "${ARG_EVALUATOR_NAME}" 2>/dev/null) || ev_resolve_result=""
-
-        if [ -n "${ev_resolve_result}" ]; then
-            local ev_type ev_arn_or_uri
-            ev_type=$(echo "${ev_resolve_result}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('type',''))" 2>/dev/null) || ev_type=""
-            ev_arn_or_uri=$(echo "${ev_resolve_result}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('arn_or_uri',''))" 2>/dev/null) || ev_arn_or_uri=""
-
-            if [ -n "${ev_arn_or_uri}" ]; then
-                echo "   Resolved evaluator: ${ev_type} → ${ev_arn_or_uri}"
-                if [ "${ev_type}" = "lambda" ]; then
-                    submit_args+=(--reward-function "${ev_arn_or_uri}")
-                else
-                    submit_args+=(--reward-prompt "${ev_arn_or_uri}")
-                fi
-            else
-                echo "⚠️  Evaluator '${ARG_EVALUATOR_NAME}' not found in registry"
-                echo "   Register it first: ./do/register --evaluator --evaluator-name ${ARG_EVALUATOR_NAME} ..."
-                exit 1
-            fi
-        else
-            echo "⚠️  Failed to resolve evaluator '${ARG_EVALUATOR_NAME}' from registry"
-            echo "   Register it first: ./do/register --evaluator --evaluator-name ${ARG_EVALUATOR_NAME} ..."
-            exit 1
-        fi
-    fi
+    # Evaluator inputs for RFT techniques are resolved + threaded by
+    # _preflight_rft_inputs() (Req 3A), which runs at the top of _submit_job and
+    # sets ARG_REWARD_FUNCTION / ARG_REWARD_PROMPT — already appended above.
     if [ "${ARG_ACCEPT_EULA}" = true ]; then
         submit_args+=(--accept-eula)
     fi
@@ -1590,6 +1657,10 @@ ADAPTER_CONF
 # ── _dry_run() ────────────────────────────────────────────────────────────────
 # Validate all inputs and show what would be submitted without creating a job.
 _dry_run() {
+    # Req 3A: validate the two-input contract (dataset + evaluator) for RFT
+    # techniques up front so --dry-run surfaces a missing input before submission.
+    _preflight_rft_inputs
+
     local output_bucket
     output_bucket=$(_resolve_output_bucket)
 

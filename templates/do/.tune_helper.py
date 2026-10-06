@@ -65,7 +65,7 @@ def main():
     submit_parser.add_argument("--region", default=None,
                                help="AWS region (defaults to AWS_REGION env var)")
     submit_parser.add_argument("--technique", required=True,
-                               choices=["sft", "dpo", "rlaif", "rlvr"],
+                               choices=["sft", "dpo", "rlaif", "rlvr", "mtrl"],
                                help="Customization technique")
     submit_parser.add_argument("--training-type", required=True,
                                choices=["lora", "full-rank"],
@@ -154,7 +154,7 @@ def main():
     stage_hf_parser.add_argument("--column-map", default=None,
                                  help="Column mapping (e.g., prompt=question,completion=answer)")
     stage_hf_parser.add_argument("--technique", default="sft",
-                                 choices=["sft", "dpo", "rlaif", "rlvr", "benchmark"],
+                                 choices=["sft", "dpo", "rlaif", "rlvr", "mtrl", "benchmark"],
                                  help="Customization technique (determines required columns)")
     stage_hf_parser.add_argument("--no-transform", action="store_true", default=False,
                                  help="Disable automatic chat-format flattening")

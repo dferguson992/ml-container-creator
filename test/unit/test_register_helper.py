@@ -616,18 +616,27 @@ class TestCmdRegisterAdapter:
 
 
 class TestRegisterEvaluator:
-    """Test register-evaluator subcommand.
+    """Test register-evaluator subcommand (BL117: native AI Registry evaluator).
 
-    Validates: Requirements AC-2c.1, AC-2c.2
+    The local evaluators.json stub was retired; register-evaluator now creates a
+    native sagemaker.ai_registry REWARD_FUNCTION evaluator. These tests mock the
+    native create helper so no AWS call is made.
+
+    Validates: Requirements 1.1, 1.2, 1.4, 1.5
     """
 
     def _make_evaluator_args(self, **kwargs):
-        """Create a Namespace with all required register-evaluator args."""
+        """Create a Namespace with register-evaluator args (native ARN path)."""
         defaults = {
             "command": "register-evaluator",
             "name": "math-reward-fn",
-            "eval_type": "lambda",
-            "arn_or_uri": "arn:aws:lambda:us-west-2:123456789012:function:math-reward",
+            "arn": "arn:aws:lambda:us-west-2:123456789012:function:math-reward",
+            "arn_or_uri": None,
+            "from_sample": False,
+            "finalize": False,
+            "sample_id": None,
+            "force": False,
+            "region": "us-west-2",
             "technique": "rlvr",
             "description": "Mathematical correctness evaluator",
             "project_name": "test-project",
@@ -635,158 +644,202 @@ class TestRegisterEvaluator:
         defaults.update(kwargs)
         return Namespace(**defaults)
 
-    def test_register_evaluator_outputs_json(self, capsys, tmp_path):
-        """register-evaluator outputs valid JSON with required fields."""
+    def _native_ok(self, member="RewardFunction"):
+        """A stand-in for register_evaluator._create_evaluator_native success."""
+        def _fake(*, name, source, evaluator_type, region, description=None,
+                  role=None, domain_id=None):
+            return {
+                "arn": f"arn:aws:sagemaker:{region}:1:hub-content/H/JsonDoc/{name}/1.0.0",
+                "version": "1.0.0",
+                "status": "Available",
+                "type": member,
+                "reference": source,
+                "domain_tagged": bool(domain_id),
+            }
+        return _fake
+
+    def test_register_evaluator_outputs_json(self, capsys):
+        """register-evaluator (ARN path) outputs native-shaped JSON."""
+        import register_evaluator
         args = self._make_evaluator_args()
 
-        with patch("register_common._EVALUATORS_REGISTRY", str(tmp_path / "evaluators.json")):
-            with patch("register_common._REGISTRY_DIR", str(tmp_path)):
-                with pytest.raises(SystemExit) as exc_info:
-                    _register_helper.cmd_register_evaluator(args)
+        with patch.object(register_evaluator, "_create_evaluator_native",
+                          side_effect=self._native_ok()), \
+             patch.object(register_evaluator, "_resolve_role_and_domain",
+                          return_value=("arn:aws:iam::1:role/r", "d-1")):
+            with pytest.raises(SystemExit) as exc_info:
+                _register_helper.cmd_register_evaluator(args)
 
-                assert exc_info.value.code == 0
-                captured = capsys.readouterr()
-                output = json.loads(captured.out)
-                assert output["name"] == "math-reward-fn"
-                assert output["type"] == "lambda"
-                assert output["arn_or_uri"] == "arn:aws:lambda:us-west-2:123456789012:function:math-reward"
-                assert output["technique"] == "rlvr"
-                assert output["registered"] is True
+        assert exc_info.value.code == 0
+        output = json.loads(capsys.readouterr().out)
+        assert output["name"] == "math-reward-fn"
+        assert output["type"] == "reward_function"
+        assert output["reference"] == "arn:aws:lambda:us-west-2:123456789012:function:math-reward"
+        assert output["technique"] == "rlvr"
+        assert output["registered"] is True
+        assert output["version"] == "1.0.0"
 
-    def test_register_evaluator_creates_registry_file(self, tmp_path):
-        """register-evaluator creates the registry JSON file."""
+    def test_register_evaluator_calls_native_create_with_arn(self):
+        """The ARN path passes source=<lambda-arn>, type=reward_function."""
+        import register_evaluator
         args = self._make_evaluator_args()
-        registry_file = str(tmp_path / "evaluators.json")
 
-        with patch("register_common._EVALUATORS_REGISTRY", registry_file):
-            with patch("register_common._REGISTRY_DIR", str(tmp_path)):
-                with pytest.raises(SystemExit):
-                    _register_helper.cmd_register_evaluator(args)
+        with patch.object(register_evaluator, "_create_evaluator_native") as mock_create, \
+             patch.object(register_evaluator, "_resolve_role_and_domain",
+                          return_value=("arn:role", "d-1")):
+            mock_create.side_effect = self._native_ok()
+            with pytest.raises(SystemExit):
+                _register_helper.cmd_register_evaluator(args)
 
-        assert os.path.exists(registry_file)
-        with open(registry_file) as f:
-            data = json.load(f)
-        assert len(data) == 1
-        assert data[0]["name"] == "math-reward-fn"
-        assert data[0]["type"] == "lambda"
-        assert data[0]["arn_or_uri"] == "arn:aws:lambda:us-west-2:123456789012:function:math-reward"
-        assert data[0]["technique"] == "rlvr"
-        assert data[0]["description"] == "Mathematical correctness evaluator"
+        _, kwargs = mock_create.call_args
+        assert kwargs["source"] == "arn:aws:lambda:us-west-2:123456789012:function:math-reward"
+        assert kwargs["evaluator_type"] == "reward_function"
+        assert kwargs["name"] == "math-reward-fn"
 
-    def test_register_evaluator_rlaif_preference_model(self, capsys, tmp_path):
-        """register-evaluator supports RLAIF preference model type."""
-        args = self._make_evaluator_args(
-            name="pref-judge",
-            eval_type="model",
-            arn_or_uri="s3://bucket/models/preference-judge/",
-            technique="rlaif",
-            description="Preference model for DPO",
-        )
-
-        with patch("register_common._EVALUATORS_REGISTRY", str(tmp_path / "evaluators.json")):
-            with patch("register_common._REGISTRY_DIR", str(tmp_path)):
-                with pytest.raises(SystemExit) as exc_info:
-                    _register_helper.cmd_register_evaluator(args)
-
-                assert exc_info.value.code == 0
-                captured = capsys.readouterr()
-                output = json.loads(captured.out)
-                assert output["type"] == "model"
-                assert output["technique"] == "rlaif"
-                assert output["arn_or_uri"] == "s3://bucket/models/preference-judge/"
-
-    def test_register_evaluator_upserts_existing(self, tmp_path):
-        """register-evaluator updates existing entry with same name."""
-        registry_file = str(tmp_path / "evaluators.json")
-
-        existing = [{"name": "math-reward-fn", "type": "lambda",
-                     "arn_or_uri": "arn:old", "technique": "rlvr"}]
-        with open(registry_file, "w") as f:
-            json.dump(existing, f)
-
-        args = self._make_evaluator_args()
-        with patch("register_common._EVALUATORS_REGISTRY", registry_file):
-            with patch("register_common._REGISTRY_DIR", str(tmp_path)):
-                with pytest.raises(SystemExit):
-                    _register_helper.cmd_register_evaluator(args)
-
-        with open(registry_file) as f:
-            data = json.load(f)
-        assert len(data) == 1
-        assert data[0]["arn_or_uri"] == "arn:aws:lambda:us-west-2:123456789012:function:math-reward"
-
-    def test_register_evaluator_requires_name(self, capsys, tmp_path):
+    def test_register_evaluator_requires_name(self, capsys):
         """register-evaluator errors if name is empty."""
         args = self._make_evaluator_args(name="")
-        with patch("register_common._EVALUATORS_REGISTRY", str(tmp_path / "evaluators.json")):
-            with patch("register_common._REGISTRY_DIR", str(tmp_path)):
-                with pytest.raises(SystemExit) as exc_info:
-                    _register_helper.cmd_register_evaluator(args)
-                assert exc_info.value.code == 1
-                captured = capsys.readouterr()
-                output = json.loads(captured.out)
-                assert output["code"] == "MISSING_ARGUMENT"
+        with pytest.raises(SystemExit) as exc_info:
+            _register_helper.cmd_register_evaluator(args)
+        assert exc_info.value.code == 1
+        output = json.loads(capsys.readouterr().out)
+        assert output["code"] == "MISSING_ARGUMENT"
 
-    def test_register_evaluator_requires_arn_or_uri(self, capsys, tmp_path):
-        """register-evaluator errors if arn-or-uri is empty."""
-        args = self._make_evaluator_args(arn_or_uri="")
-        with patch("register_common._EVALUATORS_REGISTRY", str(tmp_path / "evaluators.json")):
-            with patch("register_common._REGISTRY_DIR", str(tmp_path)):
-                with pytest.raises(SystemExit) as exc_info:
-                    _register_helper.cmd_register_evaluator(args)
-                assert exc_info.value.code == 1
-                captured = capsys.readouterr()
-                output = json.loads(captured.out)
-                assert output["code"] == "MISSING_ARGUMENT"
+    def test_register_evaluator_requires_arn_or_sample(self, capsys):
+        """register-evaluator errors if neither --arn nor --from-sample is given."""
+        args = self._make_evaluator_args(arn=None, arn_or_uri=None, from_sample=False)
+        with pytest.raises(SystemExit) as exc_info:
+            _register_helper.cmd_register_evaluator(args)
+        assert exc_info.value.code == 1
+        output = json.loads(capsys.readouterr().out)
+        assert output["code"] == "MISSING_ARGUMENT"
+
+    def test_register_evaluator_name_budget_on_finalize(self, capsys, tmp_path):
+        """A too-long name fails the budget check on the managed-Lambda finalize path."""
+        import register_evaluator_sample
+        long_name = "x" * 40  # exceeds the ~27-char managed-Lambda budget
+        args = self._make_evaluator_args(
+            name=long_name, arn=None, from_sample=True, finalize=True,
+        )
+        # Pretend the sample file exists so we reach the budget check.
+        sample_file = tmp_path / f"{long_name}.py"
+        sample_file.write_text("# edited\n")
+        with patch.object(register_evaluator_sample, "sample_path_for",
+                          return_value=str(sample_file)):
+            with pytest.raises(SystemExit) as exc_info:
+                _register_helper.cmd_register_evaluator(args)
+        assert exc_info.value.code == 1
+        output = json.loads(capsys.readouterr().out)
+        assert output["code"] == "EVALUATOR_NAME_TOO_LONG"
+
+
+class TestRegisterPrompt:
+    """Test register-prompt subcommand (BL117: REWARD_PROMPT / RLAIF).
+
+    Validates: Requirements 2.1, 2.3
+    """
+
+    def _make_prompt_args(self, **kwargs):
+        defaults = {
+            "command": "register-prompt",
+            "name": "pairwise-judge",
+            "prompt": "s3://bucket/evaluators/judge-prompt.txt",
+            "arn_or_uri": None,
+            "region": "us-west-2",
+            "description": "LLM-as-judge prompt",
+            "project_name": "proj",
+        }
+        defaults.update(kwargs)
+        return Namespace(**defaults)
+
+    def test_register_prompt_outputs_json(self, capsys):
+        import register_evaluator
+        args = self._make_prompt_args()
+
+        def _fake(*, name, source, evaluator_type, region, description=None,
+                  role=None, domain_id=None):
+            assert evaluator_type == "reward_prompt"
+            return {
+                "arn": f"arn:aws:sagemaker:{region}:1:hub-content/H/JsonDoc/{name}/1.0.0",
+                "version": "1.0.0", "status": "Available", "type": "RewardPrompt",
+                "reference": source, "domain_tagged": bool(domain_id),
+            }
+
+        with patch.object(register_evaluator, "_create_evaluator_native", side_effect=_fake), \
+             patch.object(register_evaluator, "_resolve_role_and_domain",
+                          return_value=("arn:role", "d-1")):
+            with pytest.raises(SystemExit) as exc_info:
+                _register_helper.cmd_register_prompt(args)
+
+        assert exc_info.value.code == 0
+        output = json.loads(capsys.readouterr().out)
+        assert output["name"] == "pairwise-judge"
+        assert output["type"] == "reward_prompt"
+        assert output["technique"] == "rlaif"
+        assert output["reference"] == "s3://bucket/evaluators/judge-prompt.txt"
+
+    def test_register_prompt_requires_prompt(self, capsys):
+        args = self._make_prompt_args(prompt=None, arn_or_uri=None)
+        with pytest.raises(SystemExit) as exc_info:
+            _register_helper.cmd_register_prompt(args)
+        assert exc_info.value.code == 1
+        output = json.loads(capsys.readouterr().out)
+        assert output["code"] == "MISSING_ARGUMENT"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# 12. Resolve Evaluator (AC-2c.3, AC-2c.4)
+# 12. Resolve Evaluator (native AI Registry)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 class TestResolveEvaluator:
-    """Test resolve-evaluator subcommand.
+    """Test resolve-evaluator subcommand (BL117: native AI Registry).
 
-    Validates: Requirements AC-2c.3, AC-2c.4
+    Validates: Requirements 3.1, 3.2 (evaluator resolution feeds the RFT job)
     """
 
-    def test_resolve_evaluator_found(self, capsys, tmp_path):
-        """resolve-evaluator returns entry when name matches."""
-        registry_file = str(tmp_path / "evaluators.json")
-        entries = [
-            {"name": "math-fn", "type": "lambda",
-             "arn_or_uri": "arn:aws:lambda:us-west-2:123:function:math",
-             "technique": "rlvr"},
-        ]
-        with open(registry_file, "w") as f:
-            json.dump(entries, f)
-
-        args = Namespace(name="math-fn", command="resolve-evaluator")
-        with patch("register_common._EVALUATORS_REGISTRY", registry_file):
+    def test_resolve_evaluator_found(self, capsys):
+        """resolve-evaluator returns the native-resolved entry when found."""
+        import register_resolve
+        args = Namespace(name="math-fn", command="resolve-evaluator", region="us-west-2")
+        resolved = {
+            "name": "math-fn", "type": "reward_function",
+            "reference": "arn:aws:lambda:us-west-2:123:function:math",
+            "arn": "arn:aws:sagemaker:us-west-2:1:hub-content/H/JsonDoc/math-fn/1.0.0",
+            "version": "1.0.0",
+        }
+        with patch.object(register_resolve, "_resolve_evaluator_native",
+                          return_value=resolved):
             with pytest.raises(SystemExit) as exc_info:
                 _register_helper.cmd_resolve_evaluator(args)
 
-            assert exc_info.value.code == 0
-            captured = capsys.readouterr()
-            output = json.loads(captured.out)
-            assert output["name"] == "math-fn"
-            assert output["type"] == "lambda"
-            assert output["arn_or_uri"] == "arn:aws:lambda:us-west-2:123:function:math"
+        assert exc_info.value.code == 0
+        output = json.loads(capsys.readouterr().out)
+        assert output["name"] == "math-fn"
+        assert output["type"] == "reward_function"
+        assert output["reference"] == "arn:aws:lambda:us-west-2:123:function:math"
 
-    def test_resolve_evaluator_not_found(self, capsys, tmp_path):
-        """resolve-evaluator returns error when name not found."""
-        registry_file = str(tmp_path / "evaluators.json")
-        with open(registry_file, "w") as f:
-            json.dump([], f)
-
-        args = Namespace(name="nonexistent", command="resolve-evaluator")
-        with patch("register_common._EVALUATORS_REGISTRY", registry_file):
+    def test_resolve_evaluator_not_found(self, capsys):
+        """resolve-evaluator returns EVALUATOR_NOT_FOUND when the hub has no match."""
+        import register_resolve
+        args = Namespace(name="nonexistent", command="resolve-evaluator", region="us-west-2")
+        with patch.object(register_resolve, "_resolve_evaluator_native",
+                          return_value=None):
             with pytest.raises(SystemExit) as exc_info:
                 _register_helper.cmd_resolve_evaluator(args)
 
-            assert exc_info.value.code == 1
-            captured = capsys.readouterr()
-            output = json.loads(captured.out)
-            assert output["code"] == "EVALUATOR_NOT_FOUND"
+        assert exc_info.value.code == 1
+        output = json.loads(capsys.readouterr().out)
+        assert output["code"] == "EVALUATOR_NOT_FOUND"
+
+    def test_resolve_evaluator_region_unsupported(self, capsys):
+        """resolve-evaluator fails clearly in a region without the AI Registry."""
+        args = Namespace(name="math-fn", command="resolve-evaluator", region="eu-central-1")
+        with pytest.raises(SystemExit) as exc_info:
+            _register_helper.cmd_resolve_evaluator(args)
+        assert exc_info.value.code == 1
+        output = json.loads(capsys.readouterr().out)
+        assert output["code"] == "EVALUATOR_REGION_UNSUPPORTED"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -822,12 +875,11 @@ class TestDatasetEvaluatorCLIParsing:
                 assert call_args.project_name == "proj"
 
     def test_register_evaluator_cli_parses_all_args(self):
-        """register-evaluator parses all CLI arguments correctly."""
+        """register-evaluator parses the native CLI arguments (--arn path)."""
         with patch("sys.argv", [
             "prog", "register-evaluator",
             "--name", "my-eval",
-            "--type", "lambda",
-            "--arn-or-uri", "arn:aws:lambda:us-west-2:123:function:fn",
+            "--arn", "arn:aws:lambda:us-west-2:123:function:fn",
             "--technique", "rlvr",
             "--description", "Test evaluator",
             "--project-name", "proj",
@@ -837,11 +889,38 @@ class TestDatasetEvaluatorCLIParsing:
                 mock_cmd.assert_called_once()
                 call_args = mock_cmd.call_args[0][0]
                 assert call_args.name == "my-eval"
-                assert call_args.eval_type == "lambda"
-                assert call_args.arn_or_uri == "arn:aws:lambda:us-west-2:123:function:fn"
+                assert call_args.arn == "arn:aws:lambda:us-west-2:123:function:fn"
                 assert call_args.technique == "rlvr"
                 assert call_args.description == "Test evaluator"
                 assert call_args.project_name == "proj"
+
+    def test_register_evaluator_cli_parses_from_sample(self):
+        """register-evaluator parses the --from-sample on-ramp flags."""
+        with patch("sys.argv", [
+            "prog", "register-evaluator",
+            "--name", "my-eval", "--from-sample", "--finalize",
+        ]):
+            with patch.object(_register_helper, "cmd_register_evaluator") as mock_cmd:
+                _register_helper.main()
+                call_args = mock_cmd.call_args[0][0]
+                assert call_args.from_sample is True
+                assert call_args.finalize is True
+
+    def test_register_prompt_cli_parses_all_args(self):
+        """register-prompt parses the reward-prompt CLI arguments."""
+        with patch("sys.argv", [
+            "prog", "register-prompt",
+            "--name", "judge",
+            "--prompt", "s3://bucket/judge.txt",
+            "--description", "judge prompt",
+            "--project-name", "proj",
+        ]):
+            with patch.object(_register_helper, "cmd_register_prompt") as mock_cmd:
+                _register_helper.main()
+                mock_cmd.assert_called_once()
+                call_args = mock_cmd.call_args[0][0]
+                assert call_args.name == "judge"
+                assert call_args.prompt == "s3://bucket/judge.txt"
 
     def test_register_dataset_requires_name_flag(self):
         """register-dataset requires --name flag."""
@@ -856,46 +935,30 @@ class TestDatasetEvaluatorCLIParsing:
                 _register_helper.main()
 
     def test_register_evaluator_requires_name_flag(self):
-        """register-evaluator requires --name flag."""
+        """register-evaluator requires --name flag at parse time."""
         with pytest.raises(SystemExit):
             with patch("sys.argv", [
                 "prog", "register-evaluator",
-                "--type", "lambda",
-                "--arn-or-uri", "arn:x",
+                "--arn", "arn:x",
                 "--technique", "rlvr",
             ]):
                 _register_helper.main()
 
-    def test_register_evaluator_requires_type_flag(self):
-        """register-evaluator requires --type flag."""
+    def test_register_prompt_requires_name_flag(self):
+        """register-prompt requires --name flag at parse time."""
         with pytest.raises(SystemExit):
             with patch("sys.argv", [
-                "prog", "register-evaluator",
-                "--name", "x",
-                "--arn-or-uri", "arn:x",
-                "--technique", "rlvr",
+                "prog", "register-prompt",
+                "--prompt", "s3://bucket/judge.txt",
             ]):
                 _register_helper.main()
 
-    def test_register_evaluator_requires_arn_or_uri_flag(self):
-        """register-evaluator requires --arn-or-uri flag."""
+    def test_register_evaluator_technique_rejects_rlaif(self):
+        """register-evaluator --technique only accepts rlvr/mtrl (rlaif is a prompt)."""
         with pytest.raises(SystemExit):
             with patch("sys.argv", [
                 "prog", "register-evaluator",
-                "--name", "x",
-                "--type", "lambda",
-                "--technique", "rlvr",
-            ]):
-                _register_helper.main()
-
-    def test_register_evaluator_requires_technique_flag(self):
-        """register-evaluator requires --technique flag."""
-        with pytest.raises(SystemExit):
-            with patch("sys.argv", [
-                "prog", "register-evaluator",
-                "--name", "x",
-                "--type", "lambda",
-                "--arn-or-uri", "arn:x",
+                "--name", "x", "--arn", "arn:x", "--technique", "rlaif",
             ]):
                 _register_helper.main()
 

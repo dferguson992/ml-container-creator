@@ -531,51 +531,12 @@ def cmd_register_dataset(args):
     })
 
 
-def cmd_register_evaluator(args):
-    """Register an evaluator into the local registry."""
-    name = args.name
-    eval_type = args.eval_type
-    arn_or_uri = args.arn_or_uri
-    technique = args.technique
-    description = args.description or ""
-    project_name = args.project_name or ""
-
-    if not name:
-        _error_exit("--name is required", code="MISSING_ARGUMENT")
-    if not arn_or_uri:
-        _error_exit("--arn-or-uri is required", code="MISSING_ARGUMENT")
-
-    entries = _load_registry(register_common._EVALUATORS_REGISTRY)
-
-    entry = {
-        "name": name,
-        "type": eval_type,
-        "arn_or_uri": arn_or_uri,
-        "technique": technique,
-        "description": description,
-        "project_name": project_name,
-        "registered_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
-    }
-
-    updated = False
-    for i, existing in enumerate(entries):
-        if existing.get("name") == name:
-            entries[i] = entry
-            updated = True
-            break
-    if not updated:
-        entries.append(entry)
-
-    _save_registry(register_common._EVALUATORS_REGISTRY, entries)
-
-    print(f"Registered evaluator '{name}' ({eval_type}) \u2192 {arn_or_uri}", file=sys.stderr)
-    _output({
-        "name": name,
-        "type": eval_type,
-        "arn_or_uri": arn_or_uri,
-        "technique": technique,
-        "registered": True,
-    })
+# NOTE (BL117): cmd_register_evaluator moved to register_evaluator.py and was
+# rewritten to create a native sagemaker.ai_registry Evaluator asset (both the
+# REWARD_FUNCTION and REWARD_PROMPT types) instead of appending to the local
+# evaluators.json stub, which is retired as the record of truth. The reward
+# ARTIFACT (a prompt/function) is an evaluator, not a dataset — register it with
+# `do/register evaluator` or `do/register prompt`.
 
 
 # ── discover-dataset (Req B) ──────────────────────────────────────────────────

@@ -47,11 +47,13 @@ def cmd_submit(args):
     # ── Resolve --evaluator-name from registry (AC-2c.3, AC-2c.4) ────────────
     # --reward-function / --reward-prompt win if provided (backward compatible override)
     if args.evaluator_name and not args.reward_function and not args.reward_prompt:
-        ev_type, ev_arn_or_uri = _resolve_evaluator_name(args.evaluator_name)
-        if ev_type == "lambda":
-            args.reward_function = ev_arn_or_uri
+        ev_type, ev_reference = _resolve_evaluator_name(args.evaluator_name)
+        # BL117: native evaluator types are reward_function (RLVR/MTRL) and
+        # reward_prompt (RLAIF). Tolerate the legacy lambda/model labels.
+        if ev_type in ("reward_function", "lambda"):
+            args.reward_function = ev_reference
         else:
-            args.reward_prompt = ev_arn_or_uri
+            args.reward_prompt = ev_reference
 
     _check_sagemaker_sdk()
 
@@ -78,9 +80,11 @@ def cmd_submit(args):
     TRAINER_MAP = {
         "sft": SFTTrainer,
         "dpo": DPOTrainer,
-        # RLAIF and RLVR use SFTTrainer with evaluator config
+        # RLAIF, RLVR, and MTRL are managed RFT techniques that use SFTTrainer
+        # with an evaluator config (reward function or reward prompt).
         "rlaif": SFTTrainer,
         "rlvr": SFTTrainer,
+        "mtrl": SFTTrainer,
     }
 
     technique = args.technique
@@ -205,8 +209,9 @@ def cmd_submit(args):
             if hyperparameters:
                 trainer_kwargs["hyperparameters"] = hyperparameters
 
-            # Add evaluator config for RLVR/RLAIF techniques
-            if technique in ("rlvr", "rlaif"):
+            # Add evaluator config for the managed RFT techniques. RLVR and MTRL
+            # use a code-based reward function; RLAIF uses a reward prompt.
+            if technique in ("rlvr", "rlaif", "mtrl"):
                 if args.reward_function:
                     trainer_kwargs["evaluator_config"] = {"reward_function_arn": args.reward_function}
                 elif args.reward_prompt:
