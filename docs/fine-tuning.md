@@ -4,6 +4,32 @@
 
 ML Container Creator includes a `do/tune` command that wraps SageMaker AI Managed Model Customization — a serverless fine-tuning capability that eliminates instance selection and container management. You provide a dataset and technique; SageMaker AI handles infrastructure, optimization, and produces a deployable model artifact that feeds directly back into your project's deployment lifecycle.
 
+## `do/tune` vs `do/train`: the two training surfaces
+
+MLCC splits training across two surfaces by **how much of the loop you own**, not
+by technique flavor. Pick the surface first, then the technique.
+
+| | `do/tune` (managed) | `do/train` (super-user) |
+|---|---|---|
+| **What it wraps** | SageMaker Managed Model Customization (serverless) | `CreateTrainingJob` with your own container + script |
+| **Infrastructure** | Managed — no instance selection | You choose the instance type |
+| **Training code** | SageMaker's built-in trainers | Your script (ships with editable recipes) |
+| **Models** | Supported Model Catalog only | Any HuggingFace model |
+| **Supervised techniques** | SFT, DPO | SFT, DPO + any custom technique |
+| **Reinforcement learning** | Managed RLVR / RLAIF / MTRL | Self-managed **GRPO** |
+| **Reward (for RL)** | A **registered SageMaker evaluator asset** (a Lambda, referenced by ARN) | An **in-process Python callable** you write in the recipe |
+| **You edit the training/reward code?** | No | Yes — that is the point |
+| **When to choose** | You want a hands-off managed customization | You need to own and modify the training/reward loop |
+
+!!! info "GRPO is on `do/train`, not `do/tune`"
+    GRPO (Group Relative Policy Optimization) is **self-managed** reinforcement
+    learning: the reward is an in-process Python callable you author in the recipe
+    (`training/grpo/reward_example.py`), with no managed evaluator service in the
+    loop. See [Custom Training → GRPO](custom-training.md#grpo-group-relative-policy-optimization).
+    The managed RL path on `do/tune` is the opposite: its reward is a
+    separately-registered evaluator asset (an ARN). Both are called a "reward
+    function"; they are different mechanisms.
+
 ## Prerequisites
 
 | Requirement | Details |
