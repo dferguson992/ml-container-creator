@@ -481,6 +481,34 @@ def cmd_register_adapter(args):
                 f"Registered adapter family sub-model in MLflow: {mlflow_registered_name}",
                 file=sys.stderr,
             )
+            # BL123 (Req 6.1): record the dataset→model lineage edge by logging the
+            # training dataset as an input on a run in this family. Non-fatal +
+            # idempotent, and driven only by the dataset S3 URI (so it covers the
+            # do/train GRPO path with no technique-specific code).
+            _dataset_s3_uri = getattr(args, "dataset_s3_uri", "") or ""
+            if _dataset_s3_uri:
+                try:
+                    import mlflow
+                    import mlcc_mlflow as _mm
+                    if _mm._mlflow_configured():
+                        # _mlflow_configured() applies the tracking URI to the env
+                        # as a side effect, so mlflow.* picks it up here.
+                        active = mlflow.active_run()
+                        if active is not None:
+                            _mm.log_training_dataset_lineage(
+                                dataset_s3_uri=_dataset_s3_uri,
+                                dataset_name=adapter_name,
+                            )
+                        else:
+                            mlflow.set_experiment("Default")
+                            with mlflow.start_run(run_name=f"lineage-{adapter_name}"):
+                                _mm.log_training_dataset_lineage(
+                                    dataset_s3_uri=_dataset_s3_uri,
+                                    dataset_name=adapter_name,
+                                )
+                except Exception as lineage_err:  # noqa: BLE001 — lineage is best-effort
+                    print(f"\u26a0\ufe0f  dataset\u2192model lineage edge skipped (non-fatal: "
+                          f"{lineage_err}).", file=sys.stderr)
         except BaseRunNotFoundError as e:
             # Fail fast BEFORE any adapter registration — never link to a
             # missing/guessed base run (enforces Req 3 under the failure path).
@@ -561,6 +589,24 @@ def cmd_register_adapter(args):
         version = _extract_version_from_arn(model_package_arn)
 
         print(f"Registered adapter version {version}: {model_package_arn}", file=sys.stderr)
+
+        # BL123 (Req 6.2): draw the base→derivative lineage edge in SageMaker ML
+        # Lineage, driven by the family linkage we already have (parent_version_arn
+        # is the base model package; model_package_arn is this adapter). The user
+        # never calls AddAssociation — MLCC turns the family relationship into a
+        # native DerivedFrom edge. Non-fatal + idempotent: a lineage failure must
+        # not break the adapter registration the user asked for.
+        try:
+            import mlcc_mlflow
+            mlcc_mlflow.add_derived_from_edge(
+                base_source_uri=parent_version_arn,
+                derivative_source_uri=model_package_arn,
+                region=region,
+            )
+        except Exception as lineage_err:  # noqa: BLE001 — lineage is best-effort
+            print(f"\u26a0\ufe0f  base\u2192derivative lineage edge skipped (non-fatal: {lineage_err}).",
+                  file=sys.stderr)
+
         _output({
             "mpg_arn": mpg_arn,
             "model_package_arn": model_package_arn,

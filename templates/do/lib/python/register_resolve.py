@@ -16,7 +16,7 @@ from common import _output, _error_exit, _check_sagemaker_core
 from register_common import _load_registry
 import register_common
 import dataset_store
-from register_dataset import _get_hub_name_from_profile, _resolve_core_bucket
+from register_dataset import _resolve_core_bucket
 from register_model import _extract_version_from_arn, _check_ai_registry
 
 

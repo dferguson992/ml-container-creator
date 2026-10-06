@@ -34,9 +34,7 @@ from register_model import (  # noqa: E402
 from register_dataset import (  # noqa: E402
     cmd_register_dataset, cmd_register_evaluator,
     cmd_discover_dataset, cmd_delete_dataset,
-    _get_hub_name_from_profile, _register_to_hub,
     _compute_content_hash, _get_latest_version, _increment_version,
-    _parse_technique_from_description, _list_hub_datasets,
     _count_newlines_streaming, _count_rows_parquet, _count_rows,
     _resolve_core_bucket, _build_custom_metadata, _build_sidecar_doc,
 )
@@ -106,9 +104,10 @@ def main():
     dataset_parser.add_argument("--name", required=True, help="Dataset name (unique identifier)")
     dataset_parser.add_argument("--s3-uri", required=True, help="S3 URI of the dataset")
     dataset_parser.add_argument("--format", default="jsonl", choices=["jsonl", "parquet", "csv"], help="Dataset format")
-    dataset_parser.add_argument("--technique", default="benchmark", choices=["sft", "dpo", "rlaif", "rlvr", "benchmark"], help="Associated tuning technique (default: benchmark for AIPerf BYOD benchmark/eval datasets)")
+    dataset_parser.add_argument("--technique", default="benchmark", choices=["sft", "dpo", "rlvr", "rlaif", "mtrl", "benchmark"], help="Associated tuning technique (default: benchmark for AIPerf BYOD benchmark/eval datasets). sft/dpo/rlvr/rlaif/mtrl register natively in the AI Registry; rlaif/mtrl prompt corpora register under the RLVR member with the intended technique recorded in the sidecar.")
     dataset_parser.add_argument("--row-count", type=int, default=None, help="Number of rows in dataset")
     dataset_parser.add_argument("--column-schema", default=None, help="Column schema as JSON string")
+    dataset_parser.add_argument("--description", default=None, help="Human description shown in Studio Assets (the UI 'title' is the dataset name; there is no separate title field)")
     dataset_parser.add_argument("--project-name", default=None, help="Project name for context")
     dataset_parser.add_argument("--region", default=None, help="AWS region (for S3 hash computation)")
     dataset_parser.add_argument("--core-bucket", default=None, help="MLCC Core bucket for the S3 sidecar (defaults to $CORE_BUCKET)")
@@ -121,7 +120,7 @@ def main():
 
     # ── list-datasets ─────────────────────────────────────────────────────
     list_datasets_parser = subparsers.add_parser("list-datasets", help="List all registered datasets")
-    list_datasets_parser.add_argument("--technique", default=None, choices=["sft", "dpo", "rlaif", "rlvr", "benchmark"], help="Filter by tuning technique")
+    list_datasets_parser.add_argument("--technique", default=None, choices=["sft", "dpo", "rlvr", "rlaif", "mtrl", "benchmark"], help="Filter by tuning technique")
     list_datasets_parser.add_argument("--source", choices=["remote", "local", "all"], default="all", help="Dataset source to list")
     list_datasets_parser.add_argument("--region", default=None, help="AWS region")
     list_datasets_parser.add_argument("--core-bucket", default=None, help="MLCC Core bucket (defaults to $CORE_BUCKET)")

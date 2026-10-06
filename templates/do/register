@@ -79,7 +79,10 @@ _show_usage() {
     echo ""
     echo "  Shared options:"
     echo "  <name>              Dataset name (required, positional)"
-    echo "  --technique <tech>  Technique: sft, dpo, rlaif, rlvr, benchmark (default: benchmark)"
+    echo "  --technique <tech>  Technique: sft, dpo, rlvr, rlaif, mtrl, benchmark (default: benchmark)."
+    echo "                      sft/dpo register natively under their own member; rlvr/rlaif/mtrl"
+    echo "                      under the RLVR member; benchmark is sidecar-only."
+    echo "  --description <d>   Optional human description shown in SageMaker Studio Assets."
     echo "  --row-count <n>     Number of records (with --hf-id, passed to staging as --take)"
     echo "  --format <fmt>      Format: jsonl, parquet, csv (default: jsonl)"
     echo "  --column-schema <j> Column schema as JSON string"
@@ -172,6 +175,7 @@ DATASET_HF_SPLIT=""
 DATASET_COLUMN_MAP=""
 DATASET_FORMAT="jsonl"
 DATASET_TECHNIQUE="benchmark"
+DATASET_DESCRIPTION=""
 DATASET_ROW_COUNT=""
 DATASET_COLUMN_SCHEMA=""
 DATASET_HF_FILES=""
@@ -229,6 +233,8 @@ if [ "${SUBCOMMAND}" = "dataset" ]; then
             --format=*)     DATASET_FORMAT="${1#*=}"; shift ;;
             --technique)    DATASET_TECHNIQUE="$2"; shift 2 ;;
             --technique=*)  DATASET_TECHNIQUE="${1#*=}"; shift ;;
+            --description)  DATASET_DESCRIPTION="$2"; shift 2 ;;
+            --description=*) DATASET_DESCRIPTION="${1#*=}"; shift ;;
             --row-count)    DATASET_ROW_COUNT="$2"; shift 2 ;;
             --row-count=*)  DATASET_ROW_COUNT="${1#*=}"; shift ;;
             --column-schema) DATASET_COLUMN_SCHEMA="$2"; shift 2 ;;
@@ -767,12 +773,16 @@ if [ "${SUBCOMMAND}" = "dataset" ]; then
         exit 1
     fi
 
-    # Validate technique
+    # Validate technique. Each label maps to a native AI Registry
+    # CustomizationTechnique member: sft→SFT, dpo→DPO, and rlvr/rlaif/mtrl all land
+    # on the RLVR member (their training input is a prompt corpus of the same
+    # shape; the intended technique is recorded in the sidecar). benchmark is
+    # sidecar-only (an AIPerf BYOD corpus, not a customization input).
     case "${DATASET_TECHNIQUE}" in
-        sft|dpo|rlaif|rlvr|benchmark) ;;
+        sft|dpo|rlvr|rlaif|mtrl|benchmark) ;;
         *)
             echo "❌ Invalid technique: ${DATASET_TECHNIQUE}"
-            echo "   Valid values: sft, dpo, rlaif, rlvr, benchmark"
+            echo "   Valid values: sft, dpo, rlvr, rlaif, mtrl, benchmark"
             exit 1
             ;;
     esac
@@ -944,6 +954,10 @@ if [ "${SUBCOMMAND}" = "dataset" ]; then
 
     if [ -n "${DATASET_COLUMN_SCHEMA}" ]; then
         DS_ARGS+=("--column-schema" "${DATASET_COLUMN_SCHEMA}")
+    fi
+
+    if [ -n "${DATASET_DESCRIPTION}" ]; then
+        DS_ARGS+=("--description" "${DATASET_DESCRIPTION}")
     fi
 
     DS_ARGS+=("--project-name" "${PROJECT_NAME}")

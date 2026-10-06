@@ -381,18 +381,88 @@ MCC indexes datasets with an **S3 sidecar** for reproducible tuning workflows.
 | Tier | Location | Purpose |
 |------|----------|---------|
 | **S3 sidecar** (source of truth) | `s3://<CORE_BUCKET>/datasets/<name>/_dataset.json` | Version tracking, content hashes, custom metadata, name resolution |
-| **SageMaker AI Registry Hub** (supplementary, deferred) | SageMaker Hub (`mlcc-registry-{accountId}`) | Cross-account discoverability, Studio visibility |
+| **Native AI Registry** (discoverability) | SageMaker's own AI Registry hub, tagged with your Studio domain | Studio Assets visibility, native semver, ML Lineage edges |
 
 The sidecar is populated automatically by `do/register dataset` and is the
 source of truth for versioning and `@v<N>` pinning. It sits beside the dataset
 bytes (which land at `s3://<CORE_BUCKET>/datasets/<name>/`), so the registry is
-durable and shared across machines. Hub integration is preserved but deferred to
-a later phase.
+durable and shared across machines. It is written **first** and never depends on
+anything else succeeding.
+
+After the sidecar is written, `do/register dataset` **additively** registers the
+same dataset in SageMaker's native AI Registry so it shows up in **Studio
+Assets** — pointing at the same S3 URI (no copy). This step is best-effort: if it
+is skipped or fails (see below), the sidecar still stands and the dataset is
+fully usable; it just won't appear in Studio until the native registration
+succeeds.
+
+##### Studio discoverability (the domain tag)
+
+Native assets become visible in Studio Assets only when they are tagged with a
+Studio **domain id**. MLCC passes that tag automatically when the
+`sagemaker-domain` bootstrap module is provisioned (its `DomainId` is captured
+into your active profile at bootstrap time). Without a provisioned domain the
+dataset is still registered natively, but it is not tagged into Studio Assets —
+`do/register dataset` prints a note telling you to provision the
+`sagemaker-domain` module to enable Studio visibility.
+
+##### Native versioning vs the sidecar `@vN`
+
+The two version schemes do not conflict and you never reconcile them by hand:
+
+- The **sidecar `@vN`** (ordinal + semver) is MLCC's canonical, pin-able display
+  version — it is what `do/tune --dataset name@v2` resolves against.
+- The **native AI Registry semver** auto-increments internally each time you
+  re-register the same name. It is a registry-internal detail; you don't pin
+  against it.
+
+##### Technique labels and native members
+
+`--technique` accepts `sft`, `dpo`, `rlvr`, `rlaif`, `mtrl`, and `benchmark`.
+Each dataset-driven label maps to a native `CustomizationTechnique` member:
+`sft`→SFT, `dpo`→DPO, and `rlvr`/`rlaif`/`mtrl` all land on the **RLVR** member
+(their training input is a prompt corpus of the same shape; the intended
+technique is recorded in the sidecar so `do/tune` resolves it correctly).
+`benchmark` is **sidecar-only** — it is an AIPerf BYOD benchmark corpus, not a
+customization input, so it is not registered natively. Reward prompts and reward
+functions are **evaluators, not datasets**: `do/register dataset` rejects them
+and points you at `do/register prompt` / `do/register evaluator`.
+
+##### Region and SDK requirements
+
+Native registration and ML Lineage are region-gated to `us-east-1`,
+`us-west-2`, `ap-northeast-1`, and `eu-west-1`, and need a recent `sagemaker`
+SDK. Outside a supported region, or on an SDK that doesn't expose
+`sagemaker.ai_registry`, the native step is skipped with a clear message (an
+upgrade hint for the SDK case) — the sidecar and the MLflow→Model-Registry path
+are unaffected.
+
+##### Lineage: how datasets, models, and derivatives connect
+
+MLCC turns the metadata it already records into native **ML Lineage** edges, so
+Studio's lineage graph connects your assets without you ever calling
+`AddAssociation` yourself. Two edges are drawn, both best-effort and idempotent:
+
+- **dataset → model**: the training dataset is logged as an input on the MLflow
+  run that produced the model, so Studio links the dataset to the model it
+  trained. This is driven only by the dataset S3 URI, so it covers both the
+  `do/tune` adapter path and the `do/train` GRPO path.
+- **base → derivative**: when you register an adapter or draft with
+  `do/register`, MLCC adds a `DerivedFrom` edge from the base model to the new
+  derivative, driven by the `mlcc.family` linkage it already resolves.
+
+SageMaker creates the underlying lineage artifacts asynchronously, so an edge
+may be skipped on the first call if the artifact isn't materialized yet; the
+family linkage is still recorded in the model metadata, and a later re-register
+draws the edge. Live Studio/lineage rendering is validated against a real
+account.
 
 !!! note "Console Import Not Supported"
     The SageMaker Studio console's dataset import UI has a known schema validation
     bug (injects internal session properties). Always register datasets via
-    `do/register dataset` or the SDK — not the console.
+    `do/register dataset` or the SDK — not the console. `do/register dataset`
+    lands the dataset in the native AI Registry for you, so you get Studio
+    discoverability without touching the console import UI.
 
 #### Using registered datasets
 
@@ -447,11 +517,15 @@ technique, and row count from the most recent tune job.
 ##### Custom metadata
 
 Attach attribution, lineage, origination, and application metadata; these are
-recorded under `customMetadata` in the S3 sidecar (unset fields are omitted):
+recorded under `customMetadata` in the S3 sidecar (unset fields are omitted). Use
+`--description` for a human-readable summary that is also shown on the native
+asset in Studio Assets (the asset's title is the dataset name — there is no
+separate title field):
 
 ```bash
 ./do/register dataset my-dataset \
   --s3-uri s3://my-bucket/data.jsonl --technique sft \
+  --description "Open-Orca throughput calibration set" \
   --attribution "Acme Research" \
   --lineage "derived from open-orca v2, filtered" \
   --origination "hf://Open-Orca/OpenOrca@main" \
