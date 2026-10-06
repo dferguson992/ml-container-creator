@@ -16,7 +16,7 @@
       "type": "enum",
       "values": ["auto", "vllm", "tensorrt-llm", "lmi-dist"],
       "default": "auto",
-      "description": "Pluggable inference backend: LMI is a meta-engine that delegates serving to vLLM, TensorRT-LLM, or LMI-Dist (or auto-selects). LMI-specific — vLLM/SGLang ARE a single engine and expose no equivalent 'choose your backend' knob."
+      "description": "Pluggable inference backend: LMI is a meta-engine that delegates serving to a chosen backend (vLLM, TensorRT-LLM, or LMI-Dist), or auto-selects one."
     }
   }
 }

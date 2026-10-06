@@ -185,8 +185,39 @@ fi
 # Mirrors deploy.d/hyperpod-eks (BL096): the GPU-derived resource requests are
 # resolved at DEPLOY time so changing the instance type keeps node affinity and
 # tensor-parallel degree in sync.
+#
+# derive-dont-hardcode (ADR-008): the GPU count is OWNED by the instance catalog,
+# shipped into the project at .mlcc/instances.json (the same source
+# deploy-config-builder.js, hyperpod-eks, and the benchmark writer use). Read it
+# first so new instance families (g7/g7e, p6-b200, ...) resolve without editing
+# this script; the hardcoded case is ONLY a fallback for when the catalog is
+# absent/unreadable.
 _eks_detect_gpu_count() {
-    local suffix="${1#ml.}"
+    local itype="${1}"
+    [ -n "${itype}" ] || { echo 1; return; }
+
+    # 1) Authoritative source: .mlcc/instances.json (catalog[<ml.type>].gpus).
+    #    ${SCRIPT_DIR:-} so an unset SCRIPT_DIR degrades to the fallback case.
+    local _catalog="${SCRIPT_DIR:-}/../.mlcc/instances.json"
+    if [ -n "${SCRIPT_DIR:-}" ] && [ -f "${_catalog}" ] && command -v python3 >/dev/null 2>&1; then
+        local _gpus
+        _gpus="$(ITYPE="${itype}" CATALOG="${_catalog}" python3 -c '
+import json, os
+try:
+    cat = json.load(open(os.environ["CATALOG"]))["catalog"]
+    g = cat.get(os.environ["ITYPE"], {}).get("gpus")
+    print(int(g) if g and int(g) > 0 else "")
+except Exception:
+    print("")
+' 2>/dev/null)" || _gpus=""
+        if [ -n "${_gpus}" ]; then
+            echo "${_gpus}"
+            return
+        fi
+    fi
+
+    # 2) Fallback only when the catalog is unavailable or lacks the type.
+    local suffix="${itype#ml.}"
     case "${suffix}" in
         g5.xlarge|g5.2xlarge|g5.4xlarge|g5.8xlarge|g5.16xlarge) echo 1 ;;
         g5.12xlarge|g5.24xlarge) echo 4 ;;
@@ -195,6 +226,7 @@ _eks_detect_gpu_count() {
         g6.12xlarge|g6.24xlarge) echo 4 ;;
         g6.48xlarge) echo 8 ;;
         p4d.24xlarge|p4de.24xlarge|p5.48xlarge) echo 8 ;;
+        p6-b300.48xlarge) echo 8 ;;
         *) echo 1 ;;
     esac
 }

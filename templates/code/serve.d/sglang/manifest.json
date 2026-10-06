@@ -31,7 +31,7 @@
       "env_var": "SGLANG_ENABLE_RADIX_CACHE",
       "type": "boolean",
       "default": "false",
-      "description": "RadixAttention: automatic KV-cache reuse across requests sharing a prefix, via a radix tree. SGLang-specific — vLLM has block-level prefix caching, not RadixAttention. Big TTFT wins on multi-turn/RAG/agent workloads with shared prefixes."
+      "description": "RadixAttention: automatic KV-cache reuse across requests that share a prompt prefix, via a radix tree. Can reduce time-to-first-token on workloads with shared prefixes such as multi-turn chat, RAG, and agents."
     }
   }
 }

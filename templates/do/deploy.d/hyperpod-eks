@@ -370,12 +370,41 @@ export HP_INSTANCE_TYPE="${HP_INSTANCE_TYPE:-${HP_NODE_SELECTOR:-${INSTANCE_TYPE
 # GPU count would otherwise cause wrong node affinity (scheduling failures) and
 # a wrong tensor-parallel degree (OOM).
 #
-# The lookup table mirrors GPU_MAP in src/lib/deploy-config-builder.js. Unknown
-# instance types fall back to 1 GPU. CPU/memory scale with the GPU count
-# (cpu = gpu*4 cores, memory = gpu*16 Gi), matching the CRD template defaults.
+# derive-dont-hardcode (ADR-008): the GPU count is OWNED by the instance catalog,
+# which the generator ships into the project at .mlcc/instances.json (the same
+# source deploy-config-builder.js and the benchmark writer use). We read it here
+# so new instance families (g7/g7e, p6-b200, ...) are picked up without editing
+# this script. The hardcoded case below is ONLY a fallback for when the catalog
+# is absent/unreadable; it is a small known subset, not the source of truth.
+# Unknown types fall back to 1 GPU. CPU/memory scale with GPU count (cpu = gpu*4
+# cores, memory = gpu*16 Gi), matching the CRD template defaults.
 _hp_detect_gpu_count() {
-    # Strip the ml. prefix; the family.size suffix is the lookup key.
-    local suffix="${1#ml.}"
+    local itype="${1}"
+    [ -n "${itype}" ] || { echo 1; return; }
+
+    # 1) Authoritative source: .mlcc/instances.json (catalog[<ml.type>].gpus).
+    #    ${SCRIPT_DIR:-} so an unset SCRIPT_DIR degrades to the fallback case
+    #    (and does not trip `set -u`).
+    local _catalog="${SCRIPT_DIR:-}/../.mlcc/instances.json"
+    if [ -n "${SCRIPT_DIR:-}" ] && [ -f "${_catalog}" ] && command -v python3 >/dev/null 2>&1; then
+        local _gpus
+        _gpus="$(ITYPE="${itype}" CATALOG="${_catalog}" python3 -c '
+import json, os
+try:
+    cat = json.load(open(os.environ["CATALOG"]))["catalog"]
+    g = cat.get(os.environ["ITYPE"], {}).get("gpus")
+    print(int(g) if g and int(g) > 0 else "")
+except Exception:
+    print("")
+' 2>/dev/null)" || _gpus=""
+        if [ -n "${_gpus}" ]; then
+            echo "${_gpus}"
+            return
+        fi
+    fi
+
+    # 2) Fallback only when the catalog is unavailable or lacks the type.
+    local suffix="${itype#ml.}"
     case "${suffix}" in
         g5.xlarge|g5.2xlarge|g5.4xlarge|g5.8xlarge|g5.16xlarge) echo 1 ;;
         g5.12xlarge|g5.24xlarge) echo 4 ;;
