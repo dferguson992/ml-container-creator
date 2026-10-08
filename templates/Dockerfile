@@ -270,8 +270,14 @@ ENV VLLM_ALLOW_RUNTIME_LORA_UPDATING=true
     Serve the base model cleanly here; wire SGLang LoRA at adapter-attach time when
     the companion values are known. (vLLM LoRA is baked above and is valid bare.) %>
 
-<% if (typeof modelSource !== 'undefined' && modelSource && modelSource !== 'huggingface' && modelServer !== 'lmi' && modelServer !== 'djl' && modelServer !== 'llama-cpp') { %>
-# Install AWS CLI for S3 model downloads
+<%# AWS CLI is installed for ALL wrapper-path engines (vllm/sglang/tensorrt-llm),
+    NOT gated on the generate-time modelSource: a huggingface-generated project
+    can be staged to S3 at deploy time (do/stage → MODEL_SOURCE=s3), and
+    code/serve's download_model_from_s3 then needs `aws s3`. Model-B engines
+    (lmi/djl/llama-cpp) load the model via their DLC and never call this path, so
+    they are excluded. %>
+<% if (modelServer !== 'lmi' && modelServer !== 'djl' && modelServer !== 'llama-cpp') { %>
+# Install AWS CLI for S3 model downloads (do/stage → MODEL_SOURCE=s3 at deploy time)
 RUN pip install --no-cache-dir awscli
 
 <% } %>

@@ -307,9 +307,17 @@ describe('DSpark: deploy.d/hyperpod-eks wiring', () => {
             'export VLLM_SPECULATIVE_REJECTION_SAMPLE_METHOD="${HP_SPECULATIVE_REJECTION_SAMPLE_METHOD:-}"'));
     });
 
-    it('treats the two new vars as managed (not double-injected as pass-through extras)', () => {
-        assert.ok(DEPLOY_TEMPLATE.includes('"VLLM_SPECULATIVE_DRAFT_SAMPLE_METHOD"'));
-        assert.ok(DEPLOY_TEMPLATE.includes('"VLLM_SPECULATIVE_REJECTION_SAMPLE_METHOD"'));
+    it('excludes speculative vars from Tier-2 pass-through via the derived SPECULATIVE rule (ADR-010)', () => {
+        // ADR-010 removed the hardcoded `managed` VLLM_* list. Speculative vars are
+        // now excluded from the Tier-2 prefix pass-through by a derived rule — any
+        // key containing "SPECULATIVE" is skipped — so they are never double-
+        // injected as pass-through extras, for every engine. Assert the derivation
+        // rule is present, not a frozen literal list.
+        assert.ok(DEPLOY_TEMPLATE.includes('"SPECULATIVE" in k'),
+            'Tier-2 pass-through must skip speculative vars via the derived substring rule');
+        // The hardcoded managed-set literal must be gone (derive-dont-hardcode).
+        assert.ok(!DEPLOY_TEMPLATE.includes('"VLLM_SPECULATIVE_DRAFT_SAMPLE_METHOD",'),
+            'no hardcoded VLLM_* managed-set literal should remain');
     });
 });
 

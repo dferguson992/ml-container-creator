@@ -13,6 +13,7 @@
   "dimension_map": {
     "max_model_len": "CTX_SIZE"
   },
+  "capability_map": {},
   "engine_features": {
     "gpu_layers": {
       "env_var": "SM_LLAMA_CPP_N_GPU_LAYERS",

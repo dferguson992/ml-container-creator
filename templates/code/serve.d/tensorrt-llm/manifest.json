@@ -15,5 +15,9 @@
     "tensor_parallel_degree": "TENSOR_PARALLEL_SIZE",
     "max_model_len": "MAX_INPUT_LEN"
   },
+  "capability_map": {
+    "tensor_parallel_degree": { "suffix": "TENSOR_PARALLEL_SIZE", "value_type": "valued" },
+    "quantization": { "suffix": "DTYPE", "value_type": "valued" }
+  },
   "min_version": "1.0.0"
 }

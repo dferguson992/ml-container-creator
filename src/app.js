@@ -706,18 +706,24 @@ export async function writeProject(templateDir, destDir, answers, registryConfig
     // do/deploy.d/eks can re-render from the template at deploy time — the render
     // source of truth is the .ejs template resolved against current do/config, not
     // the generate-time-frozen eks/*.yaml that copyTpl also writes (kept only as the
-    // envsubst-fallback input). Only the plain-EKS target needs this.
-    if (answers.deploymentTarget === 'eks') {
-        const eksTemplateDir = path.join(templateDir, 'eks');
-        if (fs.existsSync(eksTemplateDir)) {
-            const eksDestDir = path.join(destDir, 'eks');
-            fs.mkdirSync(eksDestDir, { recursive: true });
-            for (const ejsSrc of fs.readdirSync(eksTemplateDir)) {
-                if (!ejsSrc.endsWith('.yaml.ejs')) continue;
-                // Copy verbatim (NOT EJS-rendered): the deploy-time render owns the
-                // <%= %> resolution so instanceType/GPU/model/serve reflect deploy time.
-                _copyFile(path.join(eksTemplateDir, ejsSrc), path.join(eksDestDir, ejsSrc));
-            }
+    // envsubst-fallback input).
+    //
+    // This is ALWAYS done, for every project. The deployment target is a
+    // DEPLOY-TIME choice (`do/deploy --target eks`), NOT a generation-time answer —
+    // at generation `answers.deploymentTarget` is just the default
+    // (realtime-inference). Gating this on `=== 'eks'` therefore meant the .ejs
+    // source was NEVER shipped, so every EKS deploy's node+ejs render loop matched
+    // zero files and silently applied nothing. Any project can deploy to EKS, so
+    // every project carries the .ejs source.
+    const eksTemplateDir = path.join(templateDir, 'eks');
+    if (fs.existsSync(eksTemplateDir)) {
+        const eksDestDir = path.join(destDir, 'eks');
+        fs.mkdirSync(eksDestDir, { recursive: true });
+        for (const ejsSrc of fs.readdirSync(eksTemplateDir)) {
+            if (!ejsSrc.endsWith('.yaml.ejs')) continue;
+            // Copy verbatim (NOT EJS-rendered): the deploy-time render owns the
+            // <%= %> resolution so instanceType/GPU/model/serve reflect deploy time.
+            _copyFile(path.join(eksTemplateDir, ejsSrc), path.join(eksDestDir, ejsSrc));
         }
     }
 
