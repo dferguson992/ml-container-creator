@@ -1,11 +1,11 @@
 {
   "version": "2026-05-27",
-  "lastSynced": "2026-10-09T19:21:30.097Z",
+  "lastSynced": "2026-10-13T18:23:41.572Z",
   "source": "https://docs.aws.amazon.com/sagemaker/latest/dg/model-customize-open-weight.html",
   "models": {
     "huggingface-llm-qwen2-5-7b-instruct": {
       "family": "qwen-2.5",
-      "provider": "alibaba",
+      "provider": "Qwen",
       "displayName": "Qwen2.5-7B-Instruct",
       "huggingFaceId": "Qwen/Qwen2.5-7B-Instruct",
       "techniques": {
@@ -76,7 +76,7 @@
     },
     "huggingface-llm-qwen2-5-14b-instruct": {
       "family": "qwen-2.5",
-      "provider": "alibaba",
+      "provider": "Qwen",
       "displayName": "Qwen2.5 14B Instruct",
       "huggingFaceId": "Qwen/Qwen2.5-14B-Instruct",
       "techniques": {
@@ -147,7 +147,7 @@
     },
     "huggingface-llm-qwen2-5-32b-instruct": {
       "family": "qwen-2.5",
-      "provider": "alibaba",
+      "provider": "Qwen",
       "displayName": "Qwen2.5 32B Instruct",
       "huggingFaceId": "Qwen/Qwen2.5-32B-Instruct",
       "techniques": {
@@ -218,7 +218,7 @@
     },
     "huggingface-llm-qwen2-5-72b-instruct": {
       "family": "qwen-2.5",
-      "provider": "alibaba",
+      "provider": "Qwen",
       "displayName": "Qwen2.5-72B-Instruct",
       "huggingFaceId": "Qwen/Qwen2.5-72B-Instruct",
       "techniques": {
@@ -289,7 +289,7 @@
     },
     "huggingface-reasoning-qwen3-06b": {
       "family": "qwen-3",
-      "provider": "alibaba",
+      "provider": "Qwen",
       "displayName": "Qwen3-0.6B",
       "huggingFaceId": "Qwen/Qwen3-0.6B",
       "techniques": {
@@ -360,7 +360,7 @@
     },
     "huggingface-reasoning-qwen3-1-7b": {
       "family": "qwen-3",
-      "provider": "alibaba",
+      "provider": "Qwen",
       "displayName": "Qwen3-1.7B",
       "huggingFaceId": "Qwen/Qwen3-1.7B",
       "techniques": {
@@ -431,7 +431,7 @@
     },
     "huggingface-reasoning-qwen3-4b": {
       "family": "qwen-3",
-      "provider": "alibaba",
+      "provider": "Qwen",
       "displayName": "Qwen3-4B",
       "huggingFaceId": "Qwen/Qwen3-4B",
       "techniques": {
@@ -502,7 +502,7 @@
     },
     "huggingface-reasoning-qwen3-8b": {
       "family": "qwen-3",
-      "provider": "alibaba",
+      "provider": "Qwen",
       "displayName": "Qwen3-8B",
       "huggingFaceId": "Qwen/Qwen3-8B",
       "techniques": {
@@ -573,7 +573,7 @@
     },
     "huggingface-reasoning-qwen3-14b": {
       "family": "qwen-3",
-      "provider": "alibaba",
+      "provider": "Qwen",
       "displayName": "Qwen3 14B",
       "huggingFaceId": "Qwen/Qwen3-14B",
       "techniques": {
@@ -644,7 +644,7 @@
     },
     "huggingface-reasoning-qwen3-32b": {
       "family": "qwen-3",
-      "provider": "alibaba",
+      "provider": "Qwen",
       "displayName": "Qwen3-32B",
       "huggingFaceId": "Qwen/Qwen3-32B",
       "techniques": {
@@ -715,7 +715,7 @@
     },
     "deepseek-llm-r1-distill-llama-8b": {
       "family": "deepseek-r1",
-      "provider": "deepseek",
+      "provider": "deepseek-ai",
       "displayName": "DeepSeek-R1-Distill-Llama-8B",
       "huggingFaceId": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
       "techniques": {
@@ -786,7 +786,7 @@
     },
     "deepseek-llm-r1-distill-llama-70b": {
       "family": "deepseek-r1",
-      "provider": "deepseek",
+      "provider": "deepseek-ai",
       "displayName": "DeepSeek-R1-Distill-Llama-70B",
       "huggingFaceId": "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
       "techniques": {
@@ -857,7 +857,7 @@
     },
     "deepseek-llm-r1-distill-qwen-1-5b": {
       "family": "deepseek-r1",
-      "provider": "deepseek",
+      "provider": "deepseek-ai",
       "displayName": "DeepSeek-R1-Distill-Qwen-1.5B",
       "huggingFaceId": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
       "techniques": {
@@ -928,7 +928,7 @@
     },
     "deepseek-llm-r1-distill-qwen-7b": {
       "family": "deepseek-r1",
-      "provider": "deepseek",
+      "provider": "deepseek-ai",
       "displayName": "DeepSeek-R1-Distill-Qwen-7B",
       "huggingFaceId": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
       "techniques": {
@@ -999,7 +999,7 @@
     },
     "deepseek-llm-r1-distill-qwen-14b": {
       "family": "deepseek-r1",
-      "provider": "deepseek",
+      "provider": "deepseek-ai",
       "displayName": "DeepSeek-R1-Distill-Qwen-14B",
       "huggingFaceId": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
       "techniques": {
@@ -1070,7 +1070,7 @@
     },
     "deepseek-llm-r1-distill-qwen-32b": {
       "family": "deepseek-r1",
-      "provider": "deepseek",
+      "provider": "deepseek-ai",
       "displayName": "DeepSeek-R1-Distill-Qwen-32B",
       "huggingFaceId": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
       "techniques": {
@@ -1490,6 +1490,20 @@
               "prompt": "array"
             }
           }
+        },
+        "mtrl": {
+          "trainingTypes": [
+            "lora"
+          ],
+          "datasetFormat": "default-mtrl",
+          "datasetSchema": {
+            "required": [
+              "prompt"
+            ],
+            "types": {
+              "prompt": "array"
+            }
+          }
         }
       },
       "goldenPath": false
@@ -1567,9 +1581,9 @@
     },
     "huggingface-vlm-qwen3-6-27b": {
       "family": "huggingface-vlm",
-      "provider": "unknown",
+      "provider": "Qwen",
       "displayName": "Qwen3.6-27B",
-      "huggingFaceId": "",
+      "huggingFaceId": "Qwen/Qwen3.6-27B",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -1632,15 +1646,29 @@
               "rejected": "string"
             }
           }
+        },
+        "mtrl": {
+          "trainingTypes": [
+            "lora"
+          ],
+          "datasetFormat": "default-mtrl",
+          "datasetSchema": {
+            "required": [
+              "prompt"
+            ],
+            "types": {
+              "prompt": "array"
+            }
+          }
         }
       },
       "goldenPath": false
     },
     "huggingface-vlm-qwen3-5-9b": {
       "family": "huggingface-vlm",
-      "provider": "unknown",
+      "provider": "Qwen",
       "displayName": "Qwen3.5-9b",
-      "huggingFaceId": "",
+      "huggingFaceId": "Qwen/Qwen3.5-9B",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -1709,9 +1737,9 @@
     },
     "huggingface-vlm-qwen3-5-4b": {
       "family": "huggingface-vlm",
-      "provider": "unknown",
+      "provider": "Qwen",
       "displayName": "Qwen3.5-4B",
-      "huggingFaceId": "",
+      "huggingFaceId": "Qwen/Qwen3.5-4B",
       "techniques": {
         "rlaif": {
           "trainingTypes": [
@@ -1780,9 +1808,9 @@
     },
     "huggingface-vlm-qwen3-5-27b": {
       "family": "huggingface-vlm",
-      "provider": "unknown",
+      "provider": "Qwen",
       "displayName": "Qwen3.5-27b",
-      "huggingFaceId": "",
+      "huggingFaceId": "Qwen/Qwen3.5-27B",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -1851,9 +1879,9 @@
     },
     "huggingface-llm-nvidia-nemotron-3-super-120b-a12b-bf16": {
       "family": "huggingface-llm-nvidia-nemotron",
-      "provider": "unknown",
+      "provider": "nvidia",
       "displayName": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
-      "huggingFaceId": "",
+      "huggingFaceId": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -1922,9 +1950,9 @@
     },
     "huggingface-reasoning-nvidia-nemotron-3-nano-30b-a3b-bf16": {
       "family": "huggingface-reasoning-nvidia-nemotron",
-      "provider": "unknown",
+      "provider": "nvidia",
       "displayName": "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-      "huggingFaceId": "",
+      "huggingFaceId": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -1993,9 +2021,9 @@
     },
     "huggingface-vlm-gemma-4-e4b-it": {
       "family": "huggingface-vlm",
-      "provider": "unknown",
+      "provider": "google",
       "displayName": "gemma-4-e4b-it",
-      "huggingFaceId": "",
+      "huggingFaceId": "google/gemma-4-e4b-it",
       "techniques": {
         "dpo": {
           "trainingTypes": [
@@ -2064,9 +2092,9 @@
     },
     "huggingface-vlm-gemma-4-31b-it": {
       "family": "huggingface-vlm",
-      "provider": "unknown",
+      "provider": "google",
       "displayName": "gemma-4-31b-it",
-      "huggingFaceId": "",
+      "huggingFaceId": "google/gemma-4-31b-it",
       "techniques": {
         "dpo": {
           "trainingTypes": [
@@ -2129,15 +2157,29 @@
               "prompt": "array"
             }
           }
+        },
+        "mtrl": {
+          "trainingTypes": [
+            "lora"
+          ],
+          "datasetFormat": "default-mtrl",
+          "datasetSchema": {
+            "required": [
+              "prompt"
+            ],
+            "types": {
+              "prompt": "array"
+            }
+          }
         }
       },
       "goldenPath": false
     },
     "huggingface-reasoning-nemotron-3-5-lightning-30b-a3b-bf16": {
       "family": "huggingface-reasoning-nemotron",
-      "provider": "unknown",
+      "provider": "nvidia",
       "displayName": "NVIDIA Nemotron 3.5 Lightning 30B A3B BF16",
-      "huggingFaceId": "",
+      "huggingFaceId": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -2206,9 +2248,9 @@
     },
     "huggingface-vlm-qwen3-8-27b": {
       "family": "huggingface-vlm",
-      "provider": "unknown",
+      "provider": "Qwen",
       "displayName": "Qwen3.8 27B",
-      "huggingFaceId": "",
+      "huggingFaceId": "Qwen/Qwen3.8-27B",
       "techniques": {
         "dpo": {
           "trainingTypes": [
@@ -2277,9 +2319,9 @@
     },
     "huggingface-vlm-qwen3-6-35b-a3b": {
       "family": "huggingface-vlm",
-      "provider": "unknown",
+      "provider": "Qwen",
       "displayName": "Qwen3.6-35B-A3B",
-      "huggingFaceId": "",
+      "huggingFaceId": "Qwen/Qwen3.6-35B-A3B",
       "techniques": {
         "rlaif": {
           "trainingTypes": [
@@ -2330,9 +2372,9 @@
     },
     "huggingface-vlm-ministral-3-8b-instruct-2512-bf16": {
       "family": "huggingface-vlm",
-      "provider": "unknown",
+      "provider": "mistralai",
       "displayName": "Ministral 3 8B Instruct 2512 BF16",
-      "huggingFaceId": "",
+      "huggingFaceId": "mistralai/Ministral-3-8B-Instruct-2512-BF16",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -2401,9 +2443,9 @@
     },
     "huggingface-vlm-ministral-3-3b-instruct-2512-bf16": {
       "family": "huggingface-vlm",
-      "provider": "unknown",
+      "provider": "mistralai",
       "displayName": "Ministral 3 3B Instruct 2512 BF16",
-      "huggingFaceId": "",
+      "huggingFaceId": "mistralai/Ministral-3-3B-Instruct-2512-BF16",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -2472,9 +2514,9 @@
     },
     "huggingface-vlm-ministral-3-14b-instruct-2512-bf16": {
       "family": "huggingface-vlm",
-      "provider": "unknown",
+      "provider": "mistralai",
       "displayName": "Ministral 3 14B Instruct 2512 BF16",
-      "huggingFaceId": "",
+      "huggingFaceId": "mistralai/Ministral-3-14B-Instruct-2512-BF16",
       "techniques": {
         "dpo": {
           "trainingTypes": [
@@ -2543,9 +2585,9 @@
     },
     "huggingface-vlm-gemma-4-26b-a4b-it": {
       "family": "huggingface-vlm",
-      "provider": "unknown",
+      "provider": "google",
       "displayName": "gemma-4-26b-a4b-it",
-      "huggingFaceId": "",
+      "huggingFaceId": "google/gemma-4-26B-A4B-it",
       "techniques": {
         "sft": {
           "trainingTypes": [

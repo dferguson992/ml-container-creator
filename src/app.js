@@ -19,6 +19,7 @@ import { resolvePrefixedEnvVars } from './lib/engine-prefix-resolver.js';
 import { isMarketplaceConfig, isMarketplaceModelName, refuseMarketplaceAndExit } from './lib/marketplace-refusal.js';
 import { readEnvVarPrefix, resolveEngineFeatureVars } from './lib/serve-manifest-reader.js';
 import { isLlm as tritonIsLlm, isKnownBackend as isTritonBackend } from './lib/triton-backend-reader.js';
+import { warnUnimplementedTechniques } from './lib/unimplemented-technique-warning.js';
 import {
     listPredictorFrameworks,
     pipDependencies as predictorPipDependencies,
@@ -318,6 +319,11 @@ export async function run(projectName, options) {
 
     console.log('\n✅ Project generated successfully!');
     console.log(`   📁 ${destDir}`);
+
+    // BL144 (Req 6): non-blocking note if the selected model advertises a managed
+    // technique MLCC recognizes but cannot yet drive (e.g. mtrl). Never alters the model
+    // id or exit status; generation has already completed.
+    warnUnimplementedTechniques(answers);
 }
 
 /**

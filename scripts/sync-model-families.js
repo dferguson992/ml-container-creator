@@ -21,6 +21,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { KNOWN_TECHNIQUES } from '../src/lib/managed-techniques.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -157,8 +158,12 @@ function parseRecipes(hubContentDocument) {
         if (!technique) continue;
 
         const normalizedTechnique = technique.toLowerCase();
-        const validTechniques = ['sft', 'dpo', 'rlaif', 'rlvr'];
-        if (!validTechniques.includes(normalizedTechnique)) continue;
+        // Keyed off the shared KNOWN enum so a known-but-unimplemented technique (mtrl —
+        // BL139) is RETAINED in the catalog rather than dropped at discovery. The
+        // downstream picker/warning decide implemented-vs-not; sync just records what
+        // the model advertises. (BL144 — this changes which TECHNIQUES are kept per
+        // model, NOT which models are discovered: KNOWN_PREFIXES is untouched.)
+        if (!KNOWN_TECHNIQUES.includes(normalizedTechnique)) continue;
 
         const trainingTypes = recipe.TrainingTypes || recipe.trainingTypes || ['lora'];
         const datasetFormat = recipe.DatasetFormat || recipe.datasetFormat || `default-${normalizedTechnique}`;
@@ -188,6 +193,9 @@ function getDefaultDatasetSchema(technique) {
         return { required: ['prompt', 'chosen', 'rejected'], types: { prompt: 'string', chosen: 'string', rejected: 'string' } };
     case 'rlaif':
     case 'rlvr':
+    case 'mtrl':
+        // mtrl's reward lives in the agent (message-list prompt channel), same
+        // prompt-array dataset shape as the other RL techniques.
         return { required: ['prompt'], types: { prompt: 'array' } };
     default:
         return { required: ['prompt'], types: { prompt: 'string' } };
@@ -206,14 +214,30 @@ function buildCatalogEntry(model, detail, recipes) {
     const hubContentName = model.HubContentName;
     const displayName = detail.HubContentDisplayName || detail.HubContentName || hubContentName;
 
-    // Attempt to derive HuggingFace ID from Hub metadata
+    // Extract HuggingFace id and provider from the Hub metadata document.
     let huggingFaceId = '';
+    let docProvider = '';
     if (detail.HubContentDocument) {
         try {
             const doc = typeof detail.HubContentDocument === 'string'
                 ? JSON.parse(detail.HubContentDocument)
                 : detail.HubContentDocument;
-            huggingFaceId = doc.HuggingFaceModelId || doc.huggingFaceModelId || doc.ModelId || '';
+            // JumpStart hub documents expose the HuggingFace id under a field whose
+            // casing varies by schema. Observed: `HuggingfaceId` (huggingface-vlm-*,
+            // e.g. "Qwen/Qwen3.6-27B"); older schemas used `HuggingFaceModelId` /
+            // `ModelId`. Check all known spellings so the vlm family (Qwen 3.6, Gemma 4)
+            // resolves a selectable id instead of being silently skipped by the picker.
+            huggingFaceId = doc.HuggingfaceId
+                || doc.HuggingFaceModelId
+                || doc.huggingFaceModelId
+                || doc.HuggingFaceId
+                || doc.ModelId
+                || '';
+            // The hub document carries the authoritative model MAKER in `Provider`
+            // (e.g. "Qwen", "nvidia", "deepseek"). Prefer it over name-prefix inference
+            // so the picker groups by the real provider instead of falling to "unknown"
+            // for families the prefix map does not recognize.
+            docProvider = typeof doc.Provider === 'string' ? doc.Provider : '';
         } catch {
             // Ignore parse errors
         }
@@ -230,7 +254,8 @@ function buildCatalogEntry(model, detail, recipes) {
 
     return {
         family: deriveFamily(hubContentName),
-        provider: deriveProvider(hubContentName),
+        // Hub-document `Provider` wins; name-prefix inference is the fallback.
+        provider: docProvider || deriveProvider(hubContentName),
         displayName,
         huggingFaceId,
         techniques

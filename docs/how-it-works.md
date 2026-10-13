@@ -72,6 +72,8 @@ The target directory must be `/opt/ml/model/` for SageMaker AI compatibility.
 
 Generative models (LLMs) are specified by HuggingFace model ID at generation time. MCC does not require a model format -- the serving framework handles downloading and loading the model into GPU memory. For supported models, you can fine-tune with `do/tune` and deploy the resulting adapter or full model — see the [Fine-Tuning Guide](fine-tuning.md) for the full workflow.
 
+In interactive generation, the transformers model prompt auto-lists both the managed-capable models (from the tune catalog) and general serving models, drawn from the same source `do/tune` validates against. Managed-capable entries are grouped by model family and show their supported managed techniques inline in brackets (e.g. `[SFT · DPO · RLVR · RLAIF]`); the highlighted model's footer shows a legend for those abbreviations. The list refreshes automatically when the catalog is re-synced. You are never restricted to the list — type any HuggingFace model ID to use it (unsupported models still work via `do/train`, with `do/optimize` returning fewer managed optimizations). If a listed model advertises a technique MLCC does not yet drive (e.g. multi-turn RL), that technique is omitted from the brackets, the footer notes it, and generation prints a non-blocking reminder afterward — the model stays usable for everything else.
+
 ```json
 {
   "framework": "transformers",

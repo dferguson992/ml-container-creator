@@ -196,7 +196,9 @@ export default class PromptRunner {
         const modelFormatPreviousAnswers = {
             ...frameworkAnswers,
             ...engineAnswers,
-            ...(this._mcpModelChoices ? { _mcpModelChoices: this._mcpModelChoices } : {})
+            ...(this._mcpModelChoices ? { _mcpModelChoices: this._mcpModelChoices } : {}),
+            ...(this._mcpModelCapabilities ? { _mcpModelCapabilities: this._mcpModelCapabilities } : {}),
+            ...(this._mcpModelMeta ? { _mcpModelMeta: this._mcpModelMeta } : {})
         };
         const modelFormatAnswers = await this._runPhase(
             modelFormatPrompts, 
