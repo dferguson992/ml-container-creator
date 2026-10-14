@@ -33,6 +33,51 @@ import { loadModuleManifest, selectModules, validateDependencies, findDependents
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/**
+ * Retired modules that are no longer in module-manifest.json but may still be present
+ * in a pre-upgrade profile's provisionedModules — so `remove-module` can tear them down
+ * during a one-time cutover. BL143: `hyperpod-cluster` (the pre-split 3-stack module)
+ * → removed in favor of layered `eks` + `hyperpod`. Synthetic descriptor carries the old
+ * stack set so teardown destroys the right CloudFormation stacks (reverse order).
+ */
+const LEGACY_REMOVABLE_MODULES = {
+    'hyperpod-cluster': {
+        displayName: 'HyperPod (EKS + Inference) [retired]',
+        depends: ['core'],
+        stacks: ['eks-cluster', 'hyperpod-cluster', 'inference-operator'],
+        resourceLevel: 'profile'
+    }
+};
+
+/**
+ * Every flat (denormalized) profile key that `_denormalizeModuleOutputs` can write.
+ * Used by `_forgetModuleFromProfile` to PURGE stale flat keys on module removal and then
+ * re-derive from the surviving modules — so a removed module leaves NO memory (neither
+ * `moduleOutputs[module]` nor a dangling `_PROFILE_*` flat key pointing at a destroyed
+ * resource). Keep in sync with `_denormalizeModuleOutputs`; the conformance test
+ * `bl143-forget-module` asserts every `profileData.<key> =` assignment is listed here.
+ * Excludes structural keys (awsProfile/accountId/awsRegion/provisionedModules/moduleOutputs).
+ */
+const DENORMALIZED_FLAT_KEYS = [
+    // core
+    'roleArn', 'ecrRepositoryName', 'coreS3Bucket', 'modelsS3Bucket',
+    // benchmark
+    'ciBenchmarkResultsBucket', 'benchmarkS3Bucket', 'ciGlueDatabase',
+    // registry
+    'modelPackageGroupName',
+    // training
+    'mlflowAppArn', 'trainingS3Bucket', 'adapterS3Bucket',
+    // ci
+    'ciInfraProvisioned', 'ciTableName', 'codebuildSourceS3Bucket',
+    // eks (BL143)
+    'eksClusterName', 'eksClusterArn', 'eksInferenceRoleArn',
+    'eksOidcProviderArn', 'eksOidcProviderIssuer',
+    // hyperpod (BL143)
+    'hyperpodClusterName', 'hyperpodClusterArn',
+    // sagemaker-domain
+    'domainId'
+];
+
 export default class BootstrapCommandHandler {
     constructor({ promptFn } = {}) {
         this.config = new BootstrapConfig();
@@ -88,8 +133,11 @@ export default class BootstrapCommandHandler {
             else if (arg === '--ignore-staleness') extractedOptions.ignoreStaleness = true;
             else if (arg === '--dry-run') extractedOptions.dryRun = true;
             else if (arg === '--force-delete') extractedOptions.forceDelete = true;
+            else if (arg === '--skip-teardown') extractedOptions.skipTeardown = true;
             else if (arg.startsWith('--with=')) extractedOptions.with = arg.slice('--with='.length);
             else if (arg === '--with' && i + 1 < args.length) { extractedOptions.with = args[++i]; }
+            else if (arg.startsWith('--module=')) extractedOptions.module = arg.slice('--module='.length);
+            else if (arg === '--module' && i + 1 < args.length) { extractedOptions.module = args[++i]; }
             else cleanArgs.push(arg);
         }
         args = cleanArgs;
@@ -198,7 +246,7 @@ export default class BootstrapCommandHandler {
         await this._handleStatus(options);
 
         const provisioned = activeProfile.config.provisionedModules || [];
-        const allModules = ['core', 'benchmark', 'registry', 'training', 'ci', 'sagemaker-domain', 'hyperpod-cluster'];
+        const allModules = Object.keys(loadModuleManifest().modules);
         const available = allModules.filter(m => !provisioned.includes(m));
 
         console.log('\n💡 Next steps:');
@@ -1119,16 +1167,25 @@ export default class BootstrapCommandHandler {
             if (outputs.ci.SourceBucket) profileData.codebuildSourceS3Bucket = outputs.ci.SourceBucket;
         }
 
-        // hyperpod-cluster → hyperpodClusterName, hyperpodEksClusterName, hyperpodSubnetId
-        if (outputs['hyperpod-cluster']) {
-            if (outputs['hyperpod-cluster'].HyperPodClusterName) {
-                profileData.hyperpodClusterName = outputs['hyperpod-cluster'].HyperPodClusterName;
+        // eks → eksClusterArn/Name, eksInferenceRoleArn (consumed by do/deploy.d/eks as
+        // _PROFILE_eksInferenceRoleArn), eksOidcProviderArn/Issuer (BL143 split).
+        if (outputs.eks) {
+            if (outputs.eks.EksClusterName) profileData.eksClusterName = outputs.eks.EksClusterName;
+            if (outputs.eks.EksClusterArn) profileData.eksClusterArn = outputs.eks.EksClusterArn;
+            if (outputs.eks.EksInferenceRoleArn) profileData.eksInferenceRoleArn = outputs.eks.EksInferenceRoleArn;
+            if (outputs.eks.OidcProviderArn) profileData.eksOidcProviderArn = outputs.eks.OidcProviderArn;
+            if (outputs.eks.OidcProviderIssuer) profileData.eksOidcProviderIssuer = outputs.eks.OidcProviderIssuer;
+        }
+
+        // hyperpod → hyperpodClusterArn/Name (BL143 split). HARD CUTOVER: there is NO
+        // compat alias for the old `hyperpod-cluster` module key — a profile still
+        // carrying moduleOutputs['hyperpod-cluster'] re-bootstraps (Req 3.3).
+        if (outputs.hyperpod) {
+            if (outputs.hyperpod.HyperPodClusterName) {
+                profileData.hyperpodClusterName = outputs.hyperpod.HyperPodClusterName;
             }
-            if (outputs['hyperpod-cluster'].EksClusterName) {
-                profileData.hyperpodEksClusterName = outputs['hyperpod-cluster'].EksClusterName;
-            }
-            if (outputs['hyperpod-cluster'].EksClusterArn) {
-                profileData.hyperpodEksClusterArn = outputs['hyperpod-cluster'].EksClusterArn;
+            if (outputs.hyperpod.HyperPodClusterArn) {
+                profileData.hyperpodClusterArn = outputs.hyperpod.HyperPodClusterArn;
             }
         }
 
@@ -1141,6 +1198,33 @@ export default class BootstrapCommandHandler {
                 profileData.domainId = outputs['sagemaker-domain'].DomainId;
             }
         }
+    }
+
+    /**
+     * Remove ALL trace of a module from a profile: drop it from provisionedModules and
+     * moduleOutputs, then PURGE every denormalized flat key and re-derive from the
+     * surviving modules. This guarantees no stale memory — a subsequent project cannot
+     * read a `_PROFILE_*` flat key pointing at a resource that was just destroyed.
+     *
+     * Mutates `profileConfig` in place and persists via setProfile.
+     *
+     * @param {string} name - profile name
+     * @param {object} profileConfig - the profile config object (mutated)
+     * @param {string} moduleName - module being removed
+     */
+    _forgetModuleFromProfile(name, profileConfig, moduleName) {
+        profileConfig.provisionedModules =
+            (profileConfig.provisionedModules || []).filter(m => m !== moduleName);
+        if (profileConfig.moduleOutputs) {
+            delete profileConfig.moduleOutputs[moduleName];
+        }
+        // Purge every flat key, then re-derive from the modules that remain — so the
+        // removed module's flat keys are gone and survivors' keys stay accurate.
+        for (const key of DENORMALIZED_FLAT_KEYS) {
+            delete profileConfig[key];
+        }
+        this._denormalizeModuleOutputs(profileConfig);
+        this.config.setProfile(name, profileConfig);
     }
 
     /**
@@ -1266,13 +1350,13 @@ export default class BootstrapCommandHandler {
      * @param {object} options - CLI options
      */
     async _handleModuleAdd(moduleName, options) {
+        const manifest = loadModuleManifest();
         if (!moduleName) {
             console.log('❌ Usage: ml-container-creator bootstrap add-module <module>');
-            console.log('   Available modules: core, benchmark, registry, training, ci, sagemaker-domain, hyperpod-cluster');
+            console.log(`   Available modules: ${Object.keys(manifest.modules).join(', ')}`);
             return;
         }
 
-        const manifest = loadModuleManifest();
         if (!manifest.modules[moduleName]) {
             console.log(`❌ Unknown module: ${moduleName}`);
             console.log(`   Available: ${Object.keys(manifest.modules).join(', ')}`);
@@ -1414,10 +1498,6 @@ export default class BootstrapCommandHandler {
         }
 
         const manifest = loadModuleManifest();
-        if (!manifest.modules[moduleName]) {
-            console.log(`❌ Unknown module: ${moduleName}`);
-            return;
-        }
 
         const profile = this.config.getActiveProfile();
         if (!profile) {
@@ -1428,8 +1508,34 @@ export default class BootstrapCommandHandler {
         const { name, config: profileConfig } = profile;
         const provisioned = profileConfig.provisionedModules || [];
 
+        // BL143 hard cutover: a pre-split profile may still carry the retired
+        // `hyperpod-cluster` module (no longer in the manifest). Allow tearing it down
+        // via a synthetic descriptor with its known 3-stack set, so the documented
+        // cutover (`remove-module hyperpod-cluster` → `add-module hyperpod`) works.
+        if (!manifest.modules[moduleName]) {
+            if (LEGACY_REMOVABLE_MODULES[moduleName] && provisioned.includes(moduleName)) {
+                manifest.modules[moduleName] = LEGACY_REMOVABLE_MODULES[moduleName];
+                console.log(`ℹ️  "${moduleName}" is a retired module (v2.0.0 cutover).`);
+            } else {
+                console.log(`❌ Unknown module: ${moduleName}`);
+                return;
+            }
+        }
+
         if (!provisioned.includes(moduleName)) {
             console.log(`ℹ️  Module "${moduleName}" is not provisioned. Nothing to remove.`);
+            return;
+        }
+
+        // Metadata-only removal: when the CloudFormation stacks are ALREADY gone (e.g.
+        // deleted manually, or a prior teardown destroyed them but failed before updating
+        // the profile), `--skip-teardown` reconciles the profile WITHOUT a cdk destroy and
+        // WITHOUT the destructive-confirmation prompt (nothing is destroyed). Escape hatch
+        // for "stacks deleted out-of-band, but MLCC still thinks the module is provisioned".
+        if (options.skipTeardown || options['skip-teardown']) {
+            console.log(`\n🧹 Forgetting module "${moduleName}" from the profile (no teardown — --skip-teardown).`);
+            this._forgetModuleFromProfile(name, profileConfig, moduleName);
+            console.log(`✅ Module "${moduleName}" removed from the profile (AWS resources NOT touched).`);
             return;
         }
 
@@ -1498,11 +1604,15 @@ export default class BootstrapCommandHandler {
         // Confirm removal
         if (!options.force) {
             this._warnPersistentBuckets([moduleName], profileConfig);
-            if (moduleName === 'hyperpod-cluster') {
-                console.log('\n  ⚠️  EKS cluster deletion via CloudFormation can take 30-60 minutes.');
-                console.log('     For faster teardown, consider deleting the HyperPod cluster first:');
+            // The `eks` module owns the EKS cluster — its teardown is the slow one and
+            // DESTROYS the cluster. `hyperpod` depends on eks, so removing eks removes
+            // hyperpod too (BL143 hard-cutover: this is the destructive cutover step).
+            if (moduleName === 'eks') {
+                console.log('\n  ⚠️  This DESTROYS and (on re-add) RECREATES the EKS cluster.');
+                console.log('     EKS cluster deletion via CloudFormation can take 30-60 minutes.');
+                console.log('     Drain any scaled-up HyperPod cluster FIRST (a 0-instance cluster is cheap to recreate):');
                 console.log(`       aws sagemaker delete-cluster --cluster-name mlcc-${name}-hyperpod --region ${profileConfig.awsRegion}`);
-                console.log('     Then delete the EKS cluster from the AWS EKS console before running this command.\n');
+                console.log('     The dependent `hyperpod` module (if present) is removed along with eks.\n');
             }
             const { confirm } = await this._promptFn([{
                 type: 'confirm',
@@ -1516,8 +1626,8 @@ export default class BootstrapCommandHandler {
             }
         }
 
-        // --force-delete confirmation for HyperPod (destroys retained resources)
-        if ((options.forceDelete || options['force-delete']) && moduleName === 'hyperpod-cluster') {
+        // --force-delete confirmation for the EKS layer (destroys retained roles/cluster)
+        if ((options.forceDelete || options['force-delete']) && moduleName === 'eks') {
             const { confirmForceDelete } = await this._promptFn([{
                 type: 'input',
                 name: 'confirmForceDelete',
@@ -1542,6 +1652,7 @@ export default class BootstrapCommandHandler {
             runner = new CdkModuleRunner(moduleName, mod.stackNameSuffix);
         }
 
+        let teardownFailed = null;
         try {
             const teardownOpts = {};
             if (options.forceDelete || options['force-delete']) {
@@ -1553,17 +1664,23 @@ export default class BootstrapCommandHandler {
                 awsProfile: profileConfig.awsProfile,
                 profileName: name
             }, teardownOpts);
-
-            // Update profile
-            profileConfig.provisionedModules = provisioned.filter(m => m !== moduleName);
-            if (profileConfig.moduleOutputs) {
-                delete profileConfig.moduleOutputs[moduleName];
-            }
-            this.config.setProfile(name, profileConfig);
-
-            console.log(`✅ Module "${moduleName}" removed.`);
         } catch (err) {
-            console.log(`❌ Failed to remove "${moduleName}": ${err.message}`);
+            teardownFailed = err;
+        }
+
+        // ALWAYS reconcile the profile — remove the module + purge its flat keys — even
+        // if teardown failed (stacks already gone, mid-delete, timeout, etc.). The user
+        // asked to remove the module; leaving stale `provisionedModules`/`moduleOutputs`
+        // and dangling `_PROFILE_*` flat keys pointing at destroyed resources is worse
+        // than an orphaned stack. (BL143 — this is why remove-module must purge memory,
+        // not just attempt a destroy.)
+        this._forgetModuleFromProfile(name, profileConfig, moduleName);
+
+        if (teardownFailed) {
+            console.log(`⚠️  Module "${moduleName}" removed from the profile, but teardown reported: ${teardownFailed.message.split('\n')[0]}`);
+            console.log('   The profile no longer references it. If AWS resources remain, delete them manually in the CloudFormation console.');
+        } else {
+            console.log(`✅ Module "${moduleName}" removed (stacks destroyed + profile purged).`);
         }
     }
 
@@ -1603,7 +1720,9 @@ MODULES:
   training                            Training data bucket + execution role + MLflow (best-effort)
   ci                                  CodeBuild + DynamoDB + StepFunctions
   sagemaker-domain                    SageMaker Studio domain + default user profile
-  hyperpod-cluster                    HyperPod EKS cluster configuration
+  eks                                 Standalone EKS cluster (VPC, OIDC, add-ons, inference role) ~$73+/mo
+  hyperpod                            HyperPod cluster + Inference Operator (requires eks) — runs a REQUIRED
+                                      2 x ml.g5.2xlarge on-demand worker floor, ~$1,750+/mo while provisioned
 
 SETUP OPTIONS:
   --non-interactive                   Run without interactive prompts (requires --profile, --region)
@@ -1618,6 +1737,9 @@ SETUP OPTIONS:
 ADD/REMOVE OPTIONS:
   --dry-run                           Preview changes without provisioning or destroying
   --force                             Skip confirmation prompt on remove
+  --skip-teardown                     Forget a module from the profile WITHOUT a cdk destroy
+                                      (use when the stacks were already deleted out-of-band)
+  --force-delete                      Also destroy retained roles/buckets (eks/hyperpod)
 
 STATUS OPTIONS:
   --verify                            Check each active resource against AWS APIs for drift detection
@@ -1636,6 +1758,17 @@ EXAMPLES:
   ml-container-creator bootstrap remove-module benchmark
   ml-container-creator bootstrap remove-module benchmark --dry-run
   ml-container-creator bootstrap status
+
+  # EKS / HyperPod (BL143 layered modules):
+  ml-container-creator bootstrap add-module eks           # standalone EKS cluster (vanilla-EKS users stop here)
+  ml-container-creator bootstrap add-module hyperpod      # pulls eks; adds HyperPod + Inference Operator (2-worker floor)
+  ml-container-creator bootstrap remove-module hyperpod   # tears down HyperPod layer (keeps eks)
+  ml-container-creator bootstrap remove-module eks        # tears down EKS (removes dependent hyperpod too) — DESTROYS the cluster
+
+  # One-time v2.0.0 cutover from the old combined module:
+  ml-container-creator bootstrap remove-module hyperpod-cluster   # tear down the pre-split 3-stack module
+  ml-container-creator bootstrap add-module hyperpod              # bring up the new layered eks + hyperpod
+
   ml-container-creator bootstrap update
   ml-container-creator bootstrap use prod
   ml-container-creator bootstrap list

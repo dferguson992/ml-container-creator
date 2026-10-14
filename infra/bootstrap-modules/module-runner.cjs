@@ -21,6 +21,56 @@ const path = require('path');
 const MODULES_ROOT = path.resolve(__dirname);
 
 /**
+ * The RETAIN'd service roles the eks-cluster stack creates, and the trust principals +
+ * AWS-managed policies each requires. CDK attaches these on the CREATE path, but when a
+ * role is ADOPTED (imported) CDK CANNOT set its trust policy and CANNOT attach a managed
+ * policy to it — so an adopted role freezes at whatever it had and drifts out of spec as
+ * the stack evolves. The provision-time reconciler (_ensureAdoptedServiceRoles) re-asserts
+ * trust + managed policies for ALL of these via the AWS CLI, which CDK cannot do for an
+ * imported role.
+ *
+ * derive-dont-hardcode (ADR-008): each entry MUST mirror the trust principal(s) and
+ * managed-policy array passed to the matching _createOrAdoptRole(...) call in
+ * eks/stacks/eks-cluster-stack.ts. test/unit/hyperpod-cdk-stacks.test.js has a drift test
+ * asserting the two agree for every role — update BOTH together or that test fails.
+ *
+ * The roleName is `mlcc-<profile>-<suffix>`. trustPrincipals is the FULL desired set
+ * (the reconciler writes the whole trust document). managedPolicies is the FULL set
+ * (attach is idempotent).
+ */
+const ADOPTED_SERVICE_ROLES = [
+    {
+        suffix: 'eks-cluster-role',
+        trustPrincipals: ['eks.amazonaws.com'],
+        managedPolicies: ['arn:aws:iam::aws:policy/AmazonEKSClusterPolicy'],
+    },
+    {
+        suffix: 'eks-node-role',
+        trustPrincipals: ['ec2.amazonaws.com'],
+        managedPolicies: [
+            'arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy',
+            'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly',
+            'arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy',
+        ],
+    },
+    {
+        suffix: 'hyperpod-instance-role',
+        trustPrincipals: ['sagemaker.amazonaws.com', 'ec2.amazonaws.com'],
+        managedPolicies: [
+            'arn:aws:iam::aws:policy/AmazonSageMakerClusterInstanceRolePolicy',
+            'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly',
+            'arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy',
+            'arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy',
+        ],
+    },
+    {
+        suffix: 'fargate-pod-exec-role',
+        trustPrincipals: ['eks-fargate-pods.amazonaws.com'],
+        managedPolicies: ['arn:aws:iam::aws:policy/AmazonEKSFargatePodExecutionRolePolicy'],
+    },
+];
+
+/**
  * Modules that own a retained S3 bucket, and the bucket-name template.
  * These buckets use RemovalPolicy.RETAIN, so they survive `cdk destroy`.
  * On re-provision we must adopt the existing bucket instead of recreating it.
@@ -76,6 +126,163 @@ function getStackName(profileName, stackNameSuffix) {
 }
 
 /**
+ * Build the exact `aws cloudformation continue-update-rollback` command string a user
+ * can copy-paste to recover a wedged stack by hand. Centralized so the auto-recovery
+ * path and the thrown error message always agree (BL143 Req 1.4).
+ *
+ * @param {string} stackName
+ * @param {string} region
+ * @param {string} [awsProfile]
+ * @param {string[]} [resourcesToSkip] - logical IDs to pass to --resources-to-skip
+ * @returns {string}
+ */
+function buildContinueRollbackCommand(stackName, region, awsProfile, resourcesToSkip) {
+    let cmd = `aws cloudformation continue-update-rollback --stack-name ${stackName} --region ${region}`;
+    if (resourcesToSkip && resourcesToSkip.length > 0) {
+        cmd += ` --resources-to-skip ${resourcesToSkip.join(' ')}`;
+    }
+    if (awsProfile) {
+        cmd += ` --profile ${awsProfile}`;
+    }
+    return cmd;
+}
+
+/**
+ * Parse the logical resource IDs that CloudFormation reports as un-rollback-able from a
+ * failed `continue-update-rollback` error. CFN phrasing varies; this matches the common
+ * shapes without being brittle:
+ *   "... resource(s) [LogicalIdA, LogicalIdB] ... cannot be rolled back"
+ *   "The following resource(s) could not be ... : LogicalIdA, LogicalIdB"
+ * Returns a de-duplicated list (possibly empty — the caller falls back to the exact
+ * manual command when it cannot parse IDs).
+ *
+ * NOTE: the precise CFN error text is to be confirmed against a live wedged stack
+ * (BL143 task A2); until then this is best-effort and the throw-exact-command fallback
+ * (Req 1.4) guarantees the user always gets an actionable command.
+ *
+ * @param {string} errorText
+ * @returns {string[]}
+ */
+function parseStuckResources(errorText) {
+    if (!errorText || typeof errorText !== 'string') return [];
+    const ids = new Set();
+
+    // Shape 1: a bracketed list, e.g. "[LogicalIdA, LogicalIdB]".
+    const bracket = errorText.match(/\[([^\]]+)\]/);
+    if (bracket) {
+        for (const tok of bracket[1].split(/[,\s]+/)) {
+            if (/^[A-Za-z][A-Za-z0-9]*$/.test(tok)) ids.add(tok);
+        }
+    }
+
+    // Shape 2: "resource(s) ... : Id1, Id2" after a colon near "resource". Take only the
+    // leading COMMA-separated run of identifier-shaped tokens, so trailing prose
+    // ("... failed to roll back") is not swept in. A token ends the run once it is not
+    // followed by a comma AND is followed by more words (i.e. it's prose, not an id).
+    if (ids.size === 0) {
+        const colon = errorText.match(/resource[^:]*:\s*(.+)$/i);
+        if (colon) {
+            // Split on commas; each comma-separated segment's FIRST word is a candidate
+            // id. Stop at the first segment whose first token isn't identifier-shaped.
+            for (const seg of colon[1].split(',')) {
+                const first = seg.trim().split(/\s+/)[0];
+                if (/^[A-Za-z][A-Za-z0-9]*$/.test(first)) {
+                    ids.add(first);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    return [...ids];
+}
+
+/**
+ * Recover a stack stuck in UPDATE_ROLLBACK_FAILED (BL143 Group A).
+ *
+ * An UPDATE_ROLLBACK_FAILED stack is INTACT (a failed UPDATE) — it must NOT be deleted.
+ * CloudFormation blocks all further updates until the rollback is continued. This runs
+ * `continue-update-rollback`, re-checks status, retries ONCE with --resources-to-skip if
+ * the first attempt names stuck resources, and — if still stuck — throws an Error whose
+ * message is the EXACT manual recovery command (never a generic failure).
+ *
+ * Pure w.r.t. side effects: all AWS calls go through the injected `runCmd`, so this is
+ * unit-testable offline (Req 1.6).
+ *
+ * @param {object} args
+ * @param {string} args.stackName
+ * @param {string} args.region
+ * @param {string} [args.awsProfile]
+ * @param {(argv: string[]) => string} args.runCmd - runs an aws CLI arg list, returns
+ *   stdout; throws an Error (with .message/.stderr) on non-zero exit.
+ * @param {(msg: string) => void} [args.log]
+ * @returns {{ recovered: boolean, action: string }}
+ * @throws {Error} with the exact manual recovery command when recovery fails.
+ */
+function recoverUpdateRollbackFailed({ stackName, region, awsProfile, runCmd, log = () => {} }) {
+    const profileArgs = awsProfile ? ['--profile', awsProfile] : [];
+    const describe = () => {
+        try {
+            const out = runCmd(['cloudformation', 'describe-stacks', '--stack-name', stackName,
+                '--region', region, '--output', 'json', ...profileArgs]);
+            const parsed = JSON.parse(out);
+            return parsed.Stacks && parsed.Stacks[0] && parsed.Stacks[0].StackStatus;
+        } catch {
+            return undefined;
+        }
+    };
+    // Recovered = stack is gone, or reached a terminal *_COMPLETE state (incl.
+    // UPDATE_ROLLBACK_COMPLETE) rather than still sitting in UPDATE_ROLLBACK_FAILED.
+    const isRecovered = (status) =>
+        !status || (status.endsWith('_COMPLETE') && status !== 'UPDATE_ROLLBACK_FAILED');
+
+    const attempt = (resourcesToSkip) => {
+        const argv = ['cloudformation', 'continue-update-rollback', '--stack-name', stackName,
+            '--region', region, ...profileArgs];
+        if (resourcesToSkip && resourcesToSkip.length > 0) {
+            argv.push('--resources-to-skip', ...resourcesToSkip);
+        }
+        return runCmd(argv);
+    };
+
+    log(`  🔧 Stack ${stackName} is in UPDATE_ROLLBACK_FAILED — attempting continue-update-rollback...`);
+
+    // Attempt 1: bare continue-update-rollback (clears many cases on its own).
+    let stuck = [];
+    try {
+        attempt();
+        if (isRecovered(describe())) {
+            log(`  ✅ Recovered ${stackName} — proceeding with deploy`);
+            return { recovered: true, action: 'continue-update-rollback' };
+        }
+    } catch (err) {
+        stuck = parseStuckResources((err && (err.stderr || err.message) || '').toString());
+    }
+
+    // Attempt 2 (once): retry skipping the stuck resources, if we parsed any.
+    if (stuck.length > 0) {
+        log(`  🔧 Retrying with --resources-to-skip ${stuck.join(' ')}...`);
+        try {
+            attempt(stuck);
+            if (isRecovered(describe())) {
+                log(`  ✅ Recovered ${stackName} (skipped: ${stuck.join(', ')}) — proceeding`);
+                return { recovered: true, action: 'continue-update-rollback --resources-to-skip' };
+            }
+        } catch {
+            // fall through to the throw below
+        }
+    }
+
+    // Could not recover automatically — hand the user the exact command (Req 1.4).
+    const command = buildContinueRollbackCommand(stackName, region, awsProfile, stuck);
+    throw new Error(
+        `Stack ${stackName} is stuck in UPDATE_ROLLBACK_FAILED and could not be auto-recovered. ` +
+        `Run this to recover it manually, then retry bootstrap:\n    ${command}`
+    );
+}
+
+/**
  * Generic module implementation that delegates to CDK commands.
  */
 class CdkModuleRunner {
@@ -113,7 +320,69 @@ class CdkModuleRunner {
             if (opts.verbose) console.log(`  ♻️  Existing ECR repo detected (${ecrRepo}) — adopting instead of recreating`);
             flags.push('--context adoptExistingEcr=true');
         }
+        // RETAIN'd service IAM roles (eks-cluster stack) — adopt if they already exist,
+        // so a re-provision/update doesn't try to CREATE them and collide. Must be in
+        // THIS shared helper (used by BOTH provision and diff) so `diff` previews the
+        // SAME template the real deploy applies. (BL143 — a dry-run that synthesizes in
+        // create-mode while the deploy adopts is the exact drift this fixes.)
+        flags.push(...this._detectRetainedRoles(this.stackNameSuffix, profile, { verbose: opts.verbose }));
         return flags;
+    }
+
+    /**
+     * Detect whether the eks-cluster stack's RETAIN'd SERVICE roles already
+     * exist (from a prior deploy). Returns the adopt context flag if so, so a
+     * re-provision/update/diff adopts them instead of trying to CREATE and
+     * colliding. Shared by provision() and diff() via _computeAdoptFlags().
+     * @param {string} stackSuffix
+     * @param {object} profile
+     * @param {object} [opts] - { verbose?: boolean }
+     * @returns {string[]} context flag array (empty if no roles found)
+     */
+    _detectRetainedRoles(stackSuffix, profile, opts = {}) {
+        // Only the eks-cluster stack creates the RETAIN'd roles
+        if (stackSuffix !== 'eks-cluster') return [];
+
+        // Only the SERVICE roles are RETAIN'd + adopted (static service-principal trust,
+        // valid across cluster rebuilds). The IRSA roles (hyperpod-inference, alb, keda,
+        // s3-csi, fsx-csi, eks-inference) are OIDC-bound → DESTROY + always-created, so
+        // they are NOT adopt-eligible and are deliberately NOT in this list (BL143
+        // Option 1). The `adoptRoles` flag governs only the _createOrAdoptRole path.
+        const roleNames = [
+            `mlcc-${profile.profileName}-eks-cluster-role`,
+            `mlcc-${profile.profileName}-eks-node-role`,
+            `mlcc-${profile.profileName}-hyperpod-instance-role`,
+            `mlcc-${profile.profileName}-fargate-pod-exec-role`,
+        ];
+
+        for (const roleName of roleNames) {
+            if (this._iamRoleExists(roleName, profile)) {
+                if (opts.verbose) {
+                    console.log(`  ♻️  Existing service IAM role detected (${roleName}) — adopting service roles`);
+                }
+                return ['--context adoptRoles=true'];
+            }
+        }
+        return [];
+    }
+
+    /**
+     * Check whether an IAM role already exists in the account.
+     * @param {string} roleName
+     * @param {object} profile - { awsRegion, awsProfile? }
+     * @returns {boolean}
+     */
+    _iamRoleExists(roleName, profile) {
+        try {
+            execSync(
+                `aws iam get-role --role-name ${roleName}` +
+                (profile.awsProfile ? ` --profile ${profile.awsProfile}` : ''),
+                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+            );
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     /**
@@ -323,9 +592,11 @@ class CdkModuleRunner {
      *   CREATE_FAILED                        — failed initial CREATE
      *   DELETE_FAILED                        — failed teardown, stuck
      *
-     * Recoverable states (leave alone — cdk deploy can proceed):
-     *   UPDATE_ROLLBACK_COMPLETE             — failed UPDATE, but stack is intact
-     *   *_COMPLETE, *_IN_PROGRESS
+     * Recoverable-in-place (do NOT delete — the stack is intact):
+     *   UPDATE_ROLLBACK_FAILED               — failed UPDATE; continue-update-rollback
+     *                                          (auto-recover, or throw the exact command)
+     *   UPDATE_ROLLBACK_COMPLETE             — failed UPDATE, already rolled back
+     *   *_COMPLETE, *_IN_PROGRESS            — leave alone
      *
      * @param {string} stackName
      * @param {object} profile - { awsRegion, awsProfile? }
@@ -352,6 +623,23 @@ class CdkModuleRunner {
         } catch {
             // Stack doesn't exist — nothing to clean up.
             return;
+        }
+
+        // UPDATE_ROLLBACK_FAILED is an INTACT stack with a failed update — it must NOT
+        // be deleted. Continue the rollback (auto-recover) or throw the exact manual
+        // command. This is NOT in UNUPDATABLE (BL143 Req 1.1).
+        if (cfnStatus === 'UPDATE_ROLLBACK_FAILED') {
+            recoverUpdateRollbackFailed({
+                stackName,
+                region: profile.awsRegion,
+                awsProfile: profile.awsProfile,
+                runCmd: (argv) => execSync(
+                    `aws ${argv.join(' ')}`,
+                    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+                ),
+                log: (msg) => console.log(msg)
+            });
+            return; // recovered → caller proceeds; unrecovered → threw with the command.
         }
 
         if (!cfnStatus || !UNUPDATABLE.has(cfnStatus)) {
@@ -502,15 +790,33 @@ class CdkMultiStackModuleRunner {
     async provision(profile, opts = {}) {
         const allOutputs = {};
 
+        // HyperPod-only preflights run ONLY when this module owns the HyperPod stacks
+        // (BL143 — the `eks` module must NOT run them). Keyed off stack OWNERSHIP, not a
+        // module-name literal, so it stays correct if the module is renamed.
+        const ownsHyperPod = this.stacks.includes('hyperpod-cluster')
+            || this.stacks.includes('inference-operator');
+
         // Pre-flight: ensure the HyperPod service-linked role exists.
         // SageMaker needs this to manage VPC/subnet resources when creating
         // a HyperPod cluster. Without it, CreateCluster fails with
         // "Unable to retrieve subnets".
-        this._ensureHyperPodServiceLinkedRole(profile);
+        if (ownsHyperPod) {
+            this._ensureHyperPodServiceLinkedRole(profile);
+        }
 
         for (let i = 0; i < this.stacks.length; i++) {
             const stackSuffix = this.stacks[i];
             const stackName = getStackName(profile.profileName, stackSuffix);
+
+            // After the eks-cluster stack (which OWNS the RETAIN'd service roles)
+            // deploys, reconcile the trust policy + managed policies of ALL adopted
+            // service roles. CDK cannot set either on an imported/adopted role, so this
+            // closes the adopt-drift gap for every one of them (not just the HyperPod
+            // instance role) — e.g. restoring the ec2 trust principal the HyperPod role
+            // needs before CreateCluster validates it. (BL143 adopt-drift.)
+            if (stackSuffix === 'eks-cluster') {
+                this._ensureAdoptedServiceRoles(profile);
+            }
 
             // After eks-cluster is deployed, install the HyperPod Helm chart
             // dependencies before creating the HyperPod cluster. SageMaker
@@ -543,7 +849,10 @@ class CdkMultiStackModuleRunner {
 
         // Post-deploy: install inference operator addon via CLI (not CloudFormation)
         // to avoid CloudFormation timeout on the slow EnableClusterInference call.
-        await this._installInferenceAddon(profile);
+        // HyperPod-only (BL143 — the `eks` module has no inference operator).
+        if (ownsHyperPod) {
+            await this._installInferenceAddon(profile);
+        }
 
         console.log(`  ✅ All ${this.stacks.length} stacks deployed for ${this.name}`);
         return allOutputs;
@@ -1004,6 +1313,84 @@ class CdkMultiStackModuleRunner {
     }
 
     /**
+     * Reconcile the TRUST policy and AWS-MANAGED policies of EVERY adopted RETAIN'd
+     * service role (ADOPTED_SERVICE_ROLES) to match the stack's intended spec.
+     *
+     * This exists because CDK CANNOT, for an ADOPTED (imported) role:
+     *   - modify its assume-role (trust) policy, OR
+     *   - attach a managed policy (addManagedPolicy(fromManagedPolicyArn(...)) is refused
+     *     with "Can't combine imported IManagedPolicy ... Use ManagedPolicy directly" and
+     *     silently no-ops).
+     * The CREATE path sets both via `new iam.Role({ assumedBy, managedPolicies })`, but a
+     * RETAIN'd role that is adopted keeps only what it already had and drifts as the stack
+     * evolves — e.g. the HyperPod instance role missing the ec2 trust principal fails
+     * CreateCluster with "execution role permissions are invalid". This reconciler closes
+     * that gap for ALL adopted service roles, not just the HyperPod one.
+     *
+     * Idempotent: update-assume-role-policy writes the FULL desired trust document, and
+     * attach-role-policy on an already-attached policy is a no-op. Skips any role that
+     * does not yet exist (a fresh create already has correct trust/policies from CDK).
+     *
+     * Inline get-role existence check — `_iamRoleExists` lives on CdkModuleRunner, not
+     * this multi-stack class, so do not depend on it here.
+     */
+    _ensureAdoptedServiceRoles(profile) {
+        const awsFlags = profile.awsProfile ? ` --profile ${profile.awsProfile}` : '';
+
+        for (const role of ADOPTED_SERVICE_ROLES) {
+            const roleName = `mlcc-${profile.profileName}-${role.suffix}`;
+
+            // Only reconcile a role that already exists (adopted/drifted case).
+            try {
+                execSync(
+                    `aws iam get-role --role-name ${roleName}${awsFlags}`,
+                    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+                );
+            } catch {
+                continue; // role doesn't exist yet — nothing to reconcile
+            }
+
+            // 1) Trust policy — write the FULL desired principal set.
+            const trustDoc = JSON.stringify({
+                Version: '2012-10-17',
+                Statement: [{
+                    Effect: 'Allow',
+                    Principal: { Service: role.trustPrincipals },
+                    Action: 'sts:AssumeRole',
+                }],
+            });
+            const tmpTrust = path.join(
+                require('os').tmpdir(),
+                `mlcc-trust-${role.suffix}-${Date.now()}.json`,
+            );
+            try {
+                require('fs').writeFileSync(tmpTrust, trustDoc, 'utf8');
+                execSync(
+                    `aws iam update-assume-role-policy --role-name ${roleName} --policy-document file://${tmpTrust}${awsFlags}`,
+                    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+                );
+            } catch (err) {
+                console.log(`  ⚠️  Could not reconcile trust policy on ${roleName}: ${err.message?.split('\n')[0] || err}`);
+            } finally {
+                try { require('fs').unlinkSync(tmpTrust); } catch { /* best-effort cleanup */ }
+            }
+
+            // 2) Managed policies — attach the FULL set (idempotent).
+            for (const policyArn of role.managedPolicies) {
+                try {
+                    execSync(
+                        `aws iam attach-role-policy --role-name ${roleName} --policy-arn ${policyArn}${awsFlags}`,
+                        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+                    );
+                } catch (err) {
+                    console.log(`  ⚠️  Could not attach ${policyArn} to ${roleName}: ${err.message?.split('\n')[0] || err}`);
+                }
+            }
+            console.log(`  ✅ Adopted service role reconciled: ${roleName}`);
+        }
+    }
+
+    /**
      * Grant the current AWS caller (operator) cluster-admin access to the EKS
      * cluster so kubectl works without manual console steps. Uses EKS access
      * entries (works with API_AND_CONFIG_MAP auth mode). Idempotent.
@@ -1079,12 +1466,11 @@ class CdkMultiStackModuleRunner {
             throw new Error('Bootstrap TypeScript build failed');
         }
 
-        // Build adopt flags for this specific stack
+        // Build adopt flags for this specific stack. _computeAdoptFlags now covers
+        // bucket/ECR AND the RETAIN'd service-role adoption (shared with diff), so the
+        // role flag is NOT computed separately here anymore (avoids a duplicate
+        // --context adoptRoles=true).
         const adoptFlags = runner._computeAdoptFlags(profile, { verbose: true });
-
-        // Detect retained IAM roles that already exist (from a prior
-        // deploy whose stack was destroyed but roles were RETAIN'd).
-        const roleAdoptFlag = this._detectRetainedRoles(stackSuffix, profile);
 
         // Detect retained TLS bucket for inference-operator stack
         const tlsBucketAdoptFlag = this._detectRetainedTlsBucket(stackSuffix, profile);
@@ -1102,7 +1488,6 @@ class CdkMultiStackModuleRunner {
             `--context accountId=${profile.accountId}`,
             `--context region=${profile.awsRegion}`,
             ...adoptFlags,
-            ...roleAdoptFlag,
             ...tlsBucketAdoptFlag,
             ...contextFlags,
         ].filter(Boolean).join(' ');
@@ -1126,58 +1511,6 @@ class CdkMultiStackModuleRunner {
 
         console.log(`    ✅ ${stackSuffix} deployed`);
         return runner._getStackOutputs(stackName, profile);
-    }
-
-    /**
-     * Detect whether retained IAM roles from a prior deployment already exist.
-     * If any of the stack's RETAIN'd roles exist, returns ['--context adoptRoles=true']
-     * so the CDK stack uses fromRoleName() instead of creating new ones.
-     * @param {string} stackSuffix
-     * @param {object} profile
-     * @returns {string[]} context flag array (empty if no roles found)
-     */
-    _detectRetainedRoles(stackSuffix, profile) {
-        // Only the eks-cluster stack creates the RETAIN'd roles
-        if (stackSuffix !== 'eks-cluster') return [];
-
-        const roleNames = [
-            `mlcc-${profile.profileName}-eks-cluster-role`,
-            `mlcc-${profile.profileName}-eks-node-role`,
-            `mlcc-${profile.profileName}-hyperpod-instance-role`,
-            `mlcc-${profile.profileName}-hyperpod-inference-role`,
-            `mlcc-${profile.profileName}-alb-controller-role`,
-            `mlcc-${profile.profileName}-keda-operator-role`,
-            `mlcc-${profile.profileName}-s3-csi-role`,
-            `mlcc-${profile.profileName}-fsx-csi-role`,
-            `mlcc-${profile.profileName}-fargate-pod-exec-role`,
-        ];
-
-        for (const roleName of roleNames) {
-            if (this._iamRoleExists(roleName, profile)) {
-                console.log(`  ♻️  Existing IAM roles detected (${roleName}) — adopting instead of recreating`);
-                return ['--context adoptRoles=true'];
-            }
-        }
-        return [];
-    }
-
-    /**
-     * Check whether an IAM role already exists in the account.
-     * @param {string} roleName
-     * @param {object} profile - { awsRegion, awsProfile? }
-     * @returns {boolean}
-     */
-    _iamRoleExists(roleName, profile) {
-        try {
-            execSync(
-                `aws iam get-role --role-name ${roleName}` +
-                (profile.awsProfile ? ` --profile ${profile.awsProfile}` : ''),
-                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-            );
-            return true;
-        } catch {
-            return false;
-        }
     }
 
     /**
@@ -1662,4 +1995,11 @@ class CdkMultiStackModuleRunner {
     }
 }
 
-module.exports = { CdkModuleRunner, CdkMultiStackModuleRunner };
+module.exports = {
+    CdkModuleRunner,
+    CdkMultiStackModuleRunner,
+    // Exported for unit testing (BL143 Group A — offline recovery state machine).
+    recoverUpdateRollbackFailed,
+    parseStuckResources,
+    buildContinueRollbackCommand,
+};

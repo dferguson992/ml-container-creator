@@ -31,9 +31,9 @@ import { MlccTrainingStack } from '../training/stack';
 import { MlccCiStack } from '../ci/stack';
 import { MlccSagemakerDomainStack } from '../sagemaker-domain/stack';
 import { MlccHyperpodStack } from '../hyperpod-cluster/stack';
-import { MlccEksClusterStack } from '../hyperpod-cluster/stacks/eks-cluster-stack';
-import { MlccHyperPodClusterStack } from '../hyperpod-cluster/stacks/hyperpod-cluster-stack';
-import { MlccInferenceOperatorStack } from '../hyperpod-cluster/stacks/inference-operator-stack';
+import { MlccEksClusterStack } from '../eks/stacks/eks-cluster-stack';
+import { MlccHyperPodClusterStack } from '../hyperpod/stacks/hyperpod-cluster-stack';
+import { MlccInferenceOperatorStack } from '../hyperpod/stacks/inference-operator-stack';
 
 // Load module manifest
 const manifestPath = path.resolve(__dirname, '..', 'module-manifest.json');
@@ -101,15 +101,10 @@ const factories: Record<string, () => cdk.Stack> = {
     }),
     'eks-cluster': () => new MlccEksClusterStack(app, stackName('eks-cluster'), {
         env, profileName,
-        adoptEks: app.node.tryGetContext('adoptEks') === 'true',
-        adoptVpc: app.node.tryGetContext('adoptVpc') === 'true',
+        // RETAIN'd IAM roles survive teardown; the runner passes adoptRoles=true when it
+        // detects them so we adopt instead of colliding on create. Cluster/VPC always create.
         adoptRoles: app.node.tryGetContext('adoptRoles') === 'true',
-        vpcId: app.node.tryGetContext('vpcId'),
-        eksClusterArn: app.node.tryGetContext('EksClusterArn'),
-        eksClusterName: app.node.tryGetContext('EksClusterName'),
-        clusterSecurityGroupId: app.node.tryGetContext('ClusterSecurityGroupId'),
-        privateSubnetIds: app.node.tryGetContext('PrivateSubnetIds'),
-        description: `MLCC EKS Cluster — HyperPod Stack 1 (profile: ${profileName})`,
+        description: `MLCC EKS Cluster — eks module (profile: ${profileName})`,
     }),
     'hyperpod-cluster': () => new MlccHyperPodClusterStack(app, stackName('hyperpod-cluster'), {
         env, profileName,

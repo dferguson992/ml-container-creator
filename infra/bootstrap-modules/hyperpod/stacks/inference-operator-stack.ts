@@ -35,7 +35,7 @@ export class MlccInferenceOperatorStack extends cdk.Stack {
         const ssmPrefix = `/mlcc/${profileName}/hyperpod`;
 
         cdk.Tags.of(this).add('mlcc:managed-by', 'ml-container-creator');
-        cdk.Tags.of(this).add('mlcc:module', 'hyperpod-cluster');
+        cdk.Tags.of(this).add('mlcc:module', 'hyperpod');
         cdk.Tags.of(this).add('mlcc:profile', profileName);
         cdk.Tags.of(this).add('mlcc:stack', 'inference-operator');
 

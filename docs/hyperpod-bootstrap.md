@@ -145,12 +145,13 @@ two patches to make the operator functional on this cluster topology:
    on HyperPod EC2 nodes (not Fargate). This is required because the gateway controller uses
    `hostPath` volumes that Fargate cannot mount.
 
-!!! important "Inference operator needs an active worker node"
-    The inference operator requires **at least 1 active HyperPod worker node** so the CSI driver
-    can register before the controller manager can start. A `g5.2xlarge` (or similar GPU
-    instance) is recommended — CPU-only nodes like `m5` do **not** satisfy the NVIDIA device
-    plugin check, so the operator will not come up on them. Scale up at least one GPU node
-    before expecting the operator to reach a healthy state.
+!!! important "Inference operator needs active worker nodes — but NOT GPU nodes"
+    The inference operator requires active HyperPod worker nodes (a floor of 2) so its
+    control-plane pods can schedule and the cluster can finish setup. These are **CPU**
+    workloads — `ml.c5.4xlarge` is the AWS-documented minimum and what the module
+    provisions by default. GPU nodes are **not** required for the operator; they are only
+    needed by the model-serving pods you deploy later. (The module's `default-worker`
+    floor is CPU; attach GPU instance groups on demand — see "Compute" below.)
 
 ## Removal Behavior
 
@@ -168,32 +169,63 @@ Destroys VPC, EKS cluster, and Inference Operator add-on. The following are **re
 
 Also destroys retained resources. Requires typing the cluster name to confirm.
 
-## Scaling Up
+## Compute: a CPU control-plane floor + on-demand GPU serving groups
 
-The HyperPod cluster starts at 0 instances. To add compute:
+The module provisions a **permanent `default-worker` floor of 2 × `ml.c5.4xlarge`
+(CPU)**. This floor exists to run the **Inference Operator's control-plane pods**
+(gateway controller, controller-manager, ALB, KEDA — ~13 pods, per the AWS
+operator-install minimum of `ml.c5.4xlarge`). These are orchestration workloads —
+**they do not need a GPU.** The floor of 2 is a HyperPod *setup* requirement (an
+EKS-orchestrated cluster will not finish setup with fewer), not a capacity one.
+
+!!! info "The operator does not require GPU nodes"
+    A common misconception is that the inference operator needs a GPU instance. It does
+    not — its pods are CPU control-plane components. GPUs are only needed by the
+    **model-serving pods** you deploy later (via `InferenceEndpointConfig`). Keeping the
+    always-on floor on cheap CPU (`ml.c5.4xlarge`) instead of GPU cuts the idle cost
+    substantially and avoids holding scarce GPU capacity just to keep the operator alive.
+
+### Adding GPU compute for model serving
+
+GPU compute is attached **on demand** as a SEPARATE instance group, not by changing
+the CPU floor. `update-cluster` is a declarative replace, so send the FULL set —
+the existing CPU `default-worker` **plus** your new GPU group:
 
 ```bash
 aws sagemaker update-cluster \
   --cluster-name mlcc-<profile>-hyperpod \
-  --instance-groups '[{
-    "InstanceGroupName": "default-worker",
-    "InstanceType": "ml.g5.2xlarge",
-    "InstanceCount": 1,
-    "ExecutionRole": "<HyperPodInstanceRoleArn>",
-    "LifeCycleConfig": {
-      "SourceS3Uri": "s3://mlcc-core-<account>-<region>/hyperpod-lifecycle/",
-      "OnCreate": "on_create.sh"
+  --instance-groups '[
+    {
+      "InstanceGroupName": "default-worker",
+      "InstanceType": "ml.c5.4xlarge",
+      "InstanceCount": 2,
+      "ExecutionRole": "<HyperPodInstanceRoleArn>",
+      "LifeCycleConfig": {
+        "SourceS3Uri": "s3://mlcc-core-<account>-<region>/hyperpod-lifecycle/",
+        "OnCreate": "on_create.sh"
+      }
+    },
+    {
+      "InstanceGroupName": "gpu-workers",
+      "InstanceType": "ml.g5.2xlarge",
+      "InstanceCount": 1,
+      "ExecutionRole": "<HyperPodInstanceRoleArn>",
+      "LifeCycleConfig": {
+        "SourceS3Uri": "s3://mlcc-core-<account>-<region>/hyperpod-lifecycle/",
+        "OnCreate": "on_create.sh"
+      }
     }
-  }]'
+  ]'
 ```
 
-`ExecutionRole` must be the HyperPod instance role ARN (the five-policy role described above),
-`LifeCycleConfig` is required, and the lifecycle S3 URI is
-`s3://mlcc-core-<account>-<region>/hyperpod-lifecycle/`.
+`ExecutionRole` must be the HyperPod instance role ARN, `LifeCycleConfig` is required,
+and the lifecycle S3 URI is `s3://mlcc-core-<account>-<region>/hyperpod-lifecycle/`.
 
-!!! tip "Use a GPU instance"
-    Choose a GPU instance type such as `ml.g5.2xlarge` — the inference operator's NVIDIA device
-    plugin check requires GPU nodes, and CPU-only types like `m5` will not satisfy it.
+!!! warning "GPU capacity is often constrained"
+    GPU instance groups retry until capacity is available in the region. The CPU floor
+    comes up reliably regardless, so the operator stays healthy while a GPU group waits
+    for capacity. Do NOT drop the `default-worker` floor below 2 — the cluster will not
+    provision.
 
 ## `do/config` Variables
 

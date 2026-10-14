@@ -182,4 +182,43 @@ describe('BootstrapCommandHandler._handleUpdate scoped module (BL102)', () => {
             assert.ok(modulesProvisioned.includes('benchmark'), 'should deploy benchmark');
         });
     });
+
+    // Regression: `--module <name>` arrives in the passthrough `args` array (commander
+    // stops option parsing at the `update` positional), so handle() must extract it into
+    // options.module. Earlier the loop extracted --with but NOT --module, so the flag was
+    // silently dropped and update diffed/redeployed every module. These tests drive the
+    // full handle() → _handleUpdate wiring, not _handleUpdate directly, so they fail if
+    // the extraction regresses.
+    describe('handle() extracts --module from passthrough args (regression)', () => {
+        it('scopes to the single module for `update --module <name>` (space form)', async () => {
+            const { handler, modulesProvisioned, restore } = setupHandler();
+            restoreFn = restore;
+
+            await handler.handle(['update', '--module', 'benchmark'], {});
+
+            assert.deepStrictEqual(modulesProvisioned, ['benchmark'],
+                'only the --module target should be deployed');
+        });
+
+        it('scopes to the single module for `update --module=<name>` (equals form)', async () => {
+            const { handler, modulesProvisioned, restore } = setupHandler();
+            restoreFn = restore;
+
+            await handler.handle(['update', '--module=benchmark'], {});
+
+            assert.deepStrictEqual(modulesProvisioned, ['benchmark'],
+                'only the --module= target should be deployed');
+        });
+
+        it('still deploys all modules for `update` with no --module', async () => {
+            const { handler, modulesProvisioned, restore } = setupHandler();
+            restoreFn = restore;
+
+            await handler.handle(['update'], {});
+
+            assert.ok(modulesProvisioned.includes('core'), 'should deploy core');
+            assert.ok(modulesProvisioned.includes('registry'), 'should deploy registry');
+            assert.ok(modulesProvisioned.includes('benchmark'), 'should deploy benchmark');
+        });
+    });
 });

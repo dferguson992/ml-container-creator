@@ -13,10 +13,19 @@
     "HP_GPU_COUNT": "auto",
     "HP_NAMESPACE": "default",
     "HP_REPLICAS": "1",
-    "HP_QUEUE": ""
+    "HP_QUEUE": "",
+    "EKS_INFERENCE_ROLE_ARN": ""
   },
   "runtime_owned_vars": [
-    "DEPLOYMENT_TARGET_EKS_STATUS"
+    "DEPLOYMENT_TARGET_EKS_STATUS",
+    "HP_CLUSTER_NAME",
+    "HP_NAMESPACE",
+    "HP_INSTANCE_TYPE",
+    "HP_GPU_COUNT",
+    "HP_CPU_REQUEST",
+    "HP_MEM_REQUEST",
+    "KUBECONFIG",
+    "EKS_INFERENCE_ROLE_ARN"
   ],
   "serving_config_source": "kubernetes",
   "verbs": {
@@ -33,6 +42,7 @@
     { "answerKey": "namespace", "configVar": "HP_NAMESPACE", "flag": "--namespace", "roles": ["flag-input"] },
     { "answerKey": "replicas", "configVar": "HP_REPLICAS", "flag": "--replicas", "roles": ["flag-input"] },
     { "answerKey": "queue", "configVar": "HP_QUEUE", "flag": "--queue", "roles": ["flag-input"] },
-    { "answerKey": "hp_gpu_count", "configVar": "HP_GPU_COUNT", "roles": ["internal"] }
+    { "answerKey": "hp_gpu_count", "configVar": "HP_GPU_COUNT", "roles": ["internal"] },
+    { "answerKey": "hp_instance_type", "configVar": "HP_INSTANCE_TYPE", "roles": ["builder-output"] }
   ]
 }

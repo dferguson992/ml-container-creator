@@ -87,6 +87,8 @@ nav:
       - Schema-Driven Architecture: dev/schema-driven-architecture.md
       - Template System: dev/template-system.md
       - do/ Script Contracts: do-script-contract.md
+      - Bootstrap IAM Roles (adopted-role limitation): dev/bootstrap-iam-roles.md
+      - EKS / HyperPod Migration & Findings: architecture/eks-hyperpod-migration.md
       - MCP Server Development: dev/mcp-server-development.md
       - Registries and Catalogs: dev/registries-and-catalogs.md
       - Registry Contribution Guide: REGISTRY_CONTRIBUTION_GUIDE.md

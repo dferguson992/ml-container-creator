@@ -11,19 +11,30 @@ import { Construct } from 'constructs';
 
 export interface MlccEksClusterStackProps extends cdk.StackProps {
     profileName: string;
-    adoptEks?: boolean;
-    adoptVpc?: boolean;
+    /**
+     * Adopt pre-existing IAM roles (via fromRoleName) instead of creating them. The
+     * runner sets this when it detects the RETAIN'd roles survive from a prior deploy
+     * (RemovalPolicy.RETAIN keeps them through teardown). The CLUSTER/VPC are NOT
+     * RETAIN'd, so they are always created regardless of this flag. The OIDC export +
+     * EksInferenceRole are created UNCONDITIONALLY (the real v1.9 fix — they must NOT be
+     * gated behind create-vs-adopt).
+     */
     adoptRoles?: boolean;
-    vpcId?: string;
-    eksClusterArn?: string;
-    eksClusterName?: string;
-    clusterSecurityGroupId?: string;
-    privateSubnetIds?: string;
 }
 
 /**
- * Stack 1 of the HyperPod module: EKS cluster, VPC, IAM roles, and
- * dependency EKS add-ons required by the Inference Operator.
+ * The `eks` module's cluster stack (BL143 split): VPC, EKS cluster, OIDC provider,
+ * Fargate, substrate add-ons, the EksInferenceRole (vanilla-EKS inference SA), and the
+ * operator IRSA roles.
+ *
+ * HARD CUTOVER (BL143): this stack ALWAYS CREATES — the former
+ * adoptEks/adoptVpc/adoptRoles branching is gone. The OIDC provider + EksInferenceRole
+ * are therefore created unconditionally (killing the v1.9 create-only-branch trap).
+ *
+ * Option 2 note: the operator IRSA roles (ALB/KEDA/CSI/HyperpodInference) are created
+ * HERE, coupled to the live cluster handle, rather than in a separate hyperpod stack
+ * (which would require the risky fromClusterAttributes/imported-OIDC path). They are
+ * only USED once the hyperpod module is added.
  */
 export class MlccEksClusterStack extends cdk.Stack {
     constructor(scope: Construct, id: string, props: MlccEksClusterStackProps) {
@@ -36,52 +47,45 @@ export class MlccEksClusterStack extends cdk.Stack {
         const region = this.region;
 
         cdk.Tags.of(this).add('mlcc:managed-by', 'ml-container-creator');
-        cdk.Tags.of(this).add('mlcc:module', 'hyperpod-cluster');
+        cdk.Tags.of(this).add('mlcc:module', 'eks');
         cdk.Tags.of(this).add('mlcc:profile', profileName);
         cdk.Tags.of(this).add('mlcc:stack', 'eks-cluster');
 
         const ssmPrefix = `/mlcc/${profileName}/hyperpod`;
 
-        // ─── VPC ────────────────────────────────────────────────────────────
-        let vpc: ec2.IVpc;
+        // ─── VPC (always created — hard cutover, no adopt path) ─────────────
+        const vpc = new ec2.Vpc(this, 'Vpc', {
+            maxAzs: 2,
+            natGateways: 1,
+            subnetConfiguration: [
+                {
+                    cidrMask: 19,
+                    name: 'Public',
+                    subnetType: ec2.SubnetType.PUBLIC,
+                },
+                {
+                    cidrMask: 19,
+                    name: 'Private',
+                    subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+                },
+            ],
+        });
 
-        if (props.adoptVpc && props.vpcId) {
-            vpc = ec2.Vpc.fromLookup(this, 'Vpc', { vpcId: props.vpcId });
-        } else {
-            const newVpc = new ec2.Vpc(this, 'Vpc', {
-                maxAzs: 2,
-                natGateways: 1,
-                subnetConfiguration: [
-                    {
-                        cidrMask: 19,
-                        name: 'Public',
-                        subnetType: ec2.SubnetType.PUBLIC,
-                    },
-                    {
-                        cidrMask: 19,
-                        name: 'Private',
-                        subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
-                    },
-                ],
-            });
-
-            // Required subnet tags for ALB controller and internal load balancers
-            for (const subnet of newVpc.publicSubnets) {
-                cdk.Tags.of(subnet).add('kubernetes.io/role/elb', '1');
-            }
-            for (const subnet of newVpc.privateSubnets) {
-                cdk.Tags.of(subnet).add('kubernetes.io/role/internal-elb', '1');
-            }
-
-            // S3 VPC Gateway endpoint on private route tables
-            newVpc.addGatewayEndpoint('S3Endpoint', {
-                service: ec2.GatewayVpcEndpointAwsService.S3,
-                subnets: [{ subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }],
-            });
-
-            newVpc.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
-            vpc = newVpc;
+        // Required subnet tags for ALB controller and internal load balancers
+        for (const subnet of vpc.publicSubnets) {
+            cdk.Tags.of(subnet).add('kubernetes.io/role/elb', '1');
         }
+        for (const subnet of vpc.privateSubnets) {
+            cdk.Tags.of(subnet).add('kubernetes.io/role/internal-elb', '1');
+        }
+
+        // S3 VPC Gateway endpoint on private route tables
+        vpc.addGatewayEndpoint('S3Endpoint', {
+            service: ec2.GatewayVpcEndpointAwsService.S3,
+            subnets: [{ subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }],
+        });
+
+        vpc.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
         const privateSubnetIds = vpc.privateSubnets.map(s => s.subnetId).join(',');
 
@@ -93,13 +97,18 @@ export class MlccEksClusterStack extends cdk.Stack {
 
         // ─── IAM Roles (RemovalPolicy.RETAIN on all) ────────────────────────
 
+        // RETAIN'd IAM roles survive teardown, so a re-provision ADOPTS them (the runner
+        // detects their existence and passes adoptRoles). The cluster/VPC are not
+        // RETAIN'd and are always created below.
+        const adoptRoles = props.adoptRoles === true;
+
         // EKS cluster role
         const eksClusterRole = this._createOrAdoptRole(
             'EksClusterRole',
             `mlcc-${profileName}-eks-cluster-role`,
             new iam.ServicePrincipal('eks.amazonaws.com'),
             ['arn:aws:iam::aws:policy/AmazonEKSClusterPolicy'],
-            props.adoptRoles,
+            adoptRoles,
         );
 
         // EKS node role
@@ -112,7 +121,7 @@ export class MlccEksClusterStack extends cdk.Stack {
                 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly',
                 'arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy',
             ],
-            props.adoptRoles,
+            adoptRoles,
         );
 
         // HyperPod instance role
@@ -136,70 +145,73 @@ export class MlccEksClusterStack extends cdk.Stack {
                 // Required for EKS-orchestrated HyperPod: EC2 node registration with EKS
                 'arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy',
             ],
-            props.adoptRoles,
+            adoptRoles,
         );
 
         // SageMaker assumes this role during CreateCluster to validate VpcConfig
         // subnets. AmazonSageMakerClusterInstanceRolePolicy does NOT include
         // the EC2 ENI permissions required for EKS-orchestrated clusters, so we
         // add them explicitly per the HyperPod EKS IAM prerequisites docs.
-        if (!props.adoptRoles) {
-            (hyperpodInstanceRole as iam.Role).addToPolicy(new iam.PolicyStatement({
-                sid: 'HyperPodEksInstancePolicy',
-                effect: iam.Effect.ALLOW,
-                actions: [
-                    // ENI management — required for HyperPod to attach customer ENIs
-                    'ec2:AssignPrivateIpAddresses',
-                    'ec2:AttachNetworkInterface',
-                    'ec2:CreateNetworkInterface',
-                    'ec2:CreateNetworkInterfacePermission',
-                    'ec2:DeleteNetworkInterface',
-                    'ec2:DeleteNetworkInterfacePermission',
-                    'ec2:DetachNetworkInterface',
-                    'ec2:ModifyNetworkInterfaceAttribute',
-                    'ec2:UnassignPrivateIpAddresses',
-                    // Describe permissions
-                    'ec2:DescribeInstances',
-                    'ec2:DescribeInstanceTypes',
-                    'ec2:DescribeNetworkInterfaces',
-                    'ec2:DescribeTags',
-                    'ec2:DescribeVpcs',
-                    'ec2:DescribeDhcpOptions',
-                    'ec2:DescribeSubnets',
-                    'ec2:DescribeSecurityGroups',
-                    // ECR — pull container images (also covered by managed policy but explicit here)
-                    'ecr:BatchCheckLayerAvailability',
-                    'ecr:BatchGetImage',
-                    'ecr:GetAuthorizationToken',
-                    'ecr:GetDownloadUrlForLayer',
-                    // EKS Pod Identity (optional but included for completeness)
-                    'eks-auth:AssumeRoleForPodIdentity',
-                ],
-                resources: ['*'],
-            }));
-            // CreateTags scoped to network interfaces only
-            (hyperpodInstanceRole as iam.Role).addToPolicy(new iam.PolicyStatement({
-                sid: 'HyperPodEksNetworkInterfaceTags',
-                effect: iam.Effect.ALLOW,
-                actions: ['ec2:CreateTags'],
-                resources: ['arn:aws:ec2:*:*:network-interface/*'],
-            }));
-        }
+        //
+        // BL143 adopt-drift fix: these inline policies are now asserted on BOTH the
+        // create AND the adopt path (the role is imported mutably, so addToPrincipalPolicy
+        // emits a real CFN policy against the existing role). Previously they were gated
+        // behind `if (!adoptRoles)`, so an adopted role never gained them — the exact
+        // drift that made HyperPod reject the role as "permissions invalid".
+        hyperpodInstanceRole.addToPrincipalPolicy(new iam.PolicyStatement({
+            sid: 'HyperPodEksInstancePolicy',
+            effect: iam.Effect.ALLOW,
+            actions: [
+                // ENI management — required for HyperPod to attach customer ENIs
+                'ec2:AssignPrivateIpAddresses',
+                'ec2:AttachNetworkInterface',
+                'ec2:CreateNetworkInterface',
+                'ec2:CreateNetworkInterfacePermission',
+                'ec2:DeleteNetworkInterface',
+                'ec2:DeleteNetworkInterfacePermission',
+                'ec2:DetachNetworkInterface',
+                'ec2:ModifyNetworkInterfaceAttribute',
+                'ec2:UnassignPrivateIpAddresses',
+                // Describe permissions
+                'ec2:DescribeInstances',
+                'ec2:DescribeInstanceTypes',
+                'ec2:DescribeNetworkInterfaces',
+                'ec2:DescribeTags',
+                'ec2:DescribeVpcs',
+                'ec2:DescribeDhcpOptions',
+                'ec2:DescribeSubnets',
+                'ec2:DescribeSecurityGroups',
+                // ECR — pull container images (also covered by managed policy but explicit here)
+                'ecr:BatchCheckLayerAvailability',
+                'ecr:BatchGetImage',
+                'ecr:GetAuthorizationToken',
+                'ecr:GetDownloadUrlForLayer',
+                // EKS Pod Identity (optional but included for completeness)
+                'eks-auth:AssumeRoleForPodIdentity',
+            ],
+            resources: ['*'],
+        }));
+        // CreateTags scoped to network interfaces only
+        hyperpodInstanceRole.addToPrincipalPolicy(new iam.PolicyStatement({
+            sid: 'HyperPodEksNetworkInterfaceTags',
+            effect: iam.Effect.ALLOW,
+            actions: ['ec2:CreateTags'],
+            resources: ['arn:aws:ec2:*:*:network-interface/*'],
+        }));
 
         // BL087: S3 read access to mlcc-core lifecycle bucket.
         // HyperPod nodes fetch on_create.sh from s3://mlcc-core-<acct>-<region>/hyperpod-lifecycle/
         // at bootstrap time. Without this, nodes fail silently during provisioning.
-        if (!props.adoptRoles) {
-            (hyperpodInstanceRole as iam.Role).addToPolicy(new iam.PolicyStatement({
-                sid: 'HyperPodLifecycleS3Access',
-                effect: iam.Effect.ALLOW,
-                actions: ['s3:GetObject', 's3:ListBucket'],
-                resources: [
-                    `arn:aws:s3:::mlcc-core-${this.account}-${this.region}`,
-                    `arn:aws:s3:::mlcc-core-${this.account}-${this.region}/*`,
-                ],
-            }));
-        }
+        // Asserted on both create and adopt (see adopt-drift note above).
+        hyperpodInstanceRole.addToPrincipalPolicy(new iam.PolicyStatement({
+            sid: 'HyperPodLifecycleS3Access',
+            effect: iam.Effect.ALLOW,
+            actions: ['s3:GetObject', 's3:ListBucket'],
+            resources: [
+                `arn:aws:s3:::mlcc-core-${this.account}-${this.region}`,
+                `arn:aws:s3:::mlcc-core-${this.account}-${this.region}/*`,
+            ],
+        }));
 
         new ssm.StringParameter(this, 'HyperPodInstanceRoleArnParam', {
             parameterName: `${ssmPrefix}/HyperPodInstanceRoleArn`,
@@ -207,41 +219,32 @@ export class MlccEksClusterStack extends cdk.Stack {
             description: 'HyperPod instance execution role ARN',
         });
 
-        // ─── EKS Cluster ────────────────────────────────────────────────────
-        let cluster: eks.ICluster;
-        let clusterSecurityGroupId: string;
+        // ─── EKS Cluster (always created — hard cutover, no adopt path) ─────
+        const k8sVersion = this.node.tryGetContext('k8sVersion') || '1.31';
 
-        if (props.adoptEks && props.eksClusterArn) {
-            cluster = eks.Cluster.fromClusterAttributes(this, 'EksCluster', {
-                clusterName: props.eksClusterName || props.eksClusterArn.split('/').pop()!,
-                clusterSecurityGroupId: props.clusterSecurityGroupId,
-                kubectlRoleArn: eksClusterRole.roleArn,
-            });
-            clusterSecurityGroupId = props.clusterSecurityGroupId || '';
-        } else {
-            const k8sVersion = this.node.tryGetContext('k8sVersion') || '1.31';
+        const newCluster = new eks.Cluster(this, 'EksCluster', {
+            version: eks.KubernetesVersion.of(k8sVersion),
+            kubectlLayer: new KubectlV31Layer(this, 'KubectlLayer'),
+            vpc,
+            vpcSubnets: [{ subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }],
+            defaultCapacity: 0,
+            role: eksClusterRole,
+            authenticationMode: eks.AuthenticationMode.API_AND_CONFIG_MAP,
+            clusterName: `mlcc-${profileName}-eks`,
+        });
 
-            const newCluster = new eks.Cluster(this, 'EksCluster', {
-                version: eks.KubernetesVersion.of(k8sVersion),
-                kubectlLayer: new KubectlV31Layer(this, 'KubectlLayer'),
-                vpc,
-                vpcSubnets: [{ subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }],
-                defaultCapacity: 0,
-                role: eksClusterRole,
-                authenticationMode: eks.AuthenticationMode.API_AND_CONFIG_MAP,
-                clusterName: `mlcc-${profileName}-eks`,
-            });
+        const clusterSecurityGroupId = newCluster.clusterSecurityGroupId;
 
-            clusterSecurityGroupId = newCluster.clusterSecurityGroupId;
-            cluster = newCluster;
-
+        {
             // ─── Fargate Profile for system pods ────────────────────────────
             // Zero-node cluster needs Fargate to run webhook-serving pods
             // (cert-manager, ALB controller) so Helm installs and EKS addons
             // don't fail with "no endpoints available for service". Fargate is
             // pay-per-pod — ~$0.04/hr total for these tiny system pods.
             const fargateRoleName = `mlcc-${profileName}-fargate-pod-exec-role`;
-            const fargateRole = props.adoptRoles
+            // The role is RETAIN'd (survives teardown) → adopt it on re-provision; the
+            // Fargate PROFILE below is always recreated (cluster-scoped).
+            const fargateRole = adoptRoles
                 ? iam.Role.fromRoleName(this, 'FargatePodExecutionRole', fargateRoleName)
                 : new iam.Role(this, 'FargatePodExecutionRole', {
                     roleName: fargateRoleName,
@@ -250,9 +253,8 @@ export class MlccEksClusterStack extends cdk.Stack {
                         iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonEKSFargatePodExecutionRolePolicy'),
                     ],
                 });
-            // RETAIN so Fargate profile (which references this ARN) stays valid
-            // even if the stack is torn down and rebuilt.
-            if (!props.adoptRoles) {
+            if (!adoptRoles) {
+                // RETAIN so the Fargate profile's role ARN stays valid across rebuilds.
                 (fargateRole as iam.Role).applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
             }
 
@@ -428,6 +430,81 @@ export class MlccEksClusterStack extends cdk.Stack {
 
             const oidcProvider = newCluster.openIdConnectProvider;
 
+            // ─── EksInferenceRole (vanilla-EKS inference SA) ────────────────
+            // The role a plain-EKS inference pod assumes to read an S3-staged model.
+            // Namespace-WILDCARD sub (so it works across deploy namespaces) + fixed SA
+            // name `mlcc-eks-inference-sa`. Created UNCONDITIONALLY here (BL143 — this is
+            // the "redo properly in the eks module" item; the v1.9 version was gated
+            // behind a create-only adopt branch and silently skipped on adopt). Exported
+            // as eksInferenceRoleArn → consumed by do/deploy.d/eks via
+            // _PROFILE_eksInferenceRoleArn.
+            const eksInferenceRoleName = `mlcc-${profileName}-eks-inference-role`;
+            const eksInferenceCondition = new cdk.CfnJson(this, 'EksInferenceRoleCondition', {
+                value: {
+                    [`${oidcProvider.openIdConnectProviderIssuer}:aud`]: 'sts.amazonaws.com',
+                },
+            });
+            const eksInferenceRole = new iam.Role(this, 'EksInferenceRole', {
+                roleName: eksInferenceRoleName,
+                assumedBy: new iam.FederatedPrincipal(
+                    oidcProvider.openIdConnectProviderArn,
+                    {
+                        StringEquals: eksInferenceCondition,
+                        // namespace-wildcard sub: any namespace, fixed SA name.
+                        StringLike: new cdk.CfnJson(this, 'EksInferenceRoleSub', {
+                            value: {
+                                [`${oidcProvider.openIdConnectProviderIssuer}:sub`]:
+                                    'system:serviceaccount:*:mlcc-eks-inference-sa',
+                            },
+                        }),
+                    },
+                    'sts:AssumeRoleWithWebIdentity',
+                ),
+            });
+            eksInferenceRole.addToPolicy(new iam.PolicyStatement({
+                sid: 'EksInferenceS3Read',
+                effect: iam.Effect.ALLOW,
+                actions: ['s3:GetObject', 's3:ListBucket', 's3:GetBucketLocation'],
+                resources: [
+                    `arn:aws:s3:::mlcc-core-${this.account}-${this.region}`,
+                    `arn:aws:s3:::mlcc-core-${this.account}-${this.region}/*`,
+                ],
+            }));
+            // DESTROY (not RETAIN): OIDC-bound, recreated with the cluster.
+            eksInferenceRole.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
+
+            new ssm.StringParameter(this, 'EksInferenceRoleArnParam', {
+                parameterName: `${ssmPrefix}/EksInferenceRoleArn`,
+                stringValue: eksInferenceRole.roleArn,
+                description: 'EKS inference IRSA role ARN (vanilla-EKS S3-staged model access)',
+            });
+            new cdk.CfnOutput(this, 'EksInferenceRoleArnOutput', {
+                value: eksInferenceRole.roleArn,
+                exportName: `mlcc-${profileName}-eks-EksInferenceRoleArn`,
+            });
+
+            // OIDC provider exports — the eks module publishes these so any consumer
+            // (and a future hyperpod stack, if it ever imports the cluster) can resolve
+            // the provider. Created unconditionally (no adopt branch).
+            new ssm.StringParameter(this, 'OidcProviderArnParam', {
+                parameterName: `${ssmPrefix}/OidcProviderArn`,
+                stringValue: oidcProvider.openIdConnectProviderArn,
+                description: 'EKS OIDC provider ARN',
+            });
+            new ssm.StringParameter(this, 'OidcProviderIssuerParam', {
+                parameterName: `${ssmPrefix}/OidcProviderIssuer`,
+                stringValue: oidcProvider.openIdConnectProviderIssuer,
+                description: 'EKS OIDC provider issuer URL',
+            });
+            new cdk.CfnOutput(this, 'OidcProviderArnOutput', {
+                value: oidcProvider.openIdConnectProviderArn,
+                exportName: `mlcc-${profileName}-eks-OidcProviderArn`,
+            });
+            new cdk.CfnOutput(this, 'OidcProviderIssuerOutput', {
+                value: oidcProvider.openIdConnectProviderIssuer,
+                exportName: `mlcc-${profileName}-eks-OidcProviderIssuer`,
+            });
+
             // HyperpodInferenceRole
             const hyperpodInferenceRole = this._createIrsaRole(
                 'HyperpodInferenceRole',
@@ -436,20 +513,59 @@ export class MlccEksClusterStack extends cdk.Stack {
                 'hyperpod-inference-system',
                 'hyperpod-inference-controller-manager',
                 ['arn:aws:iam::aws:policy/AmazonSageMakerHyperPodInferenceAccess'],
-                props.adoptRoles,
             );
 
             // The inference operator calls UpdateClusterInference and passes its
             // own role ARN. The managed policy doesn't include iam:PassRole, so
-            // we add it explicitly (self-referencing).
-            if (!props.adoptRoles) {
-                (hyperpodInferenceRole as iam.Role).addToPolicy(new iam.PolicyStatement({
-                    sid: 'PassSelfRole',
-                    effect: iam.Effect.ALLOW,
-                    actions: ['iam:PassRole'],
-                    resources: [`arn:aws:iam::${this.account}:role/mlcc-${profileName}-hyperpod-inference-role`],
-                }));
-            }
+            // we add it explicitly (self-referencing). IRSA roles are always created
+            // (DESTROY), so this inline policy is unconditional.
+            (hyperpodInferenceRole as iam.Role).addToPolicy(new iam.PolicyStatement({
+                sid: 'PassSelfRole',
+                effect: iam.Effect.ALLOW,
+                actions: ['iam:PassRole'],
+                resources: [`arn:aws:iam::${this.account}:role/mlcc-${profileName}-hyperpod-inference-role`],
+            }));
+
+            // The inference operator writes/reads TLS material in its TLS bucket
+            // (mlcc-hyperpod-tls-<profile>, created by the inference-operator stack)
+            // and performs an S3 "dry-run" PutObject at startup to validate access.
+            // AmazonSageMakerHyperPodInferenceAccess does NOT grant write to this
+            // bucket, so the operator fails with:
+            //   AccessDenied ... s3:PutObject ... mlcc-hyperpod-tls-<profile>/inference-operator-s3-dryrun
+            // Grant it explicitly by ARN (the bucket name is deterministic, so no
+            // cross-stack import is needed — the bucket lives in a later stack).
+            // Inference Operator v3.0 tags the ALB, S3, and ACM resources it creates
+            // (per the HyperPod Inference release notes). Its TLS dry-run writes a
+            // TAGGED object to mlcc-hyperpod-tls-<profile>, so the role needs BOTH
+            // s3:PutObject AND s3:PutObjectTagging (a tagged PutObject without the latter
+            // fails AccessDenied on s3:PutObjectTagging). PutObject/GetObject/ListBucket
+            // cover the read/write of TLS material; PutObjectTagging matches AWS's
+            // documented `S3PutObjectTaggingAccess` statement.
+            const tlsBucketName = `mlcc-hyperpod-tls-${profileName}`;
+            (hyperpodInferenceRole as iam.Role).addToPolicy(new iam.PolicyStatement({
+                sid: 'HyperPodInferenceTlsBucketAccess',
+                effect: iam.Effect.ALLOW,
+                actions: [
+                    's3:PutObject',
+                    's3:PutObjectTagging',
+                    's3:GetObject',
+                    's3:ListBucket',
+                ],
+                resources: [
+                    `arn:aws:s3:::${tlsBucketName}`,
+                    `arn:aws:s3:::${tlsBucketName}/*`,
+                ],
+            }));
+
+            // The operator also tags the ACM certificate it provisions for the ALB
+            // (same v3.0 tagging change). Without this it fails AccessDenied on
+            // acm:AddTagsToCertificate. Matches AWS's `CertificateTagginPermission`.
+            (hyperpodInferenceRole as iam.Role).addToPolicy(new iam.PolicyStatement({
+                sid: 'HyperPodInferenceCertTagging',
+                effect: iam.Effect.ALLOW,
+                actions: ['acm:AddTagsToCertificate'],
+                resources: ['arn:aws:acm:*:*:certificate/*'],
+            }));
 
             new ssm.StringParameter(this, 'HyperpodInferenceRoleArnParam', {
                 parameterName: `${ssmPrefix}/HyperpodInferenceRoleArn`,
@@ -645,7 +761,13 @@ export class MlccEksClusterStack extends cdk.Stack {
                 'kube-system',
                 'aws-load-balancer-controller',
                 [albPolicy.managedPolicyArn],
-                props.adoptRoles,
+                // Trust the SA name in ANY namespace: this stack installs the ALB
+                // controller in kube-system, but the HyperPod Inference Operator add-on
+                // runs its own ALB controller in hyperpod-inference-system under the same
+                // SA name and annotates it with THIS role. A kube-system-only pin rejects
+                // the operator-namespace token (sub mismatch → AssumeRoleWithWebIdentity
+                // 403), which hangs the InferenceEndpointConfig forever.
+                true,
             );
 
             new ssm.StringParameter(this, 'AlbControllerRoleArnParam', {
@@ -682,26 +804,23 @@ export class MlccEksClusterStack extends cdk.Stack {
                 'keda',
                 'keda-operator',
                 [],
-                props.adoptRoles,
             );
 
-            // Add inline CloudWatch + APS read policies for KEDA
-            if (!props.adoptRoles) {
-                (kedaOperatorRole as iam.Role).addToPolicy(new iam.PolicyStatement({
-                    effect: iam.Effect.ALLOW,
-                    actions: [
-                        'cloudwatch:GetMetricData',
-                        'cloudwatch:GetMetricStatistics',
-                        'cloudwatch:ListMetrics',
-                        'cloudwatch:DescribeAlarms',
-                        'aps:QueryMetrics',
-                        'aps:GetLabels',
-                        'aps:GetSeries',
-                        'aps:GetMetricMetadata',
-                    ],
-                    resources: ['*'],
-                }));
-            }
+            // Add inline CloudWatch + APS read policies for KEDA (IRSA role always created).
+            (kedaOperatorRole as iam.Role).addToPolicy(new iam.PolicyStatement({
+                effect: iam.Effect.ALLOW,
+                actions: [
+                    'cloudwatch:GetMetricData',
+                    'cloudwatch:GetMetricStatistics',
+                    'cloudwatch:ListMetrics',
+                    'cloudwatch:DescribeAlarms',
+                    'aps:QueryMetrics',
+                    'aps:GetLabels',
+                    'aps:GetSeries',
+                    'aps:GetMetricMetadata',
+                ],
+                resources: ['*'],
+            }));
 
             new ssm.StringParameter(this, 'KedaOperatorRoleArnParam', {
                 parameterName: `${ssmPrefix}/KedaOperatorRoleArn`,
@@ -716,25 +835,22 @@ export class MlccEksClusterStack extends cdk.Stack {
                 'kube-system',
                 's3-csi-driver-sa',
                 [],
-                props.adoptRoles,
             );
 
-            if (!props.adoptRoles) {
-                (s3CsiRole as iam.Role).addToPolicy(new iam.PolicyStatement({
-                    effect: iam.Effect.ALLOW,
-                    actions: [
-                        's3:GetObject',
-                        's3:PutObject',
-                        's3:ListBucket',
-                        's3:DeleteObject',
-                        's3:GetBucketLocation',
-                    ],
-                    resources: [
-                        `arn:aws:s3:::hyperpod-tls-*`,
-                        `arn:aws:s3:::hyperpod-tls-*/*`,
-                    ],
-                }));
-            }
+            (s3CsiRole as iam.Role).addToPolicy(new iam.PolicyStatement({
+                effect: iam.Effect.ALLOW,
+                actions: [
+                    's3:GetObject',
+                    's3:PutObject',
+                    's3:ListBucket',
+                    's3:DeleteObject',
+                    's3:GetBucketLocation',
+                ],
+                resources: [
+                    'arn:aws:s3:::hyperpod-tls-*',
+                    'arn:aws:s3:::hyperpod-tls-*/*',
+                ],
+            }));
 
             new ssm.StringParameter(this, 'S3CsiRoleArnParam', {
                 parameterName: `${ssmPrefix}/S3CsiRoleArn`,
@@ -749,7 +865,6 @@ export class MlccEksClusterStack extends cdk.Stack {
                 'kube-system',
                 'fsx-csi-controller-sa',
                 ['arn:aws:iam::aws:policy/AmazonFSxFullAccess'],
-                props.adoptRoles,
             );
 
             new ssm.StringParameter(this, 'FsxCsiRoleArnParam', {
@@ -760,13 +875,8 @@ export class MlccEksClusterStack extends cdk.Stack {
 
         // ─── SSM Exports ────────────────────────────────────────────────────
 
-        const eksClusterArn = props.adoptEks && props.eksClusterArn
-            ? props.eksClusterArn
-            : (cluster as eks.Cluster).clusterArn;
-
-        const eksClusterName = props.adoptEks && props.eksClusterName
-            ? props.eksClusterName
-            : (cluster as eks.Cluster).clusterName;
+        const eksClusterArn = newCluster.clusterArn;
+        const eksClusterName = newCluster.clusterName;
 
         new ssm.StringParameter(this, 'EksClusterArnParam', {
             parameterName: `${ssmPrefix}/EksClusterArn`,
@@ -811,6 +921,22 @@ export class MlccEksClusterStack extends cdk.Stack {
 
     /**
      * Create or adopt an IAM role with RemovalPolicy.RETAIN.
+     *
+     * ADOPT PATH (BL143 adopt-drift fix): a RETAIN'd service role that already exists
+     * is IMPORTED, not recreated — but it is imported with `mutable: true` and its
+     * managed policies are RE-ASSERTED so a `bootstrap update` CONVERGES the live role
+     * to the current spec. The earlier bug was importing via `fromRoleName()` (which
+     * yields an IMMUTABLE handle whose addManagedPolicy/addToPolicy calls are silent
+     * no-ops) and skipping the managed/inline attachments on adopt — so an adopted role
+     * stayed frozen at whatever it had when first created, drifting out of spec and
+     * making HyperPod reject it with "execution role permissions are invalid".
+     *
+     * CAVEAT — TRUST POLICY: CDK cannot modify the assume-role (trust) policy of an
+     * IMPORTED role. The `principal` here only takes effect on the CREATE path. For an
+     * adopted role, the trust principal (e.g. the ec2.amazonaws.com principal the
+     * HyperPod instance role needs) must be reconciled out-of-band at provision time
+     * (the same seam that applies VpcSubnetAccess in module-runner.cjs). Policies DO
+     * converge here; trust does not.
      */
     private _createOrAdoptRole(
         id: string,
@@ -820,20 +946,46 @@ export class MlccEksClusterStack extends cdk.Stack {
         adopt?: boolean,
     ): iam.IRole {
         if (adopt) {
-            return iam.Role.fromRoleName(this, id, roleName);
+            // Mutable import so INLINE policy statements (addToPrincipalPolicy, added by
+            // the caller) emit a real standalone Policy attached to the existing role.
+            // NOTE: CDK CANNOT attach a MANAGED policy to an imported role —
+            // addManagedPolicy(fromManagedPolicyArn(...)) is refused with
+            // "Can't combine imported IManagedPolicy ... Use ManagedPolicy directly" and
+            // silently does nothing. So managed-policy reconciliation for an adopted role
+            // is NOT attempted here; it is done at provision time by the module runner
+            // (_ensureHyperPodInstanceRoleManagedPolicies), the same seam that reconciles
+            // the trust policy and VpcSubnetAccess. (BL143 adopt-drift.)
+            const roleArn = `arn:aws:iam::${this.account}:role/${roleName}`;
+            return iam.Role.fromRoleArn(this, id, roleArn, { mutable: true });
         }
 
+        // Reference AWS-managed policies by NAME (fromAwsManagedPolicyName), not by
+        // imported ARN (fromManagedPolicyArn). The name form yields an ATTACHABLE
+        // ManagedPolicy; the ARN form yields an imported IManagedPolicy that CDK refuses
+        // to attach to an imported role ("Can't combine imported IManagedPolicy ... Use
+        // ManagedPolicy directly"). All callers pass arn:aws:iam::aws:policy/<Name>, so
+        // the name is the ARN suffix. Using the name form keeps create robust and
+        // warning-free and is the correct API if these are ever attached post-import.
         const role = new iam.Role(this, id, {
             roleName,
             assumedBy: principal,
-            managedPolicies: managedPolicyArns.map(arn => iam.ManagedPolicy.fromManagedPolicyArn(this, `${id}Policy${managedPolicyArns.indexOf(arn)}`, arn)),
+            managedPolicies: managedPolicyArns.map(arn =>
+                iam.ManagedPolicy.fromAwsManagedPolicyName(arn.replace('arn:aws:iam::aws:policy/', '')),
+            ),
         });
         role.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
         return role;
     }
 
     /**
-     * Create or adopt an IRSA role with OIDC trust and RemovalPolicy.RETAIN.
+     * Create an IRSA role with OIDC trust and RemovalPolicy.DESTROY.
+     *
+     * IRSA roles are BOUND to this cluster's OIDC provider. The cluster/OIDC are not
+     * RETAIN'd (recreated fresh on every provision), so an IRSA role is meaningless once
+     * the cluster is gone — and a RETAIN'd one would (a) collide on recreate and (b) carry
+     * trust pointing at the DELETED OIDC. So these are DESTROY and ALWAYS created (never
+     * adopted): they must be recreated to trust the NEW OIDC issuer. (This is the
+     * correctness fix from the first live bring-up — Option 1.)
      */
     private _createIrsaRole(
         id: string,
@@ -842,16 +994,32 @@ export class MlccEksClusterStack extends cdk.Stack {
         namespace: string,
         serviceAccount: string,
         managedPolicyArns: string[],
-        adopt?: boolean,
+        // When true, trust the SA by NAME in ANY namespace (StringLike wildcard on the
+        // namespace segment) instead of pinning the exact namespace. Needed when the
+        // workload's runtime namespace is NOT controlled by this stack — e.g. the ALB
+        // controller: this stack's Helm chart installs it in kube-system, but the
+        // HyperPod Inference Operator add-on installs ITS OWN ALB controller in
+        // hyperpod-inference-system under the same SA name and annotates it with THIS
+        // role. A StringEquals pin to kube-system rejects that operator-namespace token
+        // (sub mismatch) → AssumeRoleWithWebIdentity 403 → the ALB never provisions and
+        // the InferenceEndpointConfig hangs at DeploymentInProgress. Trusting the SA name
+        // in any namespace covers whichever controller actually serves the ingress.
+        saNameAnyNamespace = false,
     ): iam.IRole {
-        if (adopt) {
-            return iam.Role.fromRoleName(this, id, roleName);
-        }
+        const subClaim = `${oidcProvider.openIdConnectProviderIssuer}:sub`;
+        const audClaim = `${oidcProvider.openIdConnectProviderIssuer}:aud`;
 
-        const conditions = new cdk.CfnJson(this, `${id}Condition`, {
+        // aud is always an exact match; sub is either exact (default) or a name-anywhere
+        // wildcard. CfnJson is required because the issuer URL is only known at deploy
+        // time (it is a token), so the condition keys cannot be literals.
+        const audCondition = new cdk.CfnJson(this, `${id}Aud`, {
+            value: { [audClaim]: 'sts.amazonaws.com' },
+        });
+        const subCondition = new cdk.CfnJson(this, `${id}Sub`, {
             value: {
-                [`${oidcProvider.openIdConnectProviderIssuer}:sub`]: `system:serviceaccount:${namespace}:${serviceAccount}`,
-                [`${oidcProvider.openIdConnectProviderIssuer}:aud`]: 'sts.amazonaws.com',
+                [subClaim]: saNameAnyNamespace
+                    ? `system:serviceaccount:*:${serviceAccount}`
+                    : `system:serviceaccount:${namespace}:${serviceAccount}`,
             },
         });
 
@@ -859,12 +1027,20 @@ export class MlccEksClusterStack extends cdk.Stack {
             roleName,
             assumedBy: new iam.FederatedPrincipal(
                 oidcProvider.openIdConnectProviderArn,
-                { StringEquals: conditions },
+                saNameAnyNamespace
+                    ? { StringEquals: audCondition, StringLike: subCondition }
+                    : { StringEquals: new cdk.CfnJson(this, `${id}Condition`, {
+                        value: {
+                            [subClaim]: `system:serviceaccount:${namespace}:${serviceAccount}`,
+                            [audClaim]: 'sts.amazonaws.com',
+                        },
+                    }) },
                 'sts:AssumeRoleWithWebIdentity',
             ),
             managedPolicies: managedPolicyArns.map(arn => iam.ManagedPolicy.fromManagedPolicyArn(this, `${id}ManagedPolicy${managedPolicyArns.indexOf(arn)}`, arn)),
         });
-        role.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+        // DESTROY (not RETAIN): OIDC-bound, dies with the cluster, recreated cleanly.
+        role.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
         return role;
     }
 }

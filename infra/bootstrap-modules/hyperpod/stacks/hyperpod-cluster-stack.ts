@@ -32,7 +32,7 @@ export class MlccHyperPodClusterStack extends cdk.Stack {
         const ssmPrefix = `/mlcc/${profileName}/hyperpod`;
 
         cdk.Tags.of(this).add('mlcc:managed-by', 'ml-container-creator');
-        cdk.Tags.of(this).add('mlcc:module', 'hyperpod-cluster');
+        cdk.Tags.of(this).add('mlcc:module', 'hyperpod');
         cdk.Tags.of(this).add('mlcc:profile', profileName);
         cdk.Tags.of(this).add('mlcc:stack', 'hyperpod-cluster');
 
@@ -51,7 +51,7 @@ export class MlccHyperPodClusterStack extends cdk.Stack {
             || '';
         const instanceType = props.instanceType
             || this.node.tryGetContext('instanceType')
-            || 'ml.g5.2xlarge';
+            || 'ml.c5.4xlarge';
 
         // Validate required inputs — during destroy, context may be empty.
         // Return early (empty stack) so CDK can still find and destroy it.
@@ -75,8 +75,23 @@ export class MlccHyperPodClusterStack extends cdk.Stack {
                     clusterArn: eksClusterArn,
                 },
             },
+            // The default-worker group is the PERMANENT FLOOR that runs the HyperPod
+            // Inference Operator's control-plane pods (gateway controller, controller
+            // manager, ALB, KEDA — ~13 pods per the AWS operator-install minimum). These
+            // are CPU/orchestration workloads: they do NOT need a GPU. GPU compute for
+            // model-serving endpoints comes from SEPARATE instance groups attached on
+            // demand (add via `aws sagemaker update-cluster`), so the always-on floor is
+            // a cheap CPU instance (ml.c5.4xlarge — the AWS-documented operator minimum),
+            // not a GPU node. Validated live: the 7 operator pods run comfortably on
+            // 2 × ml.c5.4xlarge.
+            //
+            // The floor of 2 is a HyperPod SETUP requirement, not a capacity one — a
+            // 0-instance (and empirically a 1-instance) EKS-orchestrated cluster does not
+            // finish setup. Overridable via `defaultWorkerCount` context, but DO NOT go
+            // below 2. These 2 × ml.c5.4xlarge are BILLABLE and run for the life of the
+            // hyperpod module (see the module's cost estimate).
             instanceGroups: [{
-                instanceCount: 0,
+                instanceCount: parseInt(this.node.tryGetContext('defaultWorkerCount'), 10) || 2,
                 instanceGroupName: 'default-worker',
                 instanceType,
                 executionRole: hyperPodInstanceRoleArn,

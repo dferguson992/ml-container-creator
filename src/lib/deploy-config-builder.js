@@ -796,7 +796,7 @@ export async function run({ configFile, outputFile, preTarget, preInstanceType, 
                 name: `${c.name} (${c.gpuTotal} GPUs, ${c.instanceTypes.join(', ')})`,
                 value: c.name
             }));
-            choices.push({ name: '(use current kubectl context — no cluster)', value: '' });
+            choices.push({ name: 'use current kubectl context', value: '' });
             answers.cluster_name = await select({
                 message: 'Target cluster (optional):',
                 choices,

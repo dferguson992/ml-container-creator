@@ -353,7 +353,7 @@
             "envVar": "ML_MAX_LORAS",
             "templateVar": "maxLoras",
             "configKey": "maxLoras",
-            "default": 30,
+            "default": 4,
             "validation": {
                 "min": 1,
                 "max": 256
@@ -375,7 +375,7 @@
             "widget": {
                 "section": "features",
                 "inputType": "number",
-                "placeholder": "30"
+                "placeholder": "4"
             },
             "prompt": {
                 "message": "Max concurrent LoRA adapters?",
@@ -397,7 +397,7 @@
             "envVar": "ML_MAX_LORA_RANK",
             "templateVar": "maxLoraRank",
             "configKey": "maxLoraRank",
-            "default": 64,
+            "default": 16,
             "validation": {
                 "min": 8,
                 "max": 512
@@ -419,7 +419,7 @@
             "widget": {
                 "section": "features",
                 "inputType": "number",
-                "placeholder": "64"
+                "placeholder": "16"
             },
             "prompt": {
                 "message": "Max LoRA rank?",

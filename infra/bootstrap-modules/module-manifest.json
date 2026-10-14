@@ -62,14 +62,24 @@
       "exports": ["DomainId", "UserProfileName"],
       "resourceLevel": "profile"
     },
-    "hyperpod-cluster": {
-      "displayName": "HyperPod (EKS + Inference)",
-      "description": "Provisions a full HyperPod EKS environment: VPC, EKS cluster, HyperPod cluster (0-instance), and the SageMaker Inference Operator. Three CDK stacks deployed in sequence.",
-      "estimatedMonthlyCost": "$100+/mo (EKS control plane ~$73 + NAT; compute billed per node-hour when scaled up)",
+    "eks": {
+      "displayName": "EKS Cluster",
+      "description": "Provisions a standalone EKS environment: VPC, EKS cluster, OIDC provider, Fargate profile, CSI/metrics add-ons, and the EKS inference IRSA role. Vanilla-EKS users add this alone; the hyperpod module depends on it.",
+      "estimatedMonthlyCost": "$73+/mo (EKS control plane; NAT + compute billed separately)",
       "required": false,
       "depends": ["core"],
-      "stacks": ["eks-cluster", "hyperpod-cluster", "inference-operator"],
-      "exports": ["EksClusterArn", "EksClusterName", "HyperPodClusterArn", "HyperPodClusterName", "InferenceOperatorStatus"],
+      "stacks": ["eks-cluster"],
+      "exports": ["EksClusterArn", "EksClusterName", "OidcProviderArn", "OidcProviderIssuer", "EksInferenceRoleArn"],
+      "resourceLevel": "profile"
+    },
+    "hyperpod": {
+      "displayName": "HyperPod (Inference Operator)",
+      "description": "Provisions the HyperPod cluster and the SageMaker Inference Operator on top of the eks module. Runs a REQUIRED floor of 2 x ml.c5.4xlarge on-demand CPU workers for the operator's control-plane pods (the cluster + operator will not come up with fewer). GPU compute for model serving is attached on demand via separate instance groups, not the floor. Two CDK stacks deployed in sequence. Requires the eks module.",
+      "estimatedMonthlyCost": "~$1,300/mo (2 x ml.c5.4xlarge on-demand CPU default-worker floor, billed 24/7 while provisioned; confirm current rates on the SageMaker pricing page. GPU model-serving instances are billed separately only when attached. Remove the module when idle)",
+      "required": false,
+      "depends": ["eks"],
+      "stacks": ["hyperpod-cluster", "inference-operator"],
+      "exports": ["HyperPodClusterArn", "HyperPodClusterName", "InferenceOperatorStatus"],
       "resourceLevel": "profile"
     }
   }
