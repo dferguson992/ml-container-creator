@@ -581,4 +581,92 @@ describe('Module runner reconciles ALL adopted service roles (adopt-drift)', () 
             }
         }
     });
+
+    // BL143 live-rehearsal finding: the SageMaker endpoint-creation stage is gated on the
+    // HyperPod cluster being inference-enabled (describe-cluster InferenceConfig != null).
+    // The addon being ACTIVE does NOT guarantee EnableClusterInference completed, and the
+    // old 10-min addon poll gave up while that 5-15+ min op was still running — leaving
+    // InferenceConfig: null, so every model deploy hangs (pods + ALB up, endpoint never
+    // created, operator polls DescribeEndpoint forever).
+    it('verifies cluster inference enablement (InferenceConfig) after the addon is ACTIVE', () => {
+        assert.ok(
+            source.includes('_ensureHyperPodClusterInferenceEnabled'),
+            'module-runner must define _ensureHyperPodClusterInferenceEnabled'
+        );
+        const start = source.indexOf('_ensureHyperPodClusterInferenceEnabled(profile) {');
+        const body = source.slice(start, start + 2500);
+        assert.ok(body.includes('describe-cluster'), 'must poll sagemaker describe-cluster');
+        assert.ok(body.includes('InferenceConfig'), 'must check the InferenceConfig field');
+        // Must run on BOTH the fresh-install path AND the already-ACTIVE early-return path.
+        assert.ok(
+            (source.match(/this\._ensureHyperPodClusterInferenceEnabled\(profile\)/g) || []).length >= 2,
+            'verifier must run on both the fresh-install and already-ACTIVE paths'
+        );
+    });
+
+    it('addon poll window covers the documented EnableClusterInference duration (>10 min)', () => {
+        assert.ok(
+            !source.includes('const timeout = 600000;'),
+            'addon poll must not use the too-short 10-min (600000) timeout'
+        );
+    });
+
+    it('post-install patches write their own eks kubeconfig (not a guessed path)', () => {
+        // The patches target the operator on the EKS cluster; the runner must create a
+        // kubeconfig for that cluster via update-kubeconfig rather than assuming a path
+        // another step wrote (the old `.kube/hyperpod-<profileName>` guess did not exist
+        // and every patch failed). BL143 live-rehearsal finding.
+        const start = source.indexOf('_postInstallInferenceOperator(profile, hyperpodClusterArn) {');
+        const body = source.slice(start, start + 1200);
+        assert.ok(
+            body.includes('aws eks update-kubeconfig'),
+            '_postInstallInferenceOperator must write a kubeconfig via update-kubeconfig'
+        );
+        assert.ok(
+            !body.includes('.kube/hyperpod-${profile.profileName}'),
+            'must not reuse the broken `.kube/hyperpod-<profileName>` guessed path'
+        );
+    });
+
+    it('teardown deletes the out-of-band inference add-on (BL143)', () => {
+        // The inference add-on is created via `aws eks create-addon` (not CDK), so cdk
+        // destroy never removes it. Teardown must delete it, or it dangles with a stale
+        // hyperpodClusterArn and wedges a later recreate.
+        assert.ok(
+            source.includes('_deleteInferenceAddon'),
+            'module-runner must define _deleteInferenceAddon'
+        );
+        // It must be invoked from teardown, gated to the inference-operator-owning module.
+        assert.ok(
+            /this\.stacks\.includes\('inference-operator'\)[\s\S]*?this\._deleteInferenceAddon\(profile\)/.test(source),
+            'teardown must call _deleteInferenceAddon when it owns the inference-operator stack'
+        );
+        // It must actually issue aws eks delete-addon for the inference addon.
+        const start = source.indexOf('_deleteInferenceAddon(profile) {');
+        const body = source.slice(start, start + 1600);
+        assert.ok(
+            body.includes('eks delete-addon') && body.includes('amazon-sagemaker-hyperpod-inference'),
+            '_deleteInferenceAddon must run aws eks delete-addon for amazon-sagemaker-hyperpod-inference'
+        );
+    });
+});
+
+// BL143 live-rehearsal finding: the hyperpod-eks deploy driver must fail fast if the
+// cluster is not inference-enabled, instead of a 15-min generic timeout.
+describe('hyperpod-eks deploy driver — cluster-inference precondition', () => {
+    const DRIVER = resolve(BOOTSTRAP, '../../templates/do/deploy.d/hyperpod-eks');
+    const source = readFileSync(DRIVER, 'utf8');
+
+    it('probes InferenceConfig and fails fast before the reconcile wait', () => {
+        assert.ok(source.includes('InferenceConfig'), 'driver must probe InferenceConfig');
+        assert.ok(
+            source.includes('is not inference-enabled'),
+            'driver must emit the inference-not-enabled fast-fail message'
+        );
+        // The probe must appear before the reconcile wait loop (fail fast, not after timeout).
+        const probeIdx = source.indexOf('is not inference-enabled');
+        const waitIdx = source.indexOf('Waiting for InferenceEndpointConfig to reconcile');
+        assert.ok(probeIdx > -1 && waitIdx > -1 && probeIdx < waitIdx,
+            'the InferenceConfig fast-fail must come before the reconcile wait');
+    });
 });

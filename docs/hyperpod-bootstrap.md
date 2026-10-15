@@ -130,7 +130,11 @@ far cheaper than keeping a GPU instance running to host control-plane pods.
 
 ### Stack 3: Inference Operator (`MlccInferenceOperatorStack`)
 
-- **TLS S3 Bucket**: `hyperpod-tls-<profile>-<region>` (RETAIN)
+- **TLS S3 Bucket**: `mlcc-hyperpod-tls-<profile>` (RETAIN). Note the name does NOT
+  start with `hyperpod-tls`, so `AmazonSageMakerHyperPodInferenceAccess` (whose S3 grant
+  only covers `hyperpod-tls*` buckets) does not cover it — the inference role gets an
+  explicit `HyperPodInferenceTlsBucketAccess` statement for this bucket (see
+  [Bootstrap IAM Roles](dev/bootstrap-iam-roles.md)).
 - **Inference Operator EKS Add-on**: `amazon-sagemaker-hyperpod-inference`
 
 #### Post-Install Patches

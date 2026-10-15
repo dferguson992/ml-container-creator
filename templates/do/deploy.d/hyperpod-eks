@@ -244,6 +244,40 @@ if ! kubectl create namespace "${HP_NAMESPACE}" --dry-run=client -o yaml | kubec
     echo "⚠️  Warning: Could not create/verify namespace"
 fi
 
+# ── Precondition: cluster inference capability MUST be enabled ────────────────
+# The operator only creates the SageMaker AI endpoint (CreateModel →
+# CreateEndpointConfig → CreateEndpoint) once the HyperPod cluster is
+# inference-enabled (describe-cluster → InferenceConfig != null). If it is null,
+# the serving pods + ALB still come up, but the SageMakerEndpointRegistration
+# controller polls DescribeEndpoint forever and the deploy hangs the full timeout
+# with a misleading generic failure. Fail fast with the real cause instead.
+# (BL143 live-rehearsal finding — enablement is done at bootstrap time by the
+# inference add-on controller's EnableClusterInference, which can take 15+ min.)
+_profile_arg_ic=""
+[ -n "${_PROFILE_awsProfile:-${AWS_PROFILE:-}}" ] && _profile_arg_ic="--profile ${_PROFILE_awsProfile:-${AWS_PROFILE}}"
+_INFERENCE_CONFIG=$(aws sagemaker describe-cluster \
+    --cluster-name "${HP_CLUSTER_NAME}" \
+    --region "${AWS_REGION}" \
+    ${_profile_arg_ic} \
+    --query "InferenceConfig" --output text 2>/dev/null || echo "None")
+if [ -z "${_INFERENCE_CONFIG}" ] || [ "${_INFERENCE_CONFIG}" = "None" ]; then
+    echo "❌ HyperPod cluster '${HP_CLUSTER_NAME}' is not inference-enabled (InferenceConfig: null)."
+    echo ""
+    echo "   The model's pods and load balancer would come up, but the SageMaker AI"
+    echo "   endpoint would NEVER be created — the inference operator polls for it"
+    echo "   forever and the deploy hangs."
+    echo ""
+    echo "   Cluster inference enablement happens at bootstrap time (the inference"
+    echo "   add-on controller's EnableClusterInference, which can take 15+ minutes)."
+    echo "   Re-run bootstrap to complete it, then redeploy:"
+    echo "     ml-container-creator bootstrap add-module hyperpod"
+    echo "   Verify enablement:"
+    echo "     aws sagemaker describe-cluster --cluster-name ${HP_CLUSTER_NAME} --region ${AWS_REGION} --query InferenceConfig"
+    _update_config "DEPLOYMENT_TARGET_HP_STATUS" "Failed"
+    exit 4
+fi
+echo "✅ Cluster inference capability is enabled"
+
 # Apply the InferenceEndpointConfig custom resource
 echo "📄 Rendering InferenceEndpointConfig from hyperpod/..."
 
