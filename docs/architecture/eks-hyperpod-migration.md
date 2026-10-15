@@ -274,3 +274,82 @@ trust principals + managed policies live in one `ADOPTED_SERVICE_ROLES` table, a
 drift test (`hyperpod-cdk-stacks.test.js`) asserts each entry mirrors the stack's
 `_createOrAdoptRole(...)` call, so a stack change that isn't reflected in the runner
 fails loudly. See [Bootstrap IAM Roles](../dev/bootstrap-iam-roles.md).
+---
+## 📌 RESUME PIN — BL143 Wave 2 rehearsal (paused on GPU capacity)
+
+> Parked mid-rehearsal while chasing GPU capacity (and possibly Wave 3 in the meantime).
+> The live cluster is on a **hand-patched hotfix**, not a durable state. Pick up here.
+
+### Where the live cluster is right now
+- HyperPod cluster ARN: `arn:aws:sagemaker:us-west-2:258927109213:cluster/8ddoe8yjwb85`
+  (cluster name `mlcc-mlcc-demo-us-west-2-hyperpod`), EKS `mlcc-mlcc-demo-us-west-2-eks`,
+  account `258927109213`, region `us-west-2`.
+- The inference operator was **manually installed from the HyperPod/SageMaker console**
+  (NOT via MLCC). It came up broken: the console install left `HYPERPOD_CLUSTER_ARN`
+  **empty**, the node-label fallback didn't resolve (`cluster name label not found`), and
+  the `manager` container crash-looped (exit 1, ~110 restarts).
+- **Hotfix applied** to get it healthy: `kubectl set env deployment/hyperpod-inference-controller-manager
+  -n hyperpod-inference-system HYPERPOD_CLUSTER_ARN=<the 8ddoe8yjwb85 ARN>`, then scaled the
+  old ReplicaSet (`5d4f648fbb`) to 0 so it stopped respawning crash pods. Operator pod is
+  now green. **The console's EKS add-on record still shows `CREATE_FAILED`** — that is a
+  latched provisioning-time verdict, not current pod health; it will NOT self-clear.
+- ⚠️ This hotfix is NOT durable: if the console add-on reconciles / its Helm/CFN re-applies,
+  `HYPERPOD_CLUSTER_ARN` reverts to empty and it crash-loops again.
+- Console install details observed (random-named, i.e. control-plane-generated, NOT MLCC):
+  role `SageMakerHyperPodInference-c8d2c2b0`, TLS bucket `hyperpod-tls-0e395cc8-ac7408e0`,
+  gated-download role `inf-0e395cc8-gate-c8d2c2b0`, operator image `v3.7.0` / chart `3.2.0`,
+  `describe-addon` showed `createdBy: null, role: null` (= Helm/CFN-style, not a managed add-on).
+- kubectl access gotcha: this shell authenticates as `assumed-role/Admin/frgud-Isengard`,
+  but the cluster access-entries list `role/mlcc-admin` and NOT `role/Admin`. Either add an
+  access entry for `role/Admin` (+ `AmazonEKSClusterAdminPolicy`, scope=cluster) or switch
+  the shell to the `mlcc-admin` profile before `update-kubeconfig`.
+
+### Next steps, in strict order (do NOT reorder — step 1 is irreplaceable)
+1. **GPU capacity → deploy model → capture the signal observation.** Re-attach the GPU
+   group if needed (recreate playbook step 4, full instance-group set). Then
+   `kubectl delete inferenceendpointconfig qwen3-4b-test -n default --ignore-not-found`
+   → `./do/submit` → `./do/deploy --target hyperpod-eks --instance-type ml.g5.16xlarge`.
+   **Watch:** does `aws sagemaker list-endpoints` create a qwen3 endpoint WHILE
+   `aws sagemaker describe-cluster … --query InferenceConfig` stays `null`?
+   - Endpoint created despite `InferenceConfig: null` → `InferenceConfig` is the WRONG
+     signal; fix `_ensureHyperPodClusterInferenceEnabled` (module-runner.cjs) AND the
+     `deploy.d/hyperpod-eks` precondition probe to gate on operator watcher-status /
+     `SageMakerEndpointRegistration` state instead; update the related tests + finding.
+   - No endpoint → `InferenceConfig: null` is a real blocker; keep the current gate, just
+     bump the 15-min verifier timeout (recreate-after-teardown watcher drain exceeds 15 min).
+   - **UPDATE (owner decision):** the `deploy.d/hyperpod-eks` precondition is now
+     **WARN-not-block** — it probes `InferenceConfig`, warns on null (and distinguishes a
+     failed describe probe as "unknown", not "not enabled"), but no longer `exit 4`s the
+     deploy. So the deploy will now PROCEED past a null `InferenceConfig`, which is what
+     lets this observation happen cleanly. The `module-runner.cjs` verifier was already
+     warn-only. Tests updated (`hyperpod-cdk-stacks.test.js` → "preflight (non-blocking)").
+2. **Contention test / restore durable state (right after step 1, NOT a Wave-4 item).**
+   Delete just the add-on layer and let MLCC reinstall it on the existing healthy cluster:
+   `aws eks delete-addon --cluster-name mlcc-mlcc-demo-us-west-2-eks
+   --addon-name amazon-sagemaker-hyperpod-inference --region us-west-2`, wait for pods to
+   clear from `hyperpod-inference-system`, then re-run MLCC's installer so
+   `_installInferenceAddon` recreates it with the ARN wired from SSM. If it comes up `1/1`
+   on first try → no contention AND MLCC's path is sound. (Only escalate to a full
+   teardown-to-EKS if THIS comes up dirty below the add-on layer — no evidence of that yet.)
+
+### Decisions locked this session (so we don't relitigate)
+- **Keep operator install automated in MLCC — do NOT offload to the console.** Proven: the
+  console path shipped a crash-looping operator (empty ARN) out of the box. MLCC's
+  `_installInferenceAddon` avoids it by passing `hyperpodClusterArn` (from SSM) in the config.
+- **EKS Add-on over Helm.** AWS positions the add-on as the forward path (Operator 3.0+
+  "simplified lifecycle management"; Helm installs are expected to migrate to it). MLCC
+  already uses the add-on path — stay there.
+
+### Wave 4 backlog (structural, future — informed by steps 1–2 above)
+- Move the inference add-on into **CDK ownership (`CfnAddon`)** so teardown/recreate stop
+  needing the imperative `_deleteInferenceAddon` hack and the stale-ARN recreate wedge.
+- **Naming-convention alignment (Q3).** The operator derives the cluster ARN from the
+  cluster *name* and may resolve other resources by convention. MLCC's deterministic
+  `mlcc-`-prefixed names (e.g. TLS bucket `mlcc-hyperpod-tls-${profileName}` at
+  module-runner.cjs ~L950) may diverge from what the operator/SageMaker expect (prefixes
+  like `sagemaker-` / `hyperpod-`). TODO: verify whether a hard bucket-prefix check exists;
+  prefer letting the control-plane name resources it resolves by convention, imposing MLCC
+  names only where we fully own the resource and nothing downstream resolves it by name —
+  in so far as CDK allows.
+- Fold in the operator-IRSA relocation spike + the "recreate operator from SageMaker
+  HyperPod rather than the EKS add-on" question here.

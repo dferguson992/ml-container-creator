@@ -652,21 +652,41 @@ describe('Module runner reconciles ALL adopted service roles (adopt-drift)', () 
 });
 
 // BL143 live-rehearsal finding: the hyperpod-eks deploy driver must fail fast if the
-// cluster is not inference-enabled, instead of a 15-min generic timeout.
-describe('hyperpod-eks deploy driver — cluster-inference precondition', () => {
+// cluster inference capability as a NON-BLOCKING health check (BL143 open Q1).
+// NOTE (owner decision, v2.0.0 planning): this is deliberately WARN-not-block. The
+// InferenceConfig signal is under question — the operator has logged the inference
+// watcher "Enabled" while describe-cluster still returns InferenceConfig: null — so a
+// hard gate here would false-fail a working deploy. The driver must probe and warn,
+// but MUST NOT exit on a null/absent InferenceConfig. (If the parked GPU model-deploy
+// observation confirms InferenceConfig is the wrong signal, re-gate on operator
+// watcher-status / SageMakerEndpointRegistration state and revisit this test.)
+describe('hyperpod-eks deploy driver — cluster-inference preflight (non-blocking)', () => {
     const DRIVER = resolve(BOOTSTRAP, '../../templates/do/deploy.d/hyperpod-eks');
     const source = readFileSync(DRIVER, 'utf8');
 
-    it('probes InferenceConfig and fails fast before the reconcile wait', () => {
+    it('probes InferenceConfig as a health signal', () => {
         assert.ok(source.includes('InferenceConfig'), 'driver must probe InferenceConfig');
         assert.ok(
-            source.includes('is not inference-enabled'),
-            'driver must emit the inference-not-enabled fast-fail message'
+            source.includes('describe-cluster'),
+            'driver must probe via sagemaker describe-cluster'
         );
-        // The probe must appear before the reconcile wait loop (fail fast, not after timeout).
-        const probeIdx = source.indexOf('is not inference-enabled');
-        const waitIdx = source.indexOf('Waiting for InferenceEndpointConfig to reconcile');
-        assert.ok(probeIdx > -1 && waitIdx > -1 && probeIdx < waitIdx,
-            'the InferenceConfig fast-fail must come before the reconcile wait');
+    });
+
+    it('warns but does NOT block the deploy on a null/absent InferenceConfig', () => {
+        // Isolate the preflight block (between its header and the next step: rendering
+        // the InferenceEndpointConfig). The block must warn, not exit.
+        const start = source.indexOf('Preflight: cluster inference capability');
+        assert.ok(start > -1, 'preflight block must be present');
+        const end = source.indexOf('InferenceEndpointConfig custom resource', start);
+        const block = source.slice(start, end > -1 ? end : start + 2500);
+        assert.ok(/InferenceConfig: null/.test(block),
+            'preflight must call out the InferenceConfig: null case');
+        assert.ok(!/exit\s+\d/.test(block),
+            'preflight must NOT exit on the inference-capability check (warn, not block)');
+        assert.ok(!/_update_config "DEPLOYMENT_TARGET_HP_STATUS" "Failed"/.test(block),
+            'preflight must NOT mark the deploy Failed on the inference-capability check');
+        // A failed describe probe must be treated as "unknown", not "not enabled".
+        assert.ok(/probe failed|_IC_PROBE_RC/.test(block),
+            'a failed describe-cluster probe must be distinguished from a genuine null');
     });
 });
