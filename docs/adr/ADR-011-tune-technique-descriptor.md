@@ -122,11 +122,13 @@ shape is not fabricated), so it is format-checked only.
   construction; the wrong RL dataset guess is gone; MTRL ships configurable + discoverable
   without being runnable; `artifact_kind` is declared for the later three-way deploy split
   (BL136/BL137/BL149) without being prematurely propagated.
-- **Reusability:** the config-builder BL128 writes against the descriptor's
-  `$defs/hyperparameter` entry shape is being factored descriptor-source-agnostic so the
-  user-authored `do/train` plugin UX (BL154) reuses it rather than forking — ADR-008's
+- **Reusability (shipped):** the `do/tune` config builder reads the descriptor's
+  `$defs/hyperparameter` entry shape through a descriptor-source-AGNOSTIC core
+  (`tune_config_builder.build_config`) with a thin `tune.d` adapter, so the user-authored
+  `do/train` plugin UX (BL154) can reuse the same core rather than forking — ADR-008's
   one-derivation-many-consumers applied one level up, with a user-authored (untrusted,
-  runtime-validated) descriptor source.
+  runtime-validated) descriptor source. See the Config UX section in
+  `docs/architecture/tune-descriptor.md`.
 - **Cost:** a new descriptor format + schema + validator + two readers + the sync extension
   + the Producer/Gate; a new dev dependency (`@aws-sdk/client-s3`) for the override-params
   fetch (maintainer-side only, in `devDependencies`).

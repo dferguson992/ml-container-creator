@@ -918,16 +918,34 @@ ML Container Creator offers two paths for model customization:
 |---|---|---|---|
 | `--training-type` | `lora`, `full-rank` | `lora` | Whether to produce LoRA adapter weights or a full merged model |
 
-### Hyperparameter overrides (all optional)
+### Hyperparameters — technique-aware
+
+`do/tune`'s hyperparameters are **technique-aware**: the knobs you can set, their defaults,
+ranges, and choice-lists come from the selected technique's tune descriptor
+(`templates/code/tune.d/<technique>/manifest.json`, synced from SageMaker's recipe
+override-params — see [Per-technique tune descriptor](architecture/tune-descriptor.md)).
+Run `do/tune` interactively and it prompts for the technique's `primary` knobs (pre-filled
+with their defaults, dropdowns for enum knobs); pass `--advanced` to also be prompted for the
+`advanced` knobs.
 
 | Flag | Type | Description |
 |---|---|---|
-| `--epochs` | integer | Number of training epochs (typically 1–5) |
-| `--learning-rate` | float | Learning rate (e.g., `2e-4`) |
-| `--max-seq-length` | integer | Maximum sequence length in tokens |
-| `--lora-rank` | integer | LoRA rank (e.g., 16, 32, 64). Only applies when `--training-type lora` |
-| `--lora-alpha` | integer | LoRA alpha scaling factor. Only applies when `--training-type lora` |
-| `--batch-size` | integer | Global batch size |
+| `--set KNOB=VALUE` | repeatable | Set any knob the selected technique's descriptor declares, keyed by its canonical name (e.g. `--set learning_rate=1e-5 --set global_batch_size=256`). A knob the technique does not declare is rejected, naming the valid set. Values are validated against the descriptor (range / enum / type) in sub-second preflight — before the job is submitted. |
+| `--advanced` | flag | Also prompt for `advanced`-tier knobs interactively (otherwise they take their descriptor default). |
+| `--non-interactive` | flag | Apply descriptor defaults without prompting (same validation). Also the automatic behavior when there is no TTY. |
+
+**Legacy flags (kept as aliases):** the previous fixed flags still work and map onto the same
+descriptor knobs, so existing scripts keep running:
+
+| Legacy flag | Equivalent `--set` | 
+|---|---|
+| `--epochs <n>` | `--set max_epochs=<n>` |
+| `--learning-rate <f>` | `--set learning_rate=<f>` |
+| `--max-seq-length <n>` | `--set dataset_max_len=<n>` |
+| `--lora-rank <n>` | `--set lora_rank=<n>` |
+| `--batch-size <n>` | `--set global_batch_size=<n>` |
+
+Each alias is validated against the selected technique's descriptor exactly like a `--set`.
 
 ### Dataset options
 

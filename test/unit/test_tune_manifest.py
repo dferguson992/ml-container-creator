@@ -101,3 +101,53 @@ def test_dataset_contract_propagates_not_found():
     # ManifestNotFound (the Gate/producer translate it into a clear error).
     with pytest.raises(tune_manifest.ManifestNotFound):
         tune_manifest.dataset_contract("nope")
+
+
+# -- read_hyperparameters (BL128 accessor on the BL129 reader) -----------------
+
+def test_read_hyperparameters_empty_presync_for_committed_descriptors():
+    # The committed descriptors ship hyperparameters:{} (populated by sync-model-families).
+    # The accessor returns a dict (never raises for a known technique), empty pre-sync.
+    hp = tune_manifest.read_hyperparameters("rlaif", "lora")
+    assert isinstance(hp, dict)
+
+
+def test_read_hyperparameters_missing_technique_raises_not_found():
+    with pytest.raises(tune_manifest.ManifestNotFound):
+        tune_manifest.read_hyperparameters("nope")
+
+
+def test_read_hyperparameters_reads_a_populated_block(tmp_path):
+    # Point the reader at a temp tune.d with a populated hyperparameters block to prove
+    # the accessor returns the synced knobs (the committed descriptors are pre-sync).
+    import json
+    tdir = tmp_path / "tune.d" / "rlvr"
+    tdir.mkdir(parents=True)
+    (tmp_path / "tune.d" / "rlvr" / "manifest.json").write_text(json.dumps({
+        "technique": "rlvr",
+        "reward_source": "rule",
+        "variants": {
+            "lora": {
+                "peft": "lora", "artifact_kind": "lora_adapter",
+                "dataset_contract": {"format": "parquet", "schema": "verl-5field",
+                                     "prompt_shape": "message-list",
+                                     "reward_model_style": "rule", "verified": True},
+                "hyperparameters": {
+                    "learning_rate": {"type": "number", "required": False, "default": 1e-5,
+                                      "min": 0, "max": 1, "control": "number_input", "tier": "primary"},
+                    "global_batch_size": {"type": "integer", "required": False, "default": 256,
+                                          "enum": [128, 256], "control": "dropdown", "tier": "primary"},
+                },
+                "_synced": {"smtj": {"from": "s3://b/x_v1.0.0.json", "version": "1.0.0"}},
+            }
+        }
+    }))
+    hp = tune_manifest.read_hyperparameters("rlvr", "lora", tune_dir=str(tmp_path / "tune.d"))
+    assert set(hp.keys()) == {"learning_rate", "global_batch_size"}
+    assert hp["global_batch_size"]["enum"] == [128, 256]
+
+
+def test_read_hyperparameters_lora_only_default_variant(tmp_path):
+    # mtrl ships lora-only; omitting the variant resolves to it (empty pre-sync is fine).
+    hp = tune_manifest.read_hyperparameters("mtrl")
+    assert isinstance(hp, dict)

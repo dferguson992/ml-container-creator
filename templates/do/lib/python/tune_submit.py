@@ -109,8 +109,13 @@ def cmd_submit(args):
     if not training_type:
         _error_exit(f"Unsupported training type: {args.training_type}")
 
-    # Build hyperparameters dict from optional overrides
-    # Map CLI flag names to SDK v3 fine-tuning option names
+    # Build hyperparameters dict.
+    # BL128: do/tune now resolves the technique's knobs via the config builder and passes
+    # them as a single --hyperparameters JSON blob, keyed by the canonical override-param
+    # names (which ARE the SDK fine-tuning option names). The legacy named flags below are
+    # kept as a FALLBACK for direct `tune_submit` calls (and map onto the same canonical
+    # names); the blob overlays them so a do/tune invocation (which sends the blob) is
+    # authoritative. The old hand-maintained 6-entry map is subsumed by the blob merge.
     hyperparameters = {}
     if args.epochs is not None:
         hyperparameters["max_epochs"] = args.epochs
@@ -124,6 +129,17 @@ def cmd_submit(args):
         hyperparameters["lora_alpha"] = args.lora_alpha
     if args.batch_size is not None:
         hyperparameters["global_batch_size"] = args.batch_size
+    # Overlay the builder's resolved knobs (BL128). Canonical names match by construction,
+    # so this is a straight merge — no translation table.
+    blob = getattr(args, "hyperparameters", None)
+    if blob:
+        import json as _json
+        try:
+            resolved = _json.loads(blob)
+        except (ValueError, TypeError):
+            _error_exit("--hyperparameters must be valid JSON")
+        if isinstance(resolved, dict):
+            hyperparameters.update(resolved)
 
     # Build trainer kwargs — API differs between SDK v2 and v3
     output_path = f"s3://{args.output_bucket}/{args.project_name}/tune/{technique}/"

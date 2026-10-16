@@ -164,6 +164,17 @@ def dataset_contract(technique: str, variant: str | None = None,
     return dc if isinstance(dc, dict) else {}
 
 
+def read_hyperparameters(technique: str, variant: str | None = None,
+                         tune_dir: str | None = None) -> dict:
+    """Return the SYNCED `hyperparameters` map for a technique+variant, or {} when
+    absent (e.g. a pre-sync descriptor). BL128: the config-builder reads this to render
+    the technique's knobs. Mirrors `dataset_contract`'s variant resolution.
+    """
+    v = _resolve_variant(read_manifest(technique, tune_dir), variant)
+    hp = v.get("hyperparameters")
+    return hp if isinstance(hp, dict) else {}
+
+
 def required_dataset_fields(technique: str, variant: str | None = None,
                             tune_dir: str | None = None) -> list[str]:
     """Return the row fields the dataset MUST carry for this technique's schema.

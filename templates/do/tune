@@ -37,12 +37,15 @@ ARG_TECHNIQUE=""
 ARG_DATASET=""
 ARG_TRAINING_TYPE="lora"
 ARG_MODEL=""
-ARG_EPOCHS=""
-ARG_LEARNING_RATE=""
-ARG_MAX_SEQ_LENGTH=""
-ARG_LORA_RANK=""
-ARG_LORA_ALPHA=""
-ARG_BATCH_SIZE=""
+# BL128: technique-aware hyperparameter knobs are collected into SET_KNOBS as plain
+# "KNOB=VALUE" strings (an INDEXED array — NOT `declare -A`, which needs bash 4+; do/tune
+# must run under macOS's default bash 3.2). Both --set KNOB=VALUE and the five legacy flags
+# (--epochs/--learning-rate/--max-seq-length/--lora-rank/--batch-size) append to it, keyed
+# by the descriptor's canonical knob name; the config builder resolves + validates the pairs
+# against the selected technique's tune descriptor.
+SET_KNOBS=()
+ARG_ADVANCED=false
+ARG_NON_INTERACTIVE=false
 ARG_REWARD_FUNCTION=""
 ARG_REWARD_PROMPT=""
 ARG_OUTPUT_BUCKET=""
@@ -96,42 +99,56 @@ _parse_args() {
                     exit 1
                 fi
                 ARG_MODEL="$2"; shift 2 ;;
+            # BL128: generic per-knob setter. --set KNOB=VALUE (repeatable), keyed by the
+            # descriptor's canonical knob name. The config builder validates each against
+            # the selected technique's descriptor (an unknown knob is rejected there).
+            --set)
+                if [ -z "${2:-}" ] || [[ "$2" != *=* ]]; then
+                    echo "❌ --set requires KNOB=VALUE (e.g., --set learning_rate=1e-5)"
+                    exit 1
+                fi
+                SET_KNOBS+=("$2"); shift 2 ;;
+            --advanced) ARG_ADVANCED=true; shift ;;
+            --non-interactive) ARG_NON_INTERACTIVE=true; shift ;;
+            # BL128: the five legacy hyperparameter flags are KEPT as aliases that populate
+            # the SAME SET_KNOBS map under the descriptor's canonical knob name, so existing
+            # scripts/docs keep working and get the same technique-aware validation.
             --epochs)
                 if [ -z "${2:-}" ]; then
                     echo "❌ --epochs requires an integer value"
                     exit 1
                 fi
-                ARG_EPOCHS="$2"; shift 2 ;;
+                SET_KNOBS+=("max_epochs=$2"); shift 2 ;;
             --learning-rate)
                 if [ -z "${2:-}" ]; then
                     echo "❌ --learning-rate requires a float value"
                     exit 1
                 fi
-                ARG_LEARNING_RATE="$2"; shift 2 ;;
+                SET_KNOBS+=("learning_rate=$2"); shift 2 ;;
             --max-seq-length)
                 if [ -z "${2:-}" ]; then
                     echo "❌ --max-seq-length requires an integer value"
                     exit 1
                 fi
-                ARG_MAX_SEQ_LENGTH="$2"; shift 2 ;;
+                SET_KNOBS+=("dataset_max_len=$2"); shift 2 ;;
             --lora-rank)
                 if [ -z "${2:-}" ]; then
                     echo "❌ --lora-rank requires an integer value"
                     exit 1
                 fi
-                ARG_LORA_RANK="$2"; shift 2 ;;
+                SET_KNOBS+=("lora_rank=$2"); shift 2 ;;
             --lora-alpha)
                 if [ -z "${2:-}" ]; then
                     echo "❌ --lora-alpha requires an integer value"
                     exit 1
                 fi
-                ARG_LORA_ALPHA="$2"; shift 2 ;;
+                SET_KNOBS+=("lora_alpha=$2"); shift 2 ;;
             --batch-size)
                 if [ -z "${2:-}" ]; then
                     echo "❌ --batch-size requires an integer value"
                     exit 1
                 fi
-                ARG_BATCH_SIZE="$2"; shift 2 ;;
+                SET_KNOBS+=("global_batch_size=$2"); shift 2 ;;
             --reward-function)
                 if [ -z "${2:-}" ]; then
                     echo "❌ --reward-function requires a Lambda ARN"
@@ -1382,6 +1399,57 @@ _preflight_rft_inputs() {
     return 0
 }
 
+# ── _resolve_hyperparameters() (BL128) ────────────────────────────────────────
+# Resolve the technique-aware knob values via the config builder: descriptor defaults
+# overlaid with the SET_KNOBS map (--set + legacy-flag aliases), validated against the
+# selected technique's tune descriptor. Prints the resolved {knob: value} JSON on
+# success; on any validation error prints the errors and returns 1 (caller exits).
+# Interactive unless --non-interactive / no TTY (the builder prompts primary knobs, and
+# advanced knobs when --advanced).
+_resolve_hyperparameters() {
+    # Build the --supplied JSON object from SET_KNOBS ("KNOB=VALUE" strings → JSON). Each
+    # pair is a positional arg to python (robust to values containing '='/spaces); a later
+    # pair for the same knob wins (last --set / flag). Guard the empty-array case under
+    # `set -u` with "${SET_KNOBS[@]+"${SET_KNOBS[@]}"}".
+    local supplied_json
+    supplied_json=$(python3 -c "
+import json, sys
+vals = {}
+for pair in sys.argv[1:]:
+    if '=' in pair:
+        k, v = pair.split('=', 1)
+        vals[k] = v
+print(json.dumps(vals))
+" ${SET_KNOBS[@]+"${SET_KNOBS[@]}"} 2>/dev/null) || supplied_json="{}"
+
+    local bc_args=(
+        --technique "${ARG_TECHNIQUE}"
+        --variant "${ARG_TRAINING_TYPE:-lora}"
+        --supplied "${supplied_json}"
+    )
+    [ "${ARG_ADVANCED}" = true ] && bc_args+=(--advanced)
+    [ "${ARG_NON_INTERACTIVE}" = true ] && bc_args+=(--non-interactive)
+
+    local bc_result
+    bc_result=$(python3 "${HELPER_SCRIPT}" build-config "${bc_args[@]}" 2>/dev/null) || {
+        echo "❌ Failed to resolve hyperparameters for ${ARG_TECHNIQUE}." >&2
+        return 1
+    }
+
+    # Surface validation errors (fail-fast).
+    local errors
+    errors=$(echo "${bc_result}" | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin).get('errors',[])))" 2>/dev/null) || errors=""
+    if [ -n "${errors}" ]; then
+        echo "❌ Hyperparameter validation failed for ${ARG_TECHNIQUE}:" >&2
+        echo "${errors}" | sed 's/^/   • /' >&2
+        return 1
+    fi
+
+    # Echo the resolved {knob: value} JSON for the caller to pass to submit.
+    echo "${bc_result}" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin).get('resolved',{})))" 2>/dev/null || echo "{}"
+    return 0
+}
+
 # Sets JOB_NAME on success.
 _submit_job() {
     # Req 3A two-input pre-flight: RFT techniques need BOTH dataset + evaluator.
@@ -1488,24 +1556,16 @@ print(entry.get('provider', ''))
     # Add model package group
     submit_args+=(--model-package-group "${PROJECT_NAME}-tune-models")
 
-    # Add optional hyperparameters
-    if [ -n "${ARG_EPOCHS}" ]; then
-        submit_args+=(--epochs "${ARG_EPOCHS}")
-    fi
-    if [ -n "${ARG_LEARNING_RATE}" ]; then
-        submit_args+=(--learning-rate "${ARG_LEARNING_RATE}")
-    fi
-    if [ -n "${ARG_MAX_SEQ_LENGTH}" ]; then
-        submit_args+=(--max-seq-length "${ARG_MAX_SEQ_LENGTH}")
-    fi
-    if [ -n "${ARG_LORA_RANK}" ]; then
-        submit_args+=(--lora-rank "${ARG_LORA_RANK}")
-    fi
-    if [ -n "${ARG_LORA_ALPHA}" ]; then
-        submit_args+=(--lora-alpha "${ARG_LORA_ALPHA}")
-    fi
-    if [ -n "${ARG_BATCH_SIZE}" ]; then
-        submit_args+=(--batch-size "${ARG_BATCH_SIZE}")
+    # BL128: resolve the technique-aware hyperparameter knobs from the tune descriptor
+    # (defaults + --set/legacy-flag overrides), validating each against the selected
+    # technique's descriptor BEFORE submission. The resolved {knob: value} map is passed
+    # to submit as a single --hyperparameters JSON blob (tune_submit merges it — the old
+    # per-flag map is gone). An unknown knob, an out-of-range value, or a required knob
+    # with no value fails fast HERE, not deep in the job.
+    local resolved_hp
+    resolved_hp=$(_resolve_hyperparameters) || exit 1
+    if [ -n "${resolved_hp}" ] && [ "${resolved_hp}" != "{}" ]; then
+        submit_args+=(--hyperparameters "${resolved_hp}")
     fi
     if [ -n "${ARG_REWARD_FUNCTION}" ]; then
         submit_args+=(--reward-function "${ARG_REWARD_FUNCTION}")
@@ -1914,23 +1974,15 @@ _dry_run() {
     echo "   Role:          ${role_arn}"
     echo "   Package group: ${PROJECT_NAME}-tune-models"
 
-    if [ -n "${ARG_EPOCHS}" ]; then
-        echo "   Epochs:        ${ARG_EPOCHS}"
-    fi
-    if [ -n "${ARG_LEARNING_RATE}" ]; then
-        echo "   Learning rate: ${ARG_LEARNING_RATE}"
-    fi
-    if [ -n "${ARG_MAX_SEQ_LENGTH}" ]; then
-        echo "   Max seq len:   ${ARG_MAX_SEQ_LENGTH}"
-    fi
-    if [ -n "${ARG_LORA_RANK}" ]; then
-        echo "   LoRA rank:     ${ARG_LORA_RANK}"
-    fi
-    if [ -n "${ARG_LORA_ALPHA}" ]; then
-        echo "   LoRA alpha:    ${ARG_LORA_ALPHA}"
-    fi
-    if [ -n "${ARG_BATCH_SIZE}" ]; then
-        echo "   Batch size:    ${ARG_BATCH_SIZE}"
+    # BL128: show the technique-aware knobs the user set (--set / legacy aliases), keyed
+    # by the descriptor's canonical knob name. Defaults the builder fills in are NOT shown
+    # here (they are the descriptor's, not user-supplied); the builder validates them.
+    if [ "${#SET_KNOBS[@]}" -gt 0 ]; then
+        echo "   Hyperparameters (overrides):"
+        local _pair
+        for _pair in ${SET_KNOBS[@]+"${SET_KNOBS[@]}"}; do
+            echo "      ${_pair%%=*} = ${_pair#*=}"
+        done
     fi
     if [ -n "${ARG_REWARD_FUNCTION}" ]; then
         echo "   Reward fn:     ${ARG_REWARD_FUNCTION}"

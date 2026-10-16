@@ -70,7 +70,7 @@ const RECIPES = [
     { technique: 'mtrl', peft: 'lora', smtjOverrideParamsS3Uri: 's3://b/mtrl-gpt-oss-20b-lora_override_params_sm_jobs_v1.0.22.json', hpEksOverrideParamsS3Uri: null }
 ];
 
-describe('sync-tune-descriptors (BL129)', () => {
+describe('sync-tune-descriptors (tune-descriptor synced layer)', () => {
     let tmp;
 
     beforeEach(() => {

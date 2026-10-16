@@ -143,6 +143,48 @@ is deferred (BL139).
 
 Both read the same `tune.d/` files; neither branches on the technique name.
 
+## Config UX — technique-aware `do/tune` (BL128)
+
+`do/tune`'s hyperparameter surface is driven by the descriptor's synced `hyperparameters`
+block: the user is offered exactly the selected technique's knobs — with their defaults,
+ranges, choice-lists, input widgets, and progressive-disclosure tiers — instead of a fixed
+flag set. Shipped in BL128 (`.kiro/specs/v2-w3-02-bl128`).
+
+**Descriptor-source-agnostic core.** `templates/do/lib/python/tune_config_builder.py` has a
+core `build_config(hyperparameters, supplied, *, interactive, include_advanced, prompter)`
+that takes a `hyperparameters` map + supplied values and returns `{resolved, errors}`. It
+knows nothing about `tune.d/`, technique names, `_synced`, or `reward_source` — only the
+shared `$defs/hyperparameter` entry shape. A thin `build_from_tune_descriptor` adapter (same
+module) is the ONLY `tune.d`-aware entry; it reads `tune_manifest.read_hyperparameters` and
+calls the core. This is deliberate: the user-authored `do/train` plugin UX (BL154) supplies
+its own descriptor source (with its own runtime validation / trust boundary) and reuses the
+same core instead of forking it.
+
+**What the core does** (each a BL128 requirement): derives an effective `control`/`tier` for a
+knob that omits them (MTRL's leaner schema — `enum`→dropdown, numeric→number_input, else
+text_input; default tier `primary`); progressive disclosure (prompt `primary` always,
+`advanced` only on opt-in, never `tertiary`); validates every value against
+`type`/`min`/`max`/`step`/`enum`/`required`; and resolves precedence
+`descriptor default < config file < interactive answer / flag` (user value wins).
+
+**Surfaces** (all three derive from the descriptor — a drift test asserts they agree):
+
+- **Interactive** — `do/tune` prompts via `questionary` (modeled on `deploy_prompts.py`):
+  `dropdown`→`questionary.select` over the `enum`, numeric/text→`questionary.text` pre-filled
+  with the default. Wired in the `.tune_helper.py build-config` subcommand.
+- **Flags** — `--set KNOB=VALUE` (repeatable), keyed by the descriptor's canonical knob name;
+  a knob the technique does not declare is rejected naming the valid set. The five legacy
+  flags (`--epochs`/`--learning-rate`/`--max-seq-length`/`--lora-rank`/`--batch-size`) remain
+  as validated aliases onto the same map. `--advanced` opts into the advanced tier;
+  `--non-interactive` (or no TTY) applies defaults with the same validation.
+- **Submission** — the resolved `{knob: value}` map flows to `.tune_helper.py submit` as a
+  single `--hyperparameters <json>` blob that `tune_submit.py` merges into the trainer's
+  hyperparameters (the canonical knob names match the SDK option names by construction, so no
+  translation table — the old hand-maintained per-flag map was removed).
+
+All validation happens in sub-second preflight (unknown knob, out-of-range value, required
+knob with no value) — before the SageMaker job is submitted.
+
 ## Validation
 
 `scripts/validate-tune-manifests.js` (mirrors `validate-serve-manifests.js`) discovers
