@@ -1363,6 +1363,19 @@ export default class BootstrapCommandHandler {
             return;
         }
 
+        // Deprecated modules cannot be freshly provisioned (BL153 — hyperpod cluster
+        // provisioning). Refuse with the deprecation note; allow an explicit --force
+        // escape hatch for the spike to still exercise the code path if needed.
+        const _modCfg = manifest.modules[moduleName];
+        if (_modCfg.deprecated && !options.force) {
+            console.log(`❌ Module "${moduleName}" is DEPRECATED and can no longer be provisioned.`);
+            if (_modCfg.deprecationNote) {
+                console.log(`   ${_modCfg.deprecationNote}`);
+            }
+            console.log('   (If you are intentionally testing the deprecated path, re-run with --force.)');
+            return;
+        }
+
         if (moduleName === 'core') {
             console.log('ℹ️  Core module is always provisioned — nothing to add.');
             return;

@@ -583,20 +583,25 @@ describe('Module runner reconciles ALL adopted service roles (adopt-drift)', () 
     });
 
     // BL143 live-rehearsal finding: the SageMaker endpoint-creation stage is gated on the
-    // HyperPod cluster being inference-enabled (describe-cluster InferenceConfig != null).
-    // The addon being ACTIVE does NOT guarantee EnableClusterInference completed, and the
-    // old 10-min addon poll gave up while that 5-15+ min op was still running — leaving
-    // InferenceConfig: null, so every model deploy hangs (pods + ALB up, endpoint never
-    // created, operator polls DescribeEndpoint forever).
-    it('verifies cluster inference enablement (InferenceConfig) after the addon is ACTIVE', () => {
+    // the HyperPod cluster being inference-enabled. SIGNAL CORRECTED (BL143, 2026-10-15):
+    // the live rehearsal proved `describe-cluster InferenceConfig` stays null even when the
+    // operator's watcher IS Enabled — the two are decoupled, so the verifier now gates on the
+    // OPERATOR'S watcher status (its log line), NOT InferenceConfig. The check is read-only
+    // and non-fatal (a warning, never an exit).
+    it('verifies cluster inference enablement via the operator watcher status (NOT InferenceConfig)', () => {
         assert.ok(
             source.includes('_ensureHyperPodClusterInferenceEnabled'),
             'module-runner must define _ensureHyperPodClusterInferenceEnabled'
         );
         const start = source.indexOf('_ensureHyperPodClusterInferenceEnabled(profile) {');
-        const body = source.slice(start, start + 2500);
-        assert.ok(body.includes('describe-cluster'), 'must poll sagemaker describe-cluster');
-        assert.ok(body.includes('InferenceConfig'), 'must check the InferenceConfig field');
+        const body = source.slice(start, start + 2800);
+        // Must read the OPERATOR watcher status (via kubectl controller logs), not the
+        // decoupled describe-cluster InferenceConfig field.
+        assert.ok(body.includes('hyperpod-inference-controller-manager'),
+            'must read the operator controller-manager (watcher status), not describe-cluster');
+        assert.ok(/watcher/i.test(body), 'must gate on the operator watcher status');
+        assert.ok(!/--query "InferenceConfig"/.test(body),
+            'must NOT gate on describe-cluster InferenceConfig (confirmed decoupled / red herring)');
         // Must run on BOTH the fresh-install path AND the already-ACTIVE early-return path.
         assert.ok(
             (source.match(/this\._ensureHyperPodClusterInferenceEnabled\(profile\)/g) || []).length >= 2,
@@ -648,6 +653,48 @@ describe('Module runner reconciles ALL adopted service roles (adopt-drift)', () 
             body.includes('eks delete-addon') && body.includes('amazon-sagemaker-hyperpod-inference'),
             '_deleteInferenceAddon must run aws eks delete-addon for amazon-sagemaker-hyperpod-inference'
         );
+    });
+});
+
+// BL143 finding #11: the hyperpod-eks deploy driver must NOT gate DEPLOYMENT_TARGET_HP_STATUS
+// =Running on the managed SageMaker endpoint reaching InService. The live rehearsal proved a
+// correctly-serving model (pod healthy, ALB up, /ping 200) does NOT get a SageMaker endpoint
+// created by the operator (an operator/control-plane issue outside MLCC). Gating Running on
+// describe-endpoint InService therefore reported Failed for a working deployment. The endpoint
+// is now an advisory sub-status (HP_SAGEMAKER_ENDPOINT_STATUS), never a gate.
+describe('hyperpod-eks deploy driver — Running decoupled from SageMaker endpoint (finding #11)', () => {
+    const DRIVER = resolve(BOOTSTRAP, '../../templates/do/deploy.d/hyperpod-eks');
+    const source = readFileSync(DRIVER, 'utf8');
+
+    it('does NOT exit/Fail the deploy when the SageMaker endpoint is absent', () => {
+        // Isolate the endpoint-poll block (advisory) through to the Running write.
+        const start = source.indexOf('Poll the SageMaker endpoint');
+        assert.ok(start > -1, 'endpoint-poll block must be present');
+        const end = source.indexOf('DEPLOYMENT_TARGET_HP_STATUS" "Running"', start);
+        assert.ok(end > -1, 'Running write must follow the endpoint poll');
+        const block = source.slice(start, end);
+        // The endpoint poll must NOT exit or mark Failed on a missing/non-InService endpoint.
+        assert.ok(!/_update_config "DEPLOYMENT_TARGET_HP_STATUS" "Failed"/.test(block),
+            'endpoint poll must NOT mark the deploy Failed');
+        assert.ok(!/\bexit 1\b/.test(block),
+            'endpoint poll must NOT exit on a missing/non-InService endpoint (advisory only)');
+        // The endpoint state must be recorded as a SEPARATE sub-status.
+        assert.ok(/HP_SAGEMAKER_ENDPOINT_STATUS/.test(block),
+            'endpoint state must be recorded in HP_SAGEMAKER_ENDPOINT_STATUS (not the deploy status)');
+    });
+
+    it('writes Running after DeploymentComplete regardless of the endpoint', () => {
+        // Gate 1 (CRD DeploymentComplete) is the hard requirement; it exits non-zero before
+        // the Running write if not met. The Running write itself must not be conditional on
+        // the endpoint status.
+        assert.ok(/did not reach DeploymentComplete[\s\S]*?exit 1/.test(source),
+            'gate 1 (CRD DeploymentComplete) must remain a hard requirement');
+        const runIdx = source.indexOf('DEPLOYMENT_TARGET_HP_STATUS" "Running"');
+        const epFailIdx = source.lastIndexOf('SageMaker endpoint', runIdx);
+        // There must be no "exit 1" between the endpoint poll and the Running write.
+        const between = source.slice(epFailIdx, runIdx);
+        assert.ok(!/\bexit 1\b/.test(between),
+            'no fatal exit may sit between the endpoint poll and the Running write');
     });
 });
 

@@ -26,12 +26,21 @@ Bootstrap infrastructure is organized into modules. Only `core` is required; eve
 | `training` | Training data bucket + execution role (+ MLflow, best-effort) | ~$2/mo | No | core |
 | `ci` | CodeBuild + DynamoDB + StepFunctions + EventBridge | ~$15/mo | No | core, benchmark, registry |
 | `sagemaker-domain` | Studio domain + default user profile | ~$10/mo | No | core |
-| `hyperpod-cluster` | HyperPod config intent only (does **not** create a cluster) | ~$0/mo | No | core |
+| `eks` | Standalone EKS cluster (VPC, control plane, OIDC, Fargate, CSI/metrics add-ons, inference IRSA role) | ~$73+/mo | No | core |
+| `hyperpod` | ⚠️ **DEPRECATED** — HyperPod cluster + Inference Operator | ~$1,300/mo | No | eks |
 
 Each module is a standalone CDK stack named `mlcc-<profile>-<module>` (e.g., `mlcc-default-core`). Modules expose their outputs as CloudFormation cross-stack exports (`mlcc-<profile>-<module>-<ExportName>`), which the next module imports as needed.
 
-!!! warning "hyperpod-cluster records intent only"
-    The `hyperpod-cluster` module does **not** create a HyperPod cluster — it stores configuration intent in an SSM parameter and reports `status: not-provisioned`. Creating a real cluster requires a pre-existing EKS cluster, subnets, security groups, and an instance role. Real provisioning is tracked separately (spec `e8-h4-hyperpod-cluster-provisioning`).
+!!! danger "`hyperpod` module is DEPRECATED (v2.0.0)"
+    HyperPod **cluster provisioning** via `bootstrap add-module hyperpod` is deprecated and
+    refuses to run (hidden from the interactive picker). A live rehearsal established that
+    MLCC's cluster-creation path does not enable inference at `CreateCluster` time, so the
+    inference operator never creates a SageMaker endpoint. **Provision a HyperPod cluster via
+    the AWS SageMaker console (Quick Install) or the published CloudFormation templates
+    instead** — the `hyperpod-eks` deploy target then works normally against it. A dedicated
+    spike (BL153) will decide the long-term HP-native provisioning path. See
+    [HyperPod Bootstrap](hyperpod-bootstrap.md) and the
+    [EKS/HyperPod migration findings](architecture/eks-hyperpod-migration.md).
 
 !!! info "Module definitions live in the manifest"
     `infra/bootstrap-modules/module-manifest.json` is the single source of truth for module metadata (display name, cost, dependencies, exports). Adding a module is a matter of adding a manifest entry + a CDK stack.

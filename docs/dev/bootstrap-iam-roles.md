@@ -1,5 +1,13 @@
 # Bootstrap IAM Roles — the adopted-role (CDK import) limitation
 
+!!! note "Scope: the `eks` module (the `hyperpod` module is deprecated)"
+    This page is about the `eks` module's adopted roles, which remain fully supported. The
+    `hyperpod` bootstrap module (HyperPod cluster provisioning) is **deprecated** as of v2.0.0
+    (see [HyperPod Bootstrap](../hyperpod-bootstrap.md)); where this page mentions self-heal
+    during `add-module hyperpod`, that applies to existing/`--force` provisioning only. The
+    adopt-drift mechanics below are unchanged and still apply to the `eks` module and to a
+    `bootstrap update`.
+
 This page documents a CDK limitation that affects the **RETAIN'd (adopted) IAM
 roles** the `eks` bootstrap module provisions, how to recognize it, and the fix
 workflow (reconcile the live role, then land the change in the stack via a PR). It

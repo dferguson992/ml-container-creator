@@ -869,7 +869,7 @@ class CdkMultiStackModuleRunner {
      * where webhook-serving pods haven't scheduled yet. These webhooks will be
      * recreated once the ALB/cert-manager pods are running on Fargate.
      */
-    _clearBlockingWebhooks() {
+    _clearBlockingWebhooks(profile) {
         console.log('    Clearing blocking webhooks...');
         const webhooks = [
             'mutatingwebhookconfiguration/aws-load-balancer-webhook',
@@ -877,10 +877,14 @@ class CdkMultiStackModuleRunner {
             'mutatingwebhookconfiguration/cert-manager-webhook',
             'validatingwebhookconfiguration/cert-manager-webhook',
         ];
+        // kubectl resolves identity from the env, not a flag — pin it to the MLCC
+        // profile so it matches the EKS access entry (BL143 #10). `profile` is optional
+        // for backward-compat; when omitted, inherit the ambient env as before.
+        const env = profile ? this._subprocessEnv(profile) : process.env;
         for (const wh of webhooks) {
             try {
                 execSync(`kubectl delete ${wh} --ignore-not-found`, {
-                    encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+                    encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env,
                 });
             } catch {
                 // kubectl not available or cluster not reachable — best effort
@@ -947,6 +951,11 @@ class CdkMultiStackModuleRunner {
         const hyperpodInferenceRoleArn = getParam('HyperpodInferenceRoleArn') || '';
         const albControllerRoleArn = getParam('AlbControllerRoleArn') || '';
         const kedaOperatorRoleArn = getParam('KedaOperatorRoleArn') || '';
+        // Optional: a dedicated role for JumpStart GATED model downloads. The console
+        // Quick Install sets this; MLCC does not provision one by default. Include it ONLY
+        // if a role ARN is present in SSM — the add-on schema types this as an IAM role ARN
+        // (pattern ^arn:aws:iam::...:role/.+$), so an empty string would FAIL validation.
+        const jumpstartGatedRoleArn = getParam('JumpstartGatedModelDownloadRoleArn') || '';
         const tlsBucketName = `mlcc-hyperpod-tls-${profile.profileName}`;
 
         if (!hyperpodClusterArn) {
@@ -954,26 +963,48 @@ class CdkMultiStackModuleRunner {
             return;
         }
 
-        const configValues = JSON.stringify({
+        // Mirror the SHAPE of the console HyperPod Quick Install's add-on config (BL143
+        // 2026-10-15 finding). The add-on configurationSchema requires only
+        // executionRoleArn + tlsCertificateS3Bucket, but several optional fields DEFAULT in
+        // ways that diverge from the working HP path and left MLCC's operator "pending /
+        // never fully deployed":
+        //   • inferenceGateway.enabled DEFAULTS TO true. MLCC does NOT configure an
+        //     Inference Gateway, so defaulting it ON leaves an enabled-but-unconfigured
+        //     gateway (the inference-gateway-controller) with unmet needs. The HP Quick
+        //     Install explicitly sets {enabled:false}; match it.
+        //   • keda.enabled / alb.enabled / keda IRSA enabled — HP sets these explicitly;
+        //     make them explicit here too rather than relying on nested-only inference.
+        //   • jumpstartGatedModelDownloadRoleArn — included only when provisioned (above).
+        const configObj = {
             executionRoleArn: hyperpodInferenceRoleArn,
             tlsCertificateS3Bucket: tlsBucketName,
             hyperpodClusterArn: hyperpodClusterArn,
+            inferenceGateway: {
+                enabled: false,
+            },
             alb: {
+                enabled: true,
                 serviceAccount: {
                     create: true,
                     roleArn: albControllerRoleArn,
                 },
             },
             keda: {
+                enabled: true,
                 auth: {
                     aws: {
                         irsa: {
+                            enabled: true,
                             roleArn: kedaOperatorRoleArn,
                         },
                     },
                 },
             },
-        });
+        };
+        if (jumpstartGatedRoleArn) {
+            configObj.jumpstartGatedModelDownloadRoleArn = jumpstartGatedRoleArn;
+        }
+        const configValues = JSON.stringify(configObj);
 
         console.log('  📦 Installing inference operator addon...');
         try {
@@ -1054,36 +1085,52 @@ class CdkMultiStackModuleRunner {
      * and read-only — it only observes; it does not mutate the cluster.
      */
     _ensureHyperPodClusterInferenceEnabled(profile) {
-        const awsFlags = profile.awsProfile ? ` --profile ${profile.awsProfile}` : '';
         const clusterName = `mlcc-${profile.profileName}-hyperpod`;
+        const ns = 'hyperpod-inference-system';
+        const env = this._subprocessEnv(profile);
 
-        console.log('  ⏳ Verifying cluster inference capability (EnableClusterInference, up to 15 min)...');
+        // SIGNAL (BL143 — corrected 2026-10-15): gate on the OPERATOR'S OWN watcher
+        // status, NOT `describe-cluster InferenceConfig`. The live rehearsal proved the
+        // two are DECOUPLED: the operator reaches watcher status "Enabled" (its
+        // GetInferenceWatcherStatus API) while `describe-cluster InferenceConfig` stays
+        // null indefinitely — `InferenceConfig` is a red herring and gating on it produced
+        // a false-negative "did not enable" warning on clusters that were in fact enabled.
+        // The operator logs the authoritative outcome; we read that. Read-only, idempotent.
+        console.log('  ⏳ Verifying cluster inference capability (operator watcher status, up to 25 min)...');
         const start = Date.now();
-        const timeout = 900000; // 15 minutes
-        while (Date.now() - start < timeout) {
-            let inferenceConfig = 'None';
+        const timeout = 1500000; // 25 min — a recreate-after-teardown watcher drain can push
+                                 // EnableClusterInference success past 15 min (observed ~17-20 min).
+        const grep = (needle) => {
             try {
-                inferenceConfig = execSync(
-                    `aws sagemaker describe-cluster --cluster-name ${clusterName} --region ${profile.awsRegion}${awsFlags} --query "InferenceConfig" --output text`,
-                    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-                ).trim();
+                const logs = execSync(
+                    `kubectl logs -n ${ns} deployment/hyperpod-inference-controller-manager -c manager --tail=400`,
+                    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env }
+                );
+                return logs.includes(needle);
             } catch {
-                // describe failed — keep trying
+                return false; // operator not reachable yet — keep waiting
             }
-            // AWS CLI prints "None" (text output) or empty when InferenceConfig is null.
-            if (inferenceConfig && inferenceConfig !== 'None') {
-                console.log('  ✅ Cluster inference capability is enabled (InferenceConfig present)');
+        };
+        while (Date.now() - start < timeout) {
+            // Either phrasing the operator emits once the watcher is enabled.
+            if (grep('Cluster inference watcher enabled successfully')
+                || grep('Service side watcher is already enabled')
+                || grep('Desired watcher status reached')) {
+                console.log('  ✅ Cluster inference capability is enabled (operator watcher status: Enabled)');
                 return;
             }
-            execSync('sleep 30', { stdio: 'pipe' });
+            execSync('sleep 30', { stdio: 'pipe', env });
         }
-        console.log('  ⚠️  Cluster inference capability did NOT enable within 15 minutes (InferenceConfig: null).');
-        console.log('      Model deploys will hang: pods + ALB come up but the SageMaker endpoint is');
-        console.log('      never created (SageMakerEndpointRegistration polls DescribeEndpoint forever).');
-        console.log('      Check the inference addon health and re-run; if it persists, the add-on');
-        console.log('      controller\'s EnableClusterInference did not complete:');
-        console.log(`      aws eks describe-addon --cluster-name mlcc-${profile.profileName}-eks --addon-name amazon-sagemaker-hyperpod-inference --region ${profile.awsRegion}`);
-        console.log(`      aws sagemaker describe-cluster --cluster-name ${clusterName} --region ${profile.awsRegion} --query InferenceConfig`);
+        // Non-fatal warning (the deploy driver is warn-not-block too). Note: this is only a
+        // WARNING — do not treat `InferenceConfig: null` as proof of failure (it stays null
+        // by design). A separate, confirmed operator/control-plane issue can prevent the
+        // SageMaker endpoint from ever being created even when the watcher IS enabled; see
+        // docs/architecture/eks-hyperpod-migration.md. That is NOT fixed here and is outside
+        // MLCC's control.
+        console.log('  ⚠️  Could not confirm cluster inference watcher reached "Enabled" within 25 minutes.');
+        console.log('      This is a non-blocking check. Inspect the operator directly:');
+        console.log(`      kubectl logs -n ${ns} deployment/hyperpod-inference-controller-manager -c manager | grep -i watcher`);
+        console.log(`      (describe-cluster InferenceConfig is NOT a reliable signal — it stays null even when enabled.)`);
     }
 
     /**
@@ -1154,7 +1201,7 @@ class CdkMultiStackModuleRunner {
         try {
             execSync(
                 `aws eks update-kubeconfig --name ${eksClusterName} --region ${profile.awsRegion}${awsFlags} --kubeconfig ${kubeconfig}`,
-                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: this._subprocessEnv(profile) }
             );
         } catch (e) {
             console.log(`  ⚠️  Could not write kubeconfig for ${eksClusterName}: ${e.message.split('\n')[0]}`);
@@ -1169,16 +1216,43 @@ class CdkMultiStackModuleRunner {
             },
             {
                 description: 'inference-gateway-controller nodeSelector (EC2 only — hostPath volumes)',
+                // Only applicable when the Inference Gateway is ENABLED. MLCC's add-on config
+                // sets inferenceGateway.enabled=false (matching the console Quick Install),
+                // so the add-on does NOT create this deployment — the patch would then fail
+                // with "deployments.apps inference-gateway-controller not found", a FALSE
+                // alarm that misleadingly logs "operator may not work correctly". Guard it on
+                // the deployment actually existing (self-correcting: patches when present,
+                // skips cleanly when the gateway is disabled). (BL143 2026-10-15.)
+                requiresDeployment: 'inference-gateway-controller',
                 cmd: `kubectl patch deployment inference-gateway-controller -n ${ns} --patch '{"spec":{"template":{"spec":{"nodeSelector":{"sagemaker.amazonaws.com/compute-type":"hyperpod"}}}}}' --kubeconfig ${kubeconfig}`,
                 manual: `kubectl patch deployment inference-gateway-controller -n ${ns} --patch '{"spec":{"template":{"spec":{"nodeSelector":{"sagemaker.amazonaws.com/compute-type":"hyperpod"}}}}}'`,
             },
         ];
 
         console.log('  🔧 Applying inference operator post-install patches...');
+        const patchEnv = this._subprocessEnv(profile);
         let allOk = true;
         for (const patch of patches) {
+            // Skip a patch whose target deployment legitimately does not exist (e.g. the
+            // gateway controller when inferenceGateway.enabled=false). This is NOT a failure.
+            if (patch.requiresDeployment) {
+                let exists = false;
+                try {
+                    execSync(
+                        `kubectl get deployment ${patch.requiresDeployment} -n ${ns} --kubeconfig ${kubeconfig}`,
+                        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: patchEnv }
+                    );
+                    exists = true;
+                } catch {
+                    exists = false;
+                }
+                if (!exists) {
+                    console.log(`     ⏭️  ${patch.description} — skipped (${patch.requiresDeployment} not present; expected when its feature is disabled)`);
+                    continue;
+                }
+            }
             try {
-                execSync(patch.cmd, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+                execSync(patch.cmd, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: patchEnv });
                 console.log(`     ✅ ${patch.description}`);
             } catch (e) {
                 allOk = false;
@@ -1231,6 +1305,39 @@ class CdkMultiStackModuleRunner {
      * @param {object} profile
      * @param {object} [opts] - { adoptEks?: boolean }
      */
+
+    /**
+     * Build the subprocess env for helm/kubectl calls (BL143 finding #10).
+     *
+     * `aws` CLI calls pass `--profile ${profile.awsProfile}` explicitly, but helm and
+     * kubectl take no such flag — they resolve identity from the ambient environment.
+     * If the operator's shell has AWS_PROFILE set to a profile that assumes a DIFFERENT
+     * IAM role than profile.awsProfile (the identity the EKS access entry was granted
+     * to), the helm/kubectl token is minted for the wrong principal and the cluster
+     * rejects it ("server has asked for the client to provide credentials"). Force these
+     * subprocesses onto the MLCC profile's identity so it cannot diverge from the grant.
+     * @param {object} profile
+     * @returns {NodeJS.ProcessEnv}
+     */
+    _subprocessEnv(profile) {
+        const env = { ...process.env };
+        if (profile.awsProfile) {
+            env.AWS_PROFILE = profile.awsProfile;
+            // AWS_PROFILE and static-credential env vars are mutually exclusive in the
+            // resolver; drop any inherited static creds / default-profile override so the
+            // named profile wins deterministically.
+            delete env.AWS_ACCESS_KEY_ID;
+            delete env.AWS_SECRET_ACCESS_KEY;
+            delete env.AWS_SESSION_TOKEN;
+            delete env.AWS_DEFAULT_PROFILE;
+        }
+        if (profile.awsRegion) {
+            env.AWS_REGION = profile.awsRegion;
+            env.AWS_DEFAULT_REGION = profile.awsRegion;
+        }
+        return env;
+    }
+
     async _ensureHyperPodHelmChart(profile, opts = {}) {
         if (opts.adoptEks) {
             console.log('  ⏭️  Skipping HyperPod Helm chart install (adoptEks=true — existing cluster)');
@@ -1255,7 +1362,7 @@ class CdkMultiStackModuleRunner {
         try {
             const helmStatus = execSync(
                 `helm status hyperpod-dependencies --namespace kube-system --output json 2>/dev/null`,
-                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: this._subprocessEnv(profile) }
             );
             const status = JSON.parse(helmStatus);
             if (status.info && status.info.status === 'deployed') {
@@ -1269,11 +1376,13 @@ class CdkMultiStackModuleRunner {
 
         console.log('  📦 Installing HyperPod Helm chart dependencies...');
 
-        // Update kubeconfig for the EKS cluster
+        // Update kubeconfig for the EKS cluster. Pass --profile so the written exec block
+        // bakes in the MLCC profile, and set the subprocess env so the token minted here
+        // uses the same identity helm/kubectl will use (BL143 #10).
         try {
             execSync(
                 `aws eks update-kubeconfig --name ${eksClusterName} --region ${profile.awsRegion}${awsFlags}`,
-                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: this._subprocessEnv(profile) }
             );
         } catch (err) {
             console.log(`  ⚠️  Could not update kubeconfig: ${err.message.split('\n')[0]}`);
@@ -1337,10 +1446,12 @@ class CdkMultiStackModuleRunner {
             );
         }
 
-        // Update Helm dependencies and install
+        // Update Helm dependencies and install. helm/kubectl take no --profile flag, so
+        // force them onto the MLCC profile's identity via the subprocess env (BL143 #10).
+        const helmEnv = this._subprocessEnv(profile);
         try {
             execSync('helm dependencies update .', {
-                cwd: chartDir, encoding: 'utf8', stdio: 'inherit',
+                cwd: chartDir, encoding: 'utf8', stdio: 'inherit', env: helmEnv,
             });
 
             // Remove any webhook configurations that may block Helm install.
@@ -1348,10 +1459,10 @@ class CdkMultiStackModuleRunner {
             // cert-manager) may not be running yet. These webhooks will be recreated
             // once the pods schedule on Fargate.
             console.log('    Clearing blocking webhooks before Helm install...');
-            this._clearBlockingWebhooks();
+            this._clearBlockingWebhooks(profile);
 
             execSync('helm upgrade --install hyperpod-dependencies . --namespace kube-system --create-namespace', {
-                cwd: chartDir, encoding: 'utf8', stdio: 'inherit',
+                cwd: chartDir, encoding: 'utf8', stdio: 'inherit', env: helmEnv,
             });
             console.log('  ✅ HyperPod Helm chart installed');
         } catch (err) {

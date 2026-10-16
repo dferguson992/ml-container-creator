@@ -35,7 +35,7 @@ while [ $# -gt 0 ]; do
         --target)
             shift
             if [ $# -eq 0 ]; then
-                echo "Error: --target requires a value (realtime-inference, async-inference, batch-transform, hyperpod-eks)" >&2
+                echo "Error: --target requires a value (realtime-inference, async-inference, batch-transform, hyperpod-eks, eks)" >&2
                 exit 1
             fi
             FLAG_TARGET="$1"
@@ -161,9 +161,15 @@ if [ "${1:-}" = "--json" ]; then
                 JSON="${JSON},\"batchMaxPayloadInMB\":${BATCH_MAX_PAYLOAD_IN_MB}"
             fi
             ;;
-        hyperpod-eks)
-            # HyperPod EKS
-            JSON="${JSON},\"hyperPodCluster\":\"${HP_CLUSTER_NAME}\""
+        hyperpod-eks|eks)
+            # Kubernetes targets (family: kubernetes). hyperpod-eks and plain eks
+            # share the same HP_* serving config vars (see targets.d/{hyperpod-eks,eks}
+            # manifests), so they export the same cluster/namespace/replicas fields.
+            # HP_CLUSTER_NAME is optional on plain eks (BYO cluster via kubeconfig),
+            # so only emit it when set.
+            if [ -n "${HP_CLUSTER_NAME:-}" ]; then
+                JSON="${JSON},\"hyperPodCluster\":\"${HP_CLUSTER_NAME}\""
+            fi
             if [ "${HP_NAMESPACE}" != "default" ]; then
                 JSON="${JSON},\"hyperPodNamespace\":\"${HP_NAMESPACE}\""
             fi
@@ -331,9 +337,13 @@ case "${EFFECTIVE_TARGET}" in
             CMD="${CMD} --batch-max-payload=${BATCH_MAX_PAYLOAD_IN_MB}"
         fi
         ;;
-    hyperpod-eks)
-        # HyperPod EKS
-        CMD="${CMD} --hyperpod-cluster=${HP_CLUSTER_NAME}"
+    hyperpod-eks|eks)
+        # Kubernetes targets (family: kubernetes). hyperpod-eks and plain eks share
+        # the same HP_* serving config vars; export the same flags. HP_CLUSTER_NAME is
+        # optional on plain eks (BYO cluster via kubeconfig), so only emit it when set.
+        if [ -n "${HP_CLUSTER_NAME:-}" ]; then
+            CMD="${CMD} --hyperpod-cluster=${HP_CLUSTER_NAME}"
+        fi
         if [ "${HP_NAMESPACE}" != "default" ]; then
             CMD="${CMD} --hyperpod-namespace=${HP_NAMESPACE}"
         fi

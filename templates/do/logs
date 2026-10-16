@@ -18,7 +18,7 @@
 #   ./do/logs --target <target> [args]            Override DEPLOYMENT_TARGET
 #
 #   <target> is one of: realtime-inference, async-inference,
-#                       hyperpod-eks, batch-transform
+#                       hyperpod-eks, eks, batch-transform
 #
 # @mlcc-script
 # type: deployment-centric
@@ -45,7 +45,7 @@ while [ $# -gt 0 ]; do
         --target)
             shift
             if [ $# -eq 0 ]; then
-                echo "❌ --target requires a value (realtime-inference, async-inference, batch-transform, hyperpod-eks)"
+                echo "❌ --target requires a value (realtime-inference, async-inference, batch-transform, hyperpod-eks, eks)"
                 exit 1
             fi
             FLAG_TARGET="$1"

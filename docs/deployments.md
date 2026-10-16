@@ -63,8 +63,14 @@ Speculative decoding is supported for vLLM and SGLang images on HyperPod EKS. Se
 
 Prerequisites:
 
-- An existing SageMaker AI HyperPod cluster with EKS orchestrator
-- The `amazon-sagemaker-hyperpod-inference` EKS add-on installed (via `mcc bootstrap add-module hyperpod-cluster`), which provisions the `hyperpod-inference` service account in the target namespace
+- An existing SageMaker AI HyperPod cluster with EKS orchestrator, **provisioned via the AWS
+  SageMaker console (Quick Install) or the published CloudFormation templates.** (MLCC's
+  `bootstrap add-module hyperpod` provisioning is **deprecated** — it does not enable inference
+  at cluster-creation time, so endpoints never get created. See
+  [HyperPod Bootstrap](hyperpod-bootstrap.md). The `hyperpod-eks` deploy target below is
+  unaffected and works against a correctly-provisioned cluster.)
+- The `amazon-sagemaker-hyperpod-inference` EKS add-on installed on that cluster (the console
+  Quick Install / CFT installs it), which provisions the `hyperpod-inference` service account in the target namespace
 - `kubectl` installed locally
 - IAM permissions for `sagemaker:DescribeCluster`, `eks:DescribeCluster`, and `sagemaker:DescribeEndpoint`
 - Sufficient node capacity (especially GPU nodes for LLM workloads)

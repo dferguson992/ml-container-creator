@@ -1,5 +1,29 @@
 # HyperPod Bootstrap Module
 
+!!! danger "DEPRECATED (v2.0.0) — HyperPod cluster provisioning is parked pending a dedicated spike"
+    The `hyperpod` bootstrap module (HyperPod **cluster provisioning**) is **deprecated** and
+    can no longer be freshly provisioned (`bootstrap add-module hyperpod` refuses; it is hidden
+    from the interactive module picker). A live sim-account rehearsal established that MLCC's
+    cluster-creation path does **not** enable inference at `CreateCluster` time — the resulting
+    cluster has no inference capability, so the inference operator can register but never creates
+    a SageMaker endpoint, and model deploys never complete. The root cause lives in AWS's
+    compiled provisioning Lambda and cannot be reliably reconstructed by MLCC's hand-assembled
+    install. Full forensic record: [EKS/HyperPod migration findings](architecture/eks-hyperpod-migration.md).
+
+    **What this means for you:**
+
+    - **Provision a HyperPod cluster via the AWS SageMaker console** ("Create HyperPod cluster"
+      → Quick Install, which enables inference correctly) **or the published CloudFormation
+      templates** (`aws-sagemaker-hyperpod-cluster-setup-<region>-prod`). Do not use
+      `bootstrap add-module hyperpod` to create the cluster.
+    - **The `hyperpod-eks` DEPLOY target still works.** Once you have a correctly-provisioned
+      cluster, `do/deploy --target hyperpod-eks` (and `do/benchmark`, `do/optimize`, the
+      cluster picker, etc.) are unaffected and fully supported.
+    - **Existing provisioned installs** keep working and can still be torn down with
+      `remove-module hyperpod`.
+    - A dedicated spike (BL153) will decide the HP-native provisioning path (self-provisioning
+      module vs. documented console/CFT route). The sections below are retained as reference.
+
 The `hyperpod-cluster` bootstrap module provisions a complete SageMaker HyperPod EKS
 environment as three CDK stacks deployed in sequence.
 
@@ -28,18 +52,25 @@ When you run `bootstrap add-module hyperpod`, the module deploys:
 
 ## Quick Start
 
+!!! danger "`add-module hyperpod` is deprecated"
+    The provisioning command below no longer works (the module is deprecated — see the banner
+    at the top of this page). Provision your HyperPod cluster via the AWS SageMaker console or
+    the published CFT, then skip straight to generate + deploy against it. The deploy half of
+    this flow is unchanged.
+
 ```bash
-# Add the HyperPod module to an existing bootstrap profile
-ml-container-creator bootstrap add-module hyperpod-cluster
+# ⚠️ DEPRECATED — provisioning via MLCC is parked (BL153). Create the cluster via the
+#    AWS SageMaker console (Quick Install) or the published CloudFormation templates instead.
+#    ml-container-creator bootstrap add-module hyperpod      # <-- refuses; deprecated
 
 # Check status
 ml-container-creator bootstrap status
 
-# Generate a project targeting HyperPod
+# Generate a project targeting HyperPod (deploy target is NOT deprecated)
 ml-container-creator generate --deployment-target hyperpod-eks
 
-# Deploy (after build + push)
-do/build && do/push && do/deploy
+# Deploy (after build + push) against a correctly-provisioned cluster
+do/build && do/push && do/deploy --target hyperpod-eks
 ```
 
 ## Cost
