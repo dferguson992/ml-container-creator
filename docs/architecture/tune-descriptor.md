@@ -12,7 +12,8 @@ and follows the same ADR-008 principle: **derive, don't hardcode.** Every consum
 the `do/tune` config UX (BL128), the register-side dataset producer, and the `do/tune`
 preflight — reads the descriptor so they cannot drift out of agreement.
 
-Introduced in BL129 (`.kiro/specs/v2-w3-01-bl129`). The settled design rationale +
+Introduced in BL129 (`.kiro/specs/v2-w3-01-bl129`); the decision record is
+[ADR-011](../adr/ADR-011-tune-technique-descriptor.md). The settled design rationale +
 the live SageMaker JumpStart API probe findings are in
 `.kiro/v2-w3-tune-descriptor-design.md`.
 

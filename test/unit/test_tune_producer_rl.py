@@ -40,6 +40,21 @@ def _load(name):
 
 producer = _load("tune_producer_rl")
 
+# The pure-transform tests (to_verl_row / assert_verl_row) need no pyarrow and always
+# run. The tests that actually WRITE/READ parquet are skipped when pyarrow is absent —
+# in a generated project `do/register`'s venv carries it, but a bare CI interpreter may
+# not. (Mirrors test_tune_gate_field_schema.py's importorskip.)
+try:
+    import pyarrow  # noqa: F401
+    _HAS_PYARROW = True
+except ImportError:
+    _HAS_PYARROW = False
+
+_needs_pyarrow = pytest.mark.skipif(
+    not _HAS_PYARROW,
+    reason="pyarrow not installed; parquet production is covered where pyarrow is available",
+)
+
 
 # -- is_managed_rl_verl --------------------------------------------------------
 
@@ -128,6 +143,7 @@ def test_assert_rejects_missing_reward_model_struct():
 
 # -- produce_verl_parquet + post-write assert (6.4 end-to-end) -------------------
 
+@_needs_pyarrow
 def test_produce_parquet_end_to_end_and_post_write_conforms(tmp_path):
     out = str(tmp_path / "train.verl.parquet")
     records = [
@@ -149,6 +165,7 @@ def test_produce_parquet_end_to_end_and_post_write_conforms(tmp_path):
     assert all(isinstance(r["prompt"], list) and r["prompt"] for r in rows)
 
 
+@_needs_pyarrow
 def test_produce_parquet_respects_take(tmp_path):
     out = str(tmp_path / "train.verl.parquet")
     records = [{"prompt": f"q{i}", "ground_truth": str(i)} for i in range(10)]
@@ -156,6 +173,7 @@ def test_produce_parquet_respects_take(tmp_path):
     assert n == 3
 
 
+@_needs_pyarrow
 def test_rlaif_parquet_uses_model_style_from_descriptor(tmp_path):
     out = str(tmp_path / "train.verl.parquet")
     producer.produce_verl_parquet(

@@ -123,8 +123,20 @@ All supported models include at least one fine-tuning technique via SageMaker AI
 |---|---|---|---|
 | **SFT** | Supervised Fine-Tuning on prompt/completion pairs | LoRA adapter | `do/adapter add --from-tune` |
 | **DPO** | Direct Preference Optimization on chosen/rejected pairs | LoRA adapter | `do/adapter add --from-tune` |
-| **RLVR** | Reinforcement Learning with Verifiable Rewards | LoRA adapter | `do/adapter add --from-tune` |
-| **RLAIF** | RL from AI Feedback (requires Lambda reward function) | LoRA adapter | `do/adapter add --from-tune` |
+| **RLVR** | Reinforcement Learning with Verifiable Rewards (a registered Lambda reward function) | LoRA adapter | `do/adapter add --from-tune` |
+| **RLAIF** | RL from AI Feedback (an LLM-as-judge reward prompt, not a Lambda) | LoRA adapter | `do/adapter add --from-tune` |
+| **MTRL** | Multi-turn RL (reward from a custom agent environment) | LoRA adapter | *not yet runnable — see below* |
+
+Each technique's knobs, PEFT variants, and dataset contract are declared in a
+per-technique descriptor (`templates/code/tune.d/<technique>/manifest.json`) synced from
+SageMaker's recipe override-params — see
+[Per-technique tune descriptor](architecture/tune-descriptor.md).
+
+!!! note "MTRL is configurable but not yet runnable"
+    MTRL is **discoverable and configurable** via `do/tune` (its knobs are synced like any
+    other technique), but running an MTRL job end-to-end is deferred — it needs an
+    MTRL-capable catalog model plus a `CustomAgentLambda`. Its dataset shape is marked
+    unverified in the descriptor until exercised against a real job.
 
 See [Fine-Tuning](fine-tuning.md) for full documentation on `do/tune` and the tune-adapter-deploy feedback loop.
 

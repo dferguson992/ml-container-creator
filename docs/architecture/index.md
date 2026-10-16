@@ -68,3 +68,9 @@ See the ADR log:
   contract enforcement (Wave 6).
 - [ADR-008](../adr/ADR-008-deployment-target-descriptor.md) — deployment-target
   descriptor / single source of truth (Wave 8).
+- [ADR-009](../adr/ADR-009-serve-engine-capability-versioning.md) — serve-engine
+  capability versioning.
+- [ADR-010](../adr/ADR-010-k8s-engine-config-injection.md) — k8s engine-config
+  injection.
+- [ADR-011](../adr/ADR-011-tune-technique-descriptor.md) — per-technique tune
+  descriptor / single source of truth (v2.0 Wave 3, BL129).
