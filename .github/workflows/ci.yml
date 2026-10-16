@@ -86,6 +86,10 @@ jobs:
         if: matrix.node-version == '24.x'
         run: node scripts/validate-serve-manifests.js
 
+      - name: Validate tune descriptors
+        if: matrix.node-version == '24.x'
+        run: node scripts/validate-tune-manifests.js
+
   integration:
     name: Integration
     runs-on: ubuntu-latest

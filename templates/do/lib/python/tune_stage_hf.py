@@ -105,6 +105,89 @@ def _resolve_hf_token(region, secret_name=None):
     return os.environ.get("HF_TOKEN")
 
 
+def _iter_source_records(local_path):
+    """Yield source records from a downloaded data file (parquet or jsonl/json)."""
+    if local_path.endswith((".parquet", ".parq")):
+        import pyarrow.parquet as pq
+        table = pq.read_table(local_path)
+        for batch in table.to_batches():
+            for row in batch.to_pylist():
+                yield row
+    else:
+        import json as json_mod
+        with open(local_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json_mod.loads(line)
+
+
+def _stage_rl_verl(args, dataset_id, org, name, split, data_files, hf_token,
+                   s3_prefix, technique):
+    """Produce verl 5-field PARQUET for a managed-RL technique (rlvr/rlaif) and upload
+    it to a channel-pure `<s3_prefix>/data/` subprefix (ODP-2). Returns
+    (s3_uri, num_records) where s3_uri is the `data/` subprefix (the training channel).
+
+    The source records (parquet or jsonl) are transformed row-by-row into the verl
+    schema by tune_producer_rl (prompt kept as a message LIST — NOT flattened —
+    reward_model.style derived from the descriptor, flat ground-truth lifted into the
+    nested struct), then asserted conformant before AND after write.
+    """
+    from huggingface_hub import hf_hub_download
+    import boto3
+    import tempfile
+
+    import tune_producer_rl
+
+    s3_client = boto3.client("s3", region_name=args.region)
+    column_map = _parse_column_map(getattr(args, "column_map", None))
+    take_limit = getattr(args, "take", None)
+    # Channel-pure subprefix: parquet lands here, the _dataset.json sidecar does NOT.
+    data_prefix = f"{s3_prefix}/data"
+
+    total = 0
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for data_file in data_files:
+            local_path = hf_hub_download(
+                repo_id=dataset_id, filename=data_file, repo_type="dataset",
+                token=hf_token, local_dir=tmpdir,
+            )
+
+            remaining = None if take_limit is None else max(0, take_limit - total)
+            if remaining == 0:
+                break
+
+            base = os.path.splitext(os.path.basename(data_file))[0]
+            out_path = os.path.join(tmpdir, f"{base}.verl.parquet")
+            written = tune_producer_rl.produce_verl_parquet(
+                _iter_source_records(local_path),
+                technique=technique, out_path=out_path,
+                column_map=column_map, take=remaining,
+            )
+            # Post-write conformance assert (Requirement 4.5).
+            tune_producer_rl.assert_parquet_conforms(out_path, technique=technique)
+
+            s3_key = f"{data_prefix}/{base}.parquet"
+            s3_client.upload_file(out_path, args.output_bucket, s3_key)
+            total += written
+
+    if total == 0:
+        _error_exit(
+            f"Produced 0 verl rows for {dataset_id} (technique {technique}). "
+            "The source dataset yielded no usable records."
+        )
+
+    print(
+        f"\u2705 Produced {total} verl 5-field parquet rows for {technique} "
+        f"\u2192 s3://{args.output_bucket}/{data_prefix}/ (message-list prompt, "
+        "nested reward_model). The _dataset.json sidecar stays OUTSIDE this channel.",
+        file=sys.stderr,
+    )
+    # The training channel is the clean `data/` subprefix (prefix form, trailing slash).
+    s3_uri = f"s3://{args.output_bucket}/{data_prefix}/"
+    return s3_uri, total
+
+
 def cmd_stage_hf(args):
     """Download HF dataset to S3 using huggingface_hub.
 
@@ -190,6 +273,22 @@ def cmd_stage_hf(args):
             s3_prefix = f"{args.project_name}/datasets/{org}/{name}/{split}"
         num_records = 0
         empty_field_counts = {}
+
+        # ── BL129: managed-RL (verl) Producer branch ────────────────────────────
+        # For rlvr/rlaif the managed trainer runs verl's RLHFDataset, which reads the
+        # train channel as PARQUET in the 5-field row schema (prompt as a message
+        # LIST, nested reward_model struct) — the OPPOSITE of the jsonl + flatten
+        # path below. Produce verl parquet into a channel-pure `data/` subprefix (so
+        # the _dataset.json sidecar co-located at the dataset prefix is NOT in the
+        # training channel — ODP-2) and return that subprefix as the dataset s3_uri.
+        import tune_producer_rl
+        if tune_producer_rl.is_managed_rl_verl(technique):
+            rl_s3_uri, rl_num_records = _stage_rl_verl(
+                args, dataset_id, org, name, split, data_files, hf_token,
+                s3_prefix, technique,
+            )
+            _output({"s3_uri": rl_s3_uri, "num_records": rl_num_records})
+            return
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # Schema divergence check (skip for single file)

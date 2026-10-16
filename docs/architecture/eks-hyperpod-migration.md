@@ -383,7 +383,7 @@ Profile is `frgud+mcc-demo-mlcc-admin` (the MLCC profile's awsProfile — NOT th
 filled>`, not necessarily g5.16x.
 ```
 aws sagemaker update-cluster \
-  --cluster-name mlcc-mlcc-demo-us-west-2-hyperpod --region us-west-2 \
+  --cluster-name mlcc-hyperpod-cluster --region us-west-2 \
   --profile "frgud+mcc-demo-mlcc-admin" \
   --instance-groups '[
     {"InstanceGroupName":"default-worker","InstanceType":"ml.c5.4xlarge","InstanceCount":2,"ExecutionRole":"arn:aws:iam::258927109213:role/mlcc-mlcc-demo-us-west-2-hyperpod-instance-role","LifeCycleConfig":{"SourceS3Uri":"s3://mlcc-core-258927109213-us-west-2/hyperpod-lifecycle/","OnCreate":"on_create.sh"}},
@@ -527,7 +527,15 @@ rejected — same operator either way. (Transient during this recreate: deleting
 left the controller-manager CrashLoopBackOff and removed the SageMakerEndpointRegistration CR
 — expected mid-recreate, not a new bug. Re-check once HyperPodInferenceAddonStack completes.)
 
-### �🔚 CONCLUSION — not an MLCC bug; operator does not issue CreateEndpoint (needs AWS/operator-level support)
+### 🔚 CONCLUSION — not an MLCC bug; operator does not issue CreateEndpoint (needs AWS/operator-level support)
+
+> **UPDATE (2026-09-29): RESOLVED, not a dead-end.** This "needs AWS support" conclusion was
+> about MLCC's EKS-FIRST provisioned cluster, where the operator never issued CreateEndpoint.
+> It is now SUPERSEDED by the later entries: on a properly HP-NATIVE-provisioned cluster the
+> operator issues CreateEndpoint and a real SageMaker endpoint reaches `InService` end-to-end
+> (see "✅ DEPLOY-PATH CONFIRMATION (2026-09-29)" below). The fix was never a deploy-time patch
+> or an AWS support ticket — it was HP-native PROVISIONING (→ BL153). The reasoning below is
+> retained as the historical trail that led there.
 
 ### ✅ ENDPOINT ROOT CAUSE CONFIRMED (2026-10-15, healthy-operator deploy + full controller logs)
 
@@ -676,6 +684,86 @@ chasing it blind forever." The fact that loading the cluster with every identifi
 STILL didn't make MLCC's hand-rolled path work is the strongest possible argument for not
 hand-rolling it. (The four MLCC fixes shipped this session — identity, Running-decouple,
 watcher-signal, gateway-patch-skip — all stand regardless.)
+
+### ✅ CONFIRMATION + CORRECTION (2026-10-15) — HP-native cluster works; `InferenceConfig` theory was WRONG
+
+A HyperPod cluster provisioned the HP-NATIVE way (console/CFT: `mlcc-hyperpod-cluster` /
+`cluster/61l69r1yp5ru`, orchestrator `sagemaker-mlcc-hyperpod-cluster-...-eks` — it created
+its OWN EKS) works with ZERO UI weirdness: operator green, endpoints create, Models tab
+populates. This CONFIRMS the deprecation + BL153 direction: AWS's HP-native provisioning works
+where MLCC's EKS-first hand-rolled path did not.
+
+**BUT it CORRECTS the earlier mechanism theory (which was WRONG):** `describe-cluster` on this
+WORKING cluster also has `InferenceConfig` **ABSENT** — identical to MLCC's broken cluster. So
+`InferenceConfig` present/absent tells you NOTHING about whether inference works; it is a
+confirmed RED HERRING, and the earlier "EKS-first → no InferenceConfig field → no endpoint"
+hypothesis is DISPROVEN. (The working cluster actually has MORE fields — `AutoScaling`,
+`ClusterRole`, `RestrictedInstanceGroups` — than MLCC's, but the inference capability is NOT a
+visible cluster-object field in either.) This retroactively vindicates one fix we shipped:
+re-gating the inference verifier off `InferenceConfig` onto the operator WATCHER STATUS.
+
+**What this means:** the working-vs-broken difference is NOT a single cluster field MLCC could
+add — it is the whole HP-NATIVE PROVISIONING ORCHESTRATION (cluster + EKS + operator + domain
+created together by AWS's template/console flow). That makes the deprecation + "adopt the
+HP-native path" (BL153) MORE clearly correct, not less: there was never a one-line config/field
+fix; the hand-rolled EKS-first approach was structurally wrong. The working cluster is a clean,
+healthy foundation to deploy against via `--target hyperpod-eks` and to study for the BL153
+spike's module design.
+
+### ✅ DEPLOY-PATH CONFIRMATION (2026-09-29) — `do/deploy --target hyperpod-eks` drives a SageMaker endpoint to `InService` on the HP-native cluster + the basic operator
+
+Owner ran a full model deploy through MLCC's retained `hyperpod-eks` deploy target against the
+HP-native cluster (EKS `sagemaker-mlcc-hyperpod-cluster-b9ce52cc-eks` / HyperPod
+`cluster/61l69r1yp5ru`) with the **basic inference operator** (NOT MLCC's hand-assembled add-on
+config). `do/deploy` signalled successful deployment once the `SageMakerEndpointRegistration`
+resource was successfully created on the cluster — i.e. the operator reconciled the deploy on a
+properly-provisioned cluster, which it never did on MLCC's EKS-first cluster.
+
+**Why this does NOT reverse the deprecation (it REINFORCES the boundary we drew):** this is the
+console/CFT-provisioned HP-native cluster — exactly the one the entry above already shows works.
+It was NOT provisioned by MLCC's `hyperpod` bootstrap module (still correctly deprecated). The
+new, stronger data point is that **MLCC's own `hyperpod-eks` DEPLOY target works end-to-end
+against a correctly-provisioned cluster** — which is precisely the line the Wave-2 carve-out
+drew: deprecate *provisioning* (the broken EKS-first hand-roll → BL153 spike), KEEP the deploy
+target. "Nothing we could have done" (owner) on the provisioning side is the whole BL153 thesis:
+the cluster must be CREATED HP-native with inference enabled; no MLCC deploy-time fix substitutes
+for that. The four Wave-2 fixes (identity, Running-decouple, watcher-signal, gateway-patch-skip)
++ the `hyperpod-eks` target are all vindicated by this run.
+
+**FULL END-TO-END `InService` CONFIRMED (2026-09-29, complete `do/deploy` log).** This run went
+all the way — the SageMaker endpoint the operator NEVER created on MLCC's EKS-first cluster was
+created and reached `InService` here:
+
+```
+✅ 15:34:53 InferenceEndpointConfig state: DeploymentComplete
+⏳ Waiting for SageMaker endpoint 'qwen3-4b-test' to reach InService...
+   ✅ 15:34:56 Endpoint status: InService
+   Endpoint ARN: arn:aws:sagemaker:us-west-2:258927109213:endpoint/qwen3-4b-test
+```
+
+Run shape: `./do/deploy --target hyperpod --reconfigure`, cluster `mlcc-hyperpod-cluster`
+(`cluster/61l69r1yp5ru`, EKS `sagemaker-mlcc-hyperpod-cluster-b9ce52cc-eks`), `ml.g5.16xlarge`
+g5-16x-worker node, 1 replica, `default` namespace, image
+`ml-container-creator:qwen3-4b-test-latest`. Pods went `Init → PodInitializing → 2/3 → 3/3
+Running` over ~9 min, `InferenceEndpointConfig` reached `DeploymentComplete`, then the SageMaker
+endpoint reached `InService` ~3s later. This is milestone (c) — the operator issued
+`CreateModel`/`CreateEndpointConfig`/`CreateEndpoint` end-to-end, the step that polled forever
+("Could not find endpoint") on MLCC's broken cluster.
+
+**Two things this settles:**
+1. **The `hyperpod-eks` deploy target is end-to-end CORRECT** against a properly HP-native-
+   provisioned cluster — `CreateEndpoint` fires, a real endpoint ARN is produced, `do/test`/
+   `do/benchmark`/`do/register` are reachable. The Wave-2 decision to KEEP the deploy target
+   (deprecate only provisioning) is fully vindicated.
+2. **The Wave-2 `Running`-decouple is behaving correctly, not masking.** The advisory endpoint
+   poll still actively WAITED for and REPORTED `InService` ("Waiting for SageMaker endpoint ...
+   to reach InService" → "✅ Endpoint status: InService") rather than exiting blind — so the
+   non-fatal poll surfaces the real terminal state when it genuinely happens.
+
+Net: the deprecation boundary is exactly right. Provisioning (EKS-first hand-roll) is the only
+broken part → BL153 spike; the deploy target + the four Wave-2 fixes are proven by a live
+`InService` endpoint. "Nothing we could have done" on provisioning holds — but once the cluster
+is provisioned HP-native, MLCC's deploy path works start to finish.
 
 ### 🏛️ ROOT ARCHITECTURAL FINDING (2026-10-15) — MLCC hand-reimplements an AWS-PUBLISHED CloudFormation template
 

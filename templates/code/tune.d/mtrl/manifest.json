@@ -1,0 +1,18 @@
+{
+  "technique": "mtrl",
+  "reward_source": "agent_env",
+  "variants": {
+    "lora": {
+      "peft": "lora",
+      "artifact_kind": "lora_adapter",
+      "dataset_contract": {
+        "format": "parquet",
+        "schema": "mtrl-rollout",
+        "prompt_shape": "message-list",
+        "verified": false
+      },
+      "hyperparameters": {},
+      "_synced": {}
+    }
+  }
+}

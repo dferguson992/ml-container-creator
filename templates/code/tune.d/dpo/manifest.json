@@ -1,0 +1,30 @@
+{
+  "technique": "dpo",
+  "reward_source": "preset",
+  "variants": {
+    "lora": {
+      "peft": "lora",
+      "artifact_kind": "lora_adapter",
+      "dataset_contract": {
+        "format": "jsonl",
+        "schema": "dpo-preference",
+        "prompt_shape": "message-list",
+        "verified": true
+      },
+      "hyperparameters": {},
+      "_synced": {}
+    },
+    "full": {
+      "peft": "none",
+      "artifact_kind": "full_model",
+      "dataset_contract": {
+        "format": "jsonl",
+        "schema": "dpo-preference",
+        "prompt_shape": "message-list",
+        "verified": true
+      },
+      "hyperparameters": {},
+      "_synced": {}
+    }
+  }
+}

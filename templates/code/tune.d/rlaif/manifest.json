@@ -1,0 +1,32 @@
+{
+  "technique": "rlaif",
+  "reward_source": "judge",
+  "variants": {
+    "lora": {
+      "peft": "lora",
+      "artifact_kind": "lora_adapter",
+      "dataset_contract": {
+        "format": "parquet",
+        "schema": "verl-5field",
+        "prompt_shape": "message-list",
+        "reward_model_style": "model",
+        "verified": true
+      },
+      "hyperparameters": {},
+      "_synced": {}
+    },
+    "full": {
+      "peft": "none",
+      "artifact_kind": "full_model",
+      "dataset_contract": {
+        "format": "parquet",
+        "schema": "verl-5field",
+        "prompt_shape": "message-list",
+        "reward_model_style": "model",
+        "verified": true
+      },
+      "hyperparameters": {},
+      "_synced": {}
+    }
+  }
+}

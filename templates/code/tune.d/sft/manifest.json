@@ -1,0 +1,30 @@
+{
+  "technique": "sft",
+  "reward_source": "none",
+  "variants": {
+    "lora": {
+      "peft": "lora",
+      "artifact_kind": "lora_adapter",
+      "dataset_contract": {
+        "format": "jsonl",
+        "schema": "sft-prompt-completion",
+        "prompt_shape": "message-list",
+        "verified": true
+      },
+      "hyperparameters": {},
+      "_synced": {}
+    },
+    "full": {
+      "peft": "none",
+      "artifact_kind": "full_model",
+      "dataset_contract": {
+        "format": "jsonl",
+        "schema": "sft-prompt-completion",
+        "prompt_shape": "message-list",
+        "verified": true
+      },
+      "hyperparameters": {},
+      "_synced": {}
+    }
+  }
+}

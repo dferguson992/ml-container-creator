@@ -342,8 +342,23 @@ row** (verl's documented GSM8K prep format):
 | `reward_model` | **struct** `{"style": "rule", "ground_truth": "<str>"}` | NOT a flat string. A missing `reward_model` fails with "Missing required field: 'reward_model'" |
 | `extra_info` | struct | e.g. `{"split","index"}` — recorded, not used by training |
 
-Build it with pyarrow and register the prefix (RLVR and RLAIF use the **same** dataset
-schema — they differ only in the reward asset):
+RLVR and RLAIF use the **same** dataset schema — they differ only in the reward asset
+and in `reward_model.style` (RLVR = `rule`, RLAIF = `model`, set automatically from the
+technique).
+
+**You usually don't hand-build this.** `do/register dataset --technique rlvr|rlaif`
+runs a Producer that transforms a source dataset into the verl 5-field parquet for you:
+it keeps `prompt` as a chat message list, and **lifts a flat top-level ground-truth
+column** (`ground_truth` / `answer` / `solution` / …) into the nested `reward_model`
+struct with the right `style`. The produced parquet is validated at registration time,
+so a shape error fails there — not deep in a GPU job.
+
+```bash
+# Produce verl 5-field parquet from a HuggingFace dataset (prompt + a ground-truth column)
+./do/register dataset gsm8k-rlvr --hf-id openai/gsm8k --technique rlvr
+```
+
+If you prefer to build it yourself with pyarrow, the row shape is:
 
 ```python
 import pyarrow as pa, pyarrow.parquet as pq
@@ -361,8 +376,12 @@ pq.write_table(pa.table(rows), "train-00000-of-00001.parquet")
     SageMaker mounts the whole dataset S3 prefix as the training channel. Any
     non-parquet file in it — notably the registry's `_dataset.json` sidecar — is read
     as parquet and fails the job. Stage RL datasets so the prefix holds only the
-    parquet data file(s). `do/tune` enforces parquet for RL techniques in preflight
-    (it fails loud if the dataset is not parquet, before provisioning GPUs).
+    parquet data file(s). The Producer stages RL parquet under a channel-pure
+    `datasets/<name>/data/` subprefix (the `_dataset.json` sidecar sits one level up,
+    outside the channel). `do/tune` enforces this in preflight: it fails loud if the
+    dataset is not parquet AND — the field-schema check — if the parquet is missing a
+    required verl field (e.g. `reward_model`), naming the field, all before provisioning
+    GPUs.
 
 Run RLVR / RLAIF by resolving a registered evaluator (see
 [Managed RL evaluators](#managed-rl-evaluators-rlvr-rlaif-mtrl)):

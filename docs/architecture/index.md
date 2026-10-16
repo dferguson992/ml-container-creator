@@ -39,6 +39,7 @@ an ADR. Wave 8 stitches these into a navigable Developer Guide.
 - [MCP picker servers](mcp-servers.md) — *Wave 2*
 - [Serve-engine plugins](serve-engine-plugins.md) — *Wave 3* — LLM/transformer serving engines
     - [Authoring guide](serve-engine-plugin-authoring.md) — extend/version/add engine plugins
+- [Per-technique tune descriptor](tune-descriptor.md) — *v2.0 Wave 3* — the managed-customization technique source of truth (`tune.d/`): structural + synced layers, the sync, and the managed-RL dataset contract (Producer + Gate)
 - [Predictor-framework plugins](predictor-framework-plugins.md) — classical-ML (sklearn/xgboost/tensorflow) HTTP predictors (descriptor + handler)
 - [Command handlers & do/config](command-handlers.md) — *Wave 4*
 - [Validation framework](validation.md) — *Wave 5*

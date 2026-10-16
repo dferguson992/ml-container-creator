@@ -28,6 +28,18 @@ const __dirname = path.dirname(__filename);
 
 const CATALOG_PATH = path.resolve(__dirname, '..', 'config', 'tune-catalog.json');
 
+// BL129: where the per-technique tune descriptors live (the second sync output).
+const TUNE_D = path.resolve(__dirname, '..', 'templates', 'code', 'tune.d');
+
+// BL129: plumbing keys to EXCLUDE from the LEANER MTRL override-params flavor, which
+// carries no `category` tag to filter on. Everything NOT in this denylist is treated
+// as a surfaced hyperparameter. A drift test guards this list so a new plumbing key
+// AWS adds can't silently become a knob. (The TAGGED flavor — sft/dpo/rlvr/rlaif —
+// filters on `category: hyperparameter` instead and ignores this list.)
+const MTRL_PLUMBING_DENYLIST = new Set([
+    'data_path', 'model_name_or_path', 'output_path', 'name'
+]);
+
 const KNOWN_PREFIXES = [
     'huggingface-llm',
     'huggingface-reasoning',
@@ -173,7 +185,14 @@ function parseRecipes(hubContentDocument) {
             technique: normalizedTechnique,
             trainingTypes: Array.isArray(trainingTypes) ? trainingTypes.map(t => t.toLowerCase()) : ['lora'],
             datasetFormat,
-            datasetSchema
+            datasetSchema,
+            // BL129: additive — the per-recipe PEFT mode + override-params pointers the
+            // tune-descriptor sync needs. The catalog build ignores these; only
+            // syncTuneDescriptors() reads them. `peft` maps LORA→'lora', anything else
+            // (incl. 'None'/full-rank)→'full' to key the descriptor variant.
+            peft: String(recipe.Peft || recipe.peft || 'lora').toLowerCase() === 'lora' ? 'lora' : 'full',
+            smtjOverrideParamsS3Uri: _normalizeS3Pointer(recipe.SmtjOverrideParamsS3Uri),
+            hpEksOverrideParamsS3Uri: _normalizeS3Pointer(recipe.HpEksOverrideParamsS3Uri)
         });
     }
 
@@ -181,7 +200,30 @@ function parseRecipes(hubContentDocument) {
 }
 
 /**
+ * Normalize an override-params pointer: the Hub serializes an absent pointer as the
+ * STRING "None" (seen live on MTRL's HpEksOverrideParamsS3Uri), so treat "None"/empty
+ * as null. Returns the s3:// URI or null.
+ * @param {*} value
+ * @returns {string|null}
+ */
+function _normalizeS3Pointer(value) {
+    if (typeof value !== 'string') return null;
+    const v = value.trim();
+    if (!v || v === 'None' || v === 'null') return null;
+    return v.startsWith('s3://') ? v : null;
+}
+
+/**
  * Get the default dataset schema for a technique.
+ *
+ * BL129: the RL arm (rlvr/rlaif/mtrl) previously returned `{prompt: array}` — a
+ * VERIFIED-WRONG guess. The managed-RL dataset contract is STRUCTURAL and now lives
+ * in the per-technique tune descriptor (`templates/code/tune.d/<technique>/
+ * manifest.json` → `dataset_contract`, verl 5-field parquet), consumed by the
+ * do/tune Gate's field-schema half — NOT a synced catalog guess. Only sft/dpo (the
+ * jsonl techniques whose catalog schema is still read by `do/tune`'s jsonl line-check
+ * via `_get_dataset_schema`) keep a default here. An RL technique falls through to {}
+ * (contract-absent) rather than a fabricated schema.
  * @param {string} technique
  * @returns {object}
  */
@@ -191,14 +233,11 @@ function getDefaultDatasetSchema(technique) {
         return { required: ['prompt', 'completion'], types: { prompt: 'string', completion: 'string' } };
     case 'dpo':
         return { required: ['prompt', 'chosen', 'rejected'], types: { prompt: 'string', chosen: 'string', rejected: 'string' } };
-    case 'rlaif':
-    case 'rlvr':
-    case 'mtrl':
-        // mtrl's reward lives in the agent (message-list prompt channel), same
-        // prompt-array dataset shape as the other RL techniques.
-        return { required: ['prompt'], types: { prompt: 'array' } };
     default:
-        return { required: ['prompt'], types: { prompt: 'string' } };
+        // BL129: RL techniques (rlvr/rlaif/mtrl) and any other technique carry NO
+        // guessed catalog schema — their dataset contract is structural, in the tune
+        // descriptor. Contract-absent {} rather than a fabricated {prompt:...}.
+        return {};
     }
 }
 
@@ -376,6 +415,221 @@ function writeCatalog(catalog, catalogPath) {
     writeFileSync(filePath, `${JSON.stringify(catalog, null, 2)  }\n`, 'utf8');
 }
 
+// ── BL129: tune-descriptor synced layer ─────────────────────────────────────────
+//
+// The SAME Hub traversal that builds the model catalog also populates each tune
+// descriptor's SYNCED layer (hyperparameters + _synced) from AWS's recipe
+// override-params objects. One pass, two outputs — the two catalogs cannot disagree
+// about which recipes exist. The STRUCTURAL layer (hand-authored) is preserved.
+
+/**
+ * Extract a semver from an override-params S3 key, e.g.
+ * `..._override_params_sm_jobs_v2.2.7.json` → "2.2.7". Returns null when absent.
+ * @param {string} uri
+ * @returns {string|null}
+ */
+function _versionFromOverrideParamsUri(uri) {
+    if (typeof uri !== 'string') return null;
+    const m = uri.match(/_v(\d+\.\d+\.\d+)\.json$/);
+    return m ? m[1] : null;
+}
+
+/**
+ * Map ONE AWS override-param entry onto the descriptor's canonical hyperparameter
+ * entry shape (see templates/code/tune.d/manifest.schema.json $defs/hyperparameter).
+ * Renames `control_type`→`control` and `visibility_tier`→`tier`; defaults `required`
+ * to false when the source omits it; carries default/min/max/step/enum/display_name/
+ * description/hint where present. Returns null for a value that is not an object.
+ * @param {object} knob - the override-param entry
+ * @returns {object|null}
+ */
+function _mapOverrideParamKnob(knob) {
+    if (!knob || typeof knob !== 'object') return null;
+    const entry = {
+        type: typeof knob.type === 'string' ? knob.type : 'string',
+        required: knob.required === true
+    };
+    if ('default' in knob) entry.default = knob.default;
+    for (const k of ['min', 'max', 'step']) {
+        if (typeof knob[k] === 'number') entry[k] = knob[k];
+    }
+    if (Array.isArray(knob.enum) && knob.enum.length) entry.enum = knob.enum;
+    if (typeof knob.control_type === 'string') entry.control = knob.control_type;
+    if (typeof knob.visibility_tier === 'string') entry.tier = knob.visibility_tier;
+    for (const k of ['display_name', 'description', 'hint']) {
+        if (typeof knob[k] === 'string') entry[k] = knob[k];
+    }
+    return entry;
+}
+
+/**
+ * Decide whether an override-param key is a surfaced HYPERPARAMETER (vs system/
+ * plumbing). Handles BOTH flavors:
+ *   - TAGGED (sft/dpo/rlvr/rlaif): the entry carries `category`; keep only
+ *     `category === 'hyperparameter'`.
+ *   - LEANER MTRL (no `category` on any entry): keep everything NOT in
+ *     MTRL_PLUMBING_DENYLIST.
+ * @param {string} name
+ * @param {object} knob
+ * @param {boolean} tagged - whether this override-params object uses the tagged flavor
+ * @returns {boolean}
+ */
+function _isSurfacedHyperparameter(name, knob, tagged) {
+    if (tagged) return knob && knob.category === 'hyperparameter';
+    return !MTRL_PLUMBING_DENYLIST.has(name);
+}
+
+/**
+ * Build the synced `hyperparameters` block from a parsed override-params object.
+ * @param {object} overrideParams - the override-params JSON (knob-name → entry)
+ * @returns {object} canonical hyperparameters map
+ */
+function buildHyperparametersBlock(overrideParams) {
+    const op = overrideParams && typeof overrideParams === 'object' ? overrideParams : {};
+    // TAGGED iff ANY entry carries a `category` field (the leaner MTRL flavor has none).
+    const tagged = Object.values(op).some(
+        v => v && typeof v === 'object' && typeof v.category === 'string'
+    );
+    const out = {};
+    for (const [name, knob] of Object.entries(op)) {
+        if (!_isSurfacedHyperparameter(name, knob, tagged)) continue;
+        const mapped = _mapOverrideParamKnob(knob);
+        if (mapped) out[name] = mapped;
+    }
+    return out;
+}
+
+/**
+ * Additive-merge the SYNCED layer into a descriptor's variant, PRESERVING every
+ * structural field (peft, artifact_kind, dataset_contract). Mutates `variant`.
+ * @param {object} variant - the descriptor variant object
+ * @param {object} syncedHyperparameters
+ * @param {object} syncedBlock - per-backend {smtj?, hp-eks?} provenance
+ */
+function mergeSyncedIntoVariant(variant, syncedHyperparameters, syncedBlock) {
+    variant.hyperparameters = syncedHyperparameters;
+    variant._synced = syncedBlock;
+}
+
+/**
+ * Sync the per-technique tune descriptors' SYNCED layer from the recipes discovered
+ * in the Hub traversal. For each (technique, variant) with an SMTJ override-params
+ * pointer, fetch + filter + map the knobs and additive-merge into
+ * tune.d/<technique>/manifest.json. Idempotent: a variant whose `_synced.smtj.version`
+ * already equals the recipe's version is skipped (no rewrite). The STRUCTURAL layer is
+ * never touched. Fetch failures leave the existing synced layer intact (never regress).
+ *
+ * @param {Array<{technique, peft, smtjOverrideParamsS3Uri, hpEksOverrideParamsS3Uri}>} recipes
+ *   — flattened across every discovered model (duplicates by technique+peft are fine;
+ *   last write wins, and the version-skip makes re-runs no-ops).
+ * @param {object} [opts]
+ * @param {(uri: string) => Promise<object|null>} [opts.fetchOverrideParams] - injectable
+ *   fetcher (default: S3 GetObject → parsed JSON). Injected in tests to stay offline.
+ * @param {string} [opts.tuneDir] - override the tune.d root (tests).
+ * @param {string} [opts.region]
+ * @returns {Promise<{synced: number, skipped: number, failed: number}>}
+ */
+export async function syncTuneDescriptors(recipes, opts = {}) {
+    const tuneDir = opts.tuneDir || TUNE_D;
+    const fetchOverrideParams = opts.fetchOverrideParams || _defaultFetchOverrideParams(opts.region);
+
+    let synced = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    // De-dupe recipes by technique+peft (many models advertise the same recipe; one
+    // fetch per distinct descriptor variant suffices). Prefer an entry WITH an SMTJ
+    // pointer over one without.
+    const byVariant = new Map();
+    for (const r of recipes || []) {
+        if (!r || !r.technique || !r.peft) continue;
+        const key = `${r.technique}/${r.peft}`;
+        const existing = byVariant.get(key);
+        if (!existing || (!existing.smtjOverrideParamsS3Uri && r.smtjOverrideParamsS3Uri)) {
+            byVariant.set(key, r);
+        }
+    }
+
+    for (const [key, recipe] of byVariant) {
+        const [technique, variantKey] = key.split('/');
+        const manifestPath = path.join(tuneDir, technique, 'manifest.json');
+        if (!existsSync(manifestPath)) continue; // no descriptor for this technique
+
+        const smtjUri = recipe.smtjOverrideParamsS3Uri;
+        if (!smtjUri) continue; // nothing to sync from
+
+        let manifest;
+        try {
+            manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+        } catch {
+            failed++;
+            continue;
+        }
+        const variant = manifest.variants && manifest.variants[variantKey];
+        if (!variant) continue; // descriptor doesn't declare this variant
+
+        const version = _versionFromOverrideParamsUri(smtjUri);
+        // Idempotent: skip when the recorded smtj version is unchanged.
+        if (version
+            && variant._synced && variant._synced.smtj
+            && variant._synced.smtj.version === version) {
+            skipped++;
+            continue;
+        }
+
+        let overrideParams;
+        try {
+            overrideParams = await fetchOverrideParams(smtjUri);
+        } catch {
+            overrideParams = null;
+        }
+        if (!overrideParams) {
+            // Fetch failed → leave the existing synced layer intact (never regress).
+            failed++;
+            continue;
+        }
+
+        const hyperparameters = buildHyperparametersBlock(overrideParams);
+        const syncedBlock = { smtj: { from: smtjUri, version: version || '0.0.0' } };
+        // hp-eks only when the pointer genuinely exists (MTRL's is null → omit).
+        if (recipe.hpEksOverrideParamsS3Uri) {
+            syncedBlock['hp-eks'] = {
+                from: recipe.hpEksOverrideParamsS3Uri,
+                version: _versionFromOverrideParamsUri(recipe.hpEksOverrideParamsS3Uri) || '0.0.0'
+            };
+        }
+
+        mergeSyncedIntoVariant(variant, hyperparameters, syncedBlock);
+        writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+        synced++;
+    }
+
+    return { synced, skipped, failed };
+}
+
+/**
+ * Default override-params fetcher: S3 GetObject → parsed JSON. Network-dependent; the
+ * injectable seam (opts.fetchOverrideParams) keeps the unit tests offline.
+ * @param {string} [region]
+ * @returns {(uri: string) => Promise<object|null>}
+ */
+function _defaultFetchOverrideParams(region) {
+    return async function fetchFromS3(uri) {
+        const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
+        const m = /^s3:\/\/([^/]+)\/(.+)$/.exec(uri);
+        if (!m) return null;
+        const [, bucket, key] = m;
+        const client = new S3Client({ region: region || process.env.AWS_REGION || 'us-west-2' });
+        const resp = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+        const body = await resp.Body.transformToString();
+        try {
+            return JSON.parse(body);
+        } catch {
+            return null;
+        }
+    };
+}
+
 /**
  * Sync model families from the SageMaker JumpStart Hub.
  * Orchestrates the full discovery → parse → merge → write flow.
@@ -396,6 +650,9 @@ export async function syncModelFamilies(options = {}) {
 
     const discovered = {};
     let totalQueried = 0;
+    // BL129: accumulate every parsed recipe (across all models) so the tune-descriptor
+    // sync runs in the SAME traversal as the catalog build — one pass, two outputs.
+    const allRecipes = [];
 
     for (const prefix of KNOWN_PREFIXES) {
         console.log(`  Querying Hub for prefix: ${prefix}...`);
@@ -409,6 +666,7 @@ export async function syncModelFamilies(options = {}) {
 
             if (recipes.length > 0) {
                 discovered[model.HubContentName] = buildCatalogEntry(model, detail, recipes);
+                allRecipes.push(...recipes);
             }
         }
     }
@@ -461,6 +719,20 @@ export async function syncModelFamilies(options = {}) {
     };
     writeCatalog(updatedCatalog, catalogPath);
 
+    // BL129: second output of the same traversal — populate each tune descriptor's
+    // SYNCED layer from the recipes' override-params. Opt-out via
+    // `options.syncDescriptors === false` (tests that only assert catalog behavior).
+    // The fetcher is injectable (`options.fetchOverrideParams`) so the default test
+    // gate stays offline.
+    let descriptorResult = { synced: 0, skipped: 0, failed: 0 };
+    if (options.syncDescriptors !== false) {
+        descriptorResult = await syncTuneDescriptors(allRecipes, {
+            fetchOverrideParams: options.fetchOverrideParams,
+            tuneDir: options.tuneDir,
+            region
+        });
+    }
+
     // Report summary
     console.log('');
     console.log('  📊 Sync Summary:');
@@ -472,8 +744,13 @@ export async function syncModelFamilies(options = {}) {
     if (goldenPathCount > 0) {
         console.log(`     Golden-path eligible: ${goldenPathCount}`);
     }
+    console.log(`     Tune descriptors synced: ${descriptorResult.synced} ` +
+        `(${descriptorResult.skipped} unchanged, ${descriptorResult.failed} failed)`);
 
-    return { added, updated, total, goldenPath: goldenPathCount };
+    return {
+        added, updated, total, goldenPath: goldenPathCount,
+        descriptors: descriptorResult
+    };
 }
 
 // Main guard for standalone execution

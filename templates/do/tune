@@ -999,6 +999,15 @@ _validate_dataset() {
                     exit 1
                 fi
                 echo "   Dataset is parquet (${sample_object##*/}); RL format check passed."
+                # BL129 — field-schema half of the Gate. The format half above only
+                # checks the file is parquet; now verify the ROW SCHEMA carries the
+                # verl fields the descriptor's dataset_contract requires (the SAME
+                # contract the register-side Producer wrote against), so a
+                # contract-violating parquet fails in sub-second preflight instead of
+                # deep in the GPU job. Techniques whose contract is unverified
+                # (mtrl-rollout → required_dataset_fields == []) are format-checked
+                # ONLY — the reader returns [] and the check is skipped.
+                _validate_rl_field_schema "${sample_object}" "${ARG_TECHNIQUE}"
                 return 0
                 ;;
         esac
@@ -1068,6 +1077,91 @@ _validate_dataset() {
         echo "   Stage HuggingFace datasets with: ./do/register dataset <name> --hf-id <org/name>"
         exit 1
     fi
+}
+
+# ── _validate_rl_field_schema() ───────────────────────────────────────────────
+# BL129 Gate field-schema half. Given a sampled PARQUET object and an RL technique,
+# verify the row schema carries the verl fields the technique's tune descriptor
+# requires (dataset_contract → required_dataset_fields). Fails fast (exit 1) naming
+# the first missing field. A technique whose contract is unverified
+# (required_dataset_fields == [], e.g. mtrl-rollout) is skipped — format-check only.
+# pipefail-safe: the descriptor read and the S3 sample read each guard their pipe.
+_validate_rl_field_schema() {
+    local sample_object="$1"
+    local technique="$2"
+    local reader="${SCRIPT_DIR}/lib/python/tune_manifest.py"
+
+    if [ ! -f "${reader}" ]; then
+        # No descriptor reader (older generated project) — skip field check, keep the
+        # format check that already passed. Non-fatal by design.
+        return 0
+    fi
+
+    # Required fields for this technique's dataset contract (JSON array). pipefail-safe:
+    # capture separately and default to [] on any error so a reader hiccup never blocks.
+    local required_json
+    required_json=$(python3 "${reader}" required_dataset_fields "${technique}" 2>/dev/null) || required_json="[]"
+    if [ -z "${required_json}" ] || [ "${required_json}" = "[]" ]; then
+        # Unverified / no field contract (e.g. mtrl) → format check only.
+        return 0
+    fi
+
+    # Download the sample object to a temp file (pipefail-safe: no pipe to SIGPIPE),
+    # then read its first-row column names with pyarrow and compare to the contract.
+    local tmp_parquet
+    tmp_parquet=$(mktemp -t mcc-rl-sample.XXXXXX.parquet) || {
+        echo "   ⚠️  Could not create a temp file for the RL field-schema check; skipping it."
+        return 0
+    }
+    # shellcheck disable=SC2064
+    trap "rm -f '${tmp_parquet}'" RETURN
+
+    if ! aws s3 cp "${sample_object}" "${tmp_parquet}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+        echo "   ⚠️  Could not download the sample object for the RL field-schema check; skipping it."
+        return 0
+    fi
+
+    local check_result
+    check_result=$(REQUIRED_JSON="${required_json}" PARQUET_PATH="${tmp_parquet}" python3 -c "
+import json, os, sys
+required = json.loads(os.environ['REQUIRED_JSON'])
+path = os.environ['PARQUET_PATH']
+try:
+    import pyarrow.parquet as pq
+except ImportError:
+    print(json.dumps({'skip': 'pyarrow not installed'})); sys.exit(0)
+try:
+    cols = set(pq.ParquetFile(path).schema_arrow.names)
+except Exception as e:  # noqa: BLE001 — surface as a non-fatal skip
+    print(json.dumps({'skip': f'could not read parquet schema: {e}'})); sys.exit(0)
+missing = [f for f in required if f not in cols]
+print(json.dumps({'missing': missing, 'present': sorted(cols)}))
+" 2>/dev/null) || check_result='{\"skip\":\"field check failed to run\"}'
+
+    local skip_reason
+    skip_reason=$(echo "${check_result}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('skip','') or '')" 2>/dev/null) || skip_reason=""
+    if [ -n "${skip_reason}" ]; then
+        echo "   ⚠️  RL field-schema check skipped (${skip_reason}); the training container will still validate."
+        return 0
+    fi
+
+    local missing
+    missing=$(echo "${check_result}" | python3 -c "import sys,json; print(','.join(json.load(sys.stdin).get('missing',[])))" 2>/dev/null) || missing=""
+    if [ -n "${missing}" ]; then
+        local present
+        present=$(echo "${check_result}" | python3 -c "import sys,json; print(', '.join(json.load(sys.stdin).get('present',[])))" 2>/dev/null) || present=""
+        echo "❌ ${technique} dataset is missing required verl field(s): ${missing}"
+        echo "   The managed RL trainer (verl RLHFDataset) requires the 5-field row schema:"
+        echo "   data_source, prompt (chat message list), ability, reward_model {style, ground_truth}, extra_info."
+        echo "   Found columns: ${present}"
+        echo ""
+        echo "   Re-register the dataset for this technique so the Producer emits the verl"
+        echo "   schema:  ./do/register dataset <name> --hf-id <org/name> --technique ${technique}"
+        exit 1
+    fi
+
+    echo "   RL field-schema check passed (verl 5-field contract satisfied)."
+    return 0
 }
 
 # ── _get_dataset_schema() ─────────────────────────────────────────────────────
