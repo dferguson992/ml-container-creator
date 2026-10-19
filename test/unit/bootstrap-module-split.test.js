@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * BL143 Group B — module split drift + behavior tests (offline).
+ * Bootstrap module split (eks / hyperpod) — drift + behavior tests (offline).
  *
  * Covers: the HyperPod preflights are owned by stack-presence (so `eks` runs none),
  * the denormalizer maps the new eks/hyperpod outputs with NO hyperpod-cluster compat
@@ -25,16 +25,18 @@ const RUNNER_PATH = resolve(__dirname, '../../infra/bootstrap-modules/module-run
 const RUNNER_SRC = readFileSync(RUNNER_PATH, 'utf8');
 const manifest = JSON.parse(readFileSync(MANIFEST_PATH, 'utf8'));
 
-describe('BL143 preflight ownership (eks runs no HyperPod preflights)', () => {
+describe('preflight ownership (eks runs no HyperPod preflights)', () => {
     const { CdkMultiStackModuleRunner } = require(RUNNER_PATH);
 
     it('provision() gates HyperPod preflights on stack ownership, not module name', () => {
         // The runner derives `ownsHyperPod` from the presence of the hyperpod stacks,
         // so renaming the module cannot silently re-enable/disable the preflights.
         assert.match(RUNNER_SRC, /ownsHyperPod\s*=\s*this\.stacks\.includes\('hyperpod-cluster'\)/);
-        // The two unconditional preflight calls are now guarded by ownsHyperPod.
+        // The preflight + post-deploy inference steps are guarded by ownsHyperPod.
+        // (BL161: the add-on install is now a CDK-owned eks.CfnAddon, so the post-deploy
+        // step is the kubectl patch + watcher verification, not an `aws eks create-addon`.)
         assert.match(RUNNER_SRC, /if \(ownsHyperPod\)\s*\{\s*\n\s*this\._ensureHyperPodServiceLinkedRole/);
-        assert.match(RUNNER_SRC, /if \(ownsHyperPod\)\s*\{\s*\n\s*await this\._installInferenceAddon/);
+        assert.match(RUNNER_SRC, /if \(ownsHyperPod\)\s*\{\s*\n\s*this\._postDeployInferenceOperator/);
     });
 
     it('an eks-only runner reports it does NOT own HyperPod stacks', () => {
@@ -52,7 +54,7 @@ describe('BL143 preflight ownership (eks runs no HyperPod preflights)', () => {
     });
 });
 
-describe('BL143 denormalizer: new eks/hyperpod keys, no compat alias', () => {
+describe('denormalizer: new eks/hyperpod keys, no compat alias', () => {
     // Load the handler module source to assert the denormalizer shape without
     // constructing the full handler (which pulls many deps). Behavioral assertion
     // via a minimal reimplementation would drift; instead assert the source contract.
@@ -79,7 +81,7 @@ describe('BL143 denormalizer: new eks/hyperpod keys, no compat alias', () => {
     });
 });
 
-describe('BL143 manifest ↔ denormalizer export agreement', () => {
+describe('manifest ↔ denormalizer export agreement', () => {
     const HANDLER_SRC = readFileSync(
         resolve(__dirname, '../../src/lib/bootstrap-command-handler.js'), 'utf8');
 
@@ -98,7 +100,7 @@ describe('BL143 manifest ↔ denormalizer export agreement', () => {
     });
 });
 
-describe('BL143 legacy-module removal (cutover)', () => {
+describe('legacy-module removal (cutover)', () => {
     const HANDLER_SRC = readFileSync(
         resolve(__dirname, '../../src/lib/bootstrap-command-handler.js'), 'utf8');
 
@@ -118,7 +120,7 @@ describe('BL143 legacy-module removal (cutover)', () => {
     });
 });
 
-describe('BL143 remove-module purges profile memory', () => {
+describe('remove-module purges profile memory', () => {
     const HANDLER_SRC = readFileSync(
         resolve(__dirname, '../../src/lib/bootstrap-command-handler.js'), 'utf8');
 

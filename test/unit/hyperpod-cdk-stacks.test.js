@@ -445,9 +445,25 @@ describe('HyperPod CDK Stack Files', () => {
             assert.ok(source.includes('autoDeleteObjects: false'));
         });
 
-        it('defers inference operator installation to the module runner', () => {
-            assert.ok(source.includes('_installInferenceAddon()'));
-            assert.doesNotMatch(source, /^\s*new eks\.CfnAddon\(/m);
+        it('declares the inference add-on as a CDK-owned eks.CfnAddon (BL161)', () => {
+            // BL161: the add-on moved from an out-of-band `aws eks create-addon`
+            // module-runner step into a CDK resource, mirroring the four sibling
+            // eks.CfnAddon declarations in eks-cluster-stack.ts. Source-analysis assertion
+            // (no cdk synth), consistent with how the sibling add-ons are tested.
+            assert.match(source, /new eks\.CfnAddon\(/);
+            assert.ok(
+                source.includes('addonName: \'amazon-sagemaker-hyperpod-inference\''),
+                'the CfnAddon must declare addonName amazon-sagemaker-hyperpod-inference'
+            );
+            assert.ok(
+                source.includes('resolveConflicts: \'OVERWRITE\''),
+                'the CfnAddon must resolve conflicts with OVERWRITE (like the sibling add-ons)'
+            );
+            // The imperative install hook must be GONE — the add-on is not CLI-installed.
+            assert.ok(
+                !source.includes('_installInferenceAddon'),
+                'the stack must no longer defer to the imperative _installInferenceAddon'
+            );
         });
 
         it('reads inference operator inputs from props or context', () => {
@@ -470,8 +486,33 @@ describe('HyperPod CDK Stack Files', () => {
             assert.ok(source.includes('kedaOperatorRoleArn'));
         });
 
-        it('does not declare the inference add-on as a CloudFormation resource', () => {
-            assert.doesNotMatch(source, /^\s*new eks\.CfnAddon\(/m);
+        it('builds the add-on config from stack inputs, preserving the jumpstart conditional', () => {
+            // R1/R3: the config blob the imperative path assembled now lives in the stack,
+            // sourced from props/context (no runtime SSM read).
+            assert.ok(source.includes('configurationValues: JSON.stringify('));
+            assert.ok(source.includes('executionRoleArn'));
+            assert.ok(source.includes('inferenceGateway: { enabled: false }'));
+            // The jumpstart role is included ONLY when present (empty would fail the
+            // IAM-ARN pattern validation) — the conditional must be preserved.
+            assert.ok(
+                /if \(jumpstartGatedRoleArn\) \{\s*inferenceConfig\.jumpstartGatedModelDownloadRoleArn/.test(source),
+                'jumpstartGatedModelDownloadRoleArn must be conditionally included only when present'
+            );
+        });
+
+        it('passes the TLS bucket name into the add-on config explicitly (naming-audit guard, R4)', () => {
+            // ADR-012 Q3 corollary drift guard: the mlcc-hyperpod-tls-<profile> bucket is
+            // referenced by its EXPLICIT name in the add-on configurationValues, NOT
+            // resolved by a sagemaker-/hyperpod- prefix convention. If a future change
+            // switched to prefix-based resolution, this assertion fails loudly.
+            assert.ok(
+                source.includes('const bucketName = `mlcc-hyperpod-tls-${profileName}`'),
+                'TLS bucket name must be mlcc-hyperpod-tls-<profile>'
+            );
+            assert.ok(
+                source.includes('tlsCertificateS3Bucket: bucketName'),
+                'the add-on config must pass the bucket name explicitly as tlsCertificateS3Bucket'
+            );
         });
 
         it('exports InferenceOperatorStatus as SSM param', () => {
@@ -602,17 +643,22 @@ describe('Module runner reconciles ALL adopted service roles (adopt-drift)', () 
         assert.ok(/watcher/i.test(body), 'must gate on the operator watcher status');
         assert.ok(!/--query "InferenceConfig"/.test(body),
             'must NOT gate on describe-cluster InferenceConfig (confirmed decoupled / red herring)');
-        // Must run on BOTH the fresh-install path AND the already-ACTIVE early-return path.
+        // BL161: the verifier runs as a post-deploy step (after the stack loop installs the
+        // CDK-owned add-on), via _postDeployInferenceOperator — not from the removed
+        // imperative _installInferenceAddon.
         assert.ok(
-            (source.match(/this\._ensureHyperPodClusterInferenceEnabled\(profile\)/g) || []).length >= 2,
-            'verifier must run on both the fresh-install and already-ACTIVE paths'
+            /_postDeployInferenceOperator\(profile\) \{[\s\S]*?this\._ensureHyperPodClusterInferenceEnabled\(profile\)/.test(source),
+            'the watcher verifier must run from the post-deploy step'
         );
     });
 
-    it('addon poll window covers the documented EnableClusterInference duration (>10 min)', () => {
+    it('watcher-verification poll window covers the documented enablement duration (>10 min)', () => {
+        // The read-only watcher check uses a 25-min window (recreate drains can push
+        // EnableClusterInference success past 15 min); it must not regress to the old
+        // too-short 10-min (600000) poll.
         assert.ok(
             !source.includes('const timeout = 600000;'),
-            'addon poll must not use the too-short 10-min (600000) timeout'
+            'watcher poll must not use the too-short 10-min (600000) timeout'
         );
     });
 
@@ -633,25 +679,25 @@ describe('Module runner reconciles ALL adopted service roles (adopt-drift)', () 
         );
     });
 
-    it('teardown deletes the out-of-band inference add-on (BL143)', () => {
-        // The inference add-on is created via `aws eks create-addon` (not CDK), so cdk
-        // destroy never removes it. Teardown must delete it, or it dangles with a stale
-        // hyperpodClusterArn and wedges a later recreate.
+    it('teardown removes the inference add-on via CDK destroy, not an out-of-band delete (BL161)', () => {
+        // BL161: the add-on is now a CDK-owned eks.CfnAddon in the inference-operator
+        // stack, so the normal reverse `cdk destroy` removes it with its stack. The old
+        // out-of-band `aws eks delete-addon` hook (and the stale-ARN wedge it papered over)
+        // must be GONE — create and destroy are now symmetric.
         assert.ok(
-            source.includes('_deleteInferenceAddon'),
-            'module-runner must define _deleteInferenceAddon'
+            !source.includes('_deleteInferenceAddon'),
+            'the imperative _deleteInferenceAddon hook must be removed (teardown is CDK-owned)'
         );
-        // It must be invoked from teardown, gated to the inference-operator-owning module.
         assert.ok(
-            /this\.stacks\.includes\('inference-operator'\)[\s\S]*?this\._deleteInferenceAddon\(profile\)/.test(source),
-            'teardown must call _deleteInferenceAddon when it owns the inference-operator stack'
+            !/aws eks delete-addon/.test(source),
+            'teardown must not issue an out-of-band aws eks delete-addon'
         );
-        // It must actually issue aws eks delete-addon for the inference addon.
-        const start = source.indexOf('_deleteInferenceAddon(profile) {');
-        const body = source.slice(start, start + 1600);
+        // The CDK side owns the add-on lifecycle: the inference-operator stack declares it.
+        const stackSource = readFileSync(INFERENCE_OPERATOR_STACK, 'utf8');
+        assert.match(stackSource, /new eks\.CfnAddon\(/);
         assert.ok(
-            body.includes('eks delete-addon') && body.includes('amazon-sagemaker-hyperpod-inference'),
-            '_deleteInferenceAddon must run aws eks delete-addon for amazon-sagemaker-hyperpod-inference'
+            stackSource.includes('addonName: \'amazon-sagemaker-hyperpod-inference\''),
+            'the inference-operator stack must declare the CDK-owned add-on'
         );
     });
 });

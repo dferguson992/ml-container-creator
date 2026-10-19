@@ -17,6 +17,9 @@ export interface MlccInferenceOperatorStackProps extends cdk.StackProps {
     hyperpodInferenceRoleArn?: string;
     albControllerRoleArn?: string;
     kedaOperatorRoleArn?: string;
+    // Optional: a dedicated role for JumpStart GATED model downloads. Included in the
+    // add-on config ONLY when present (empty would fail the IAM-ARN pattern validation).
+    jumpstartGatedModelDownloadRoleArn?: string;
 }
 
 /**
@@ -64,30 +67,99 @@ export class MlccInferenceOperatorStack extends cdk.Stack {
 
         // ─── TLS S3 Bucket (RemovalPolicy.RETAIN) ───────────────────────────
 
+        // NAMING AUDIT (BL161 R4 — ADR-012 Q3 corollary): the TLS bucket
+        // `mlcc-hyperpod-tls-<profile>` is MLCC-OWNED and safe to carry the `mlcc-`
+        // prefix. Nothing resolves it by a `sagemaker-`/`hyperpod-` prefix convention:
+        //   - MLCC passes the name EXPLICITLY below as the add-on's
+        //     `tlsCertificateS3Bucket` configurationValue (not discovered by prefix).
+        //   - IAM is granted by EXACT ARN (eks-cluster-stack.ts HyperPodInferenceTlsBucketAccess).
+        //   - The add-on's configurationSchema for `tlsCertificateS3Bucket` requires only
+        //     the substring `tls`, which `mlcc-hyperpod-tls-<profile>` satisfies.
+        // Census conclusion (BL161): every MLCC-chosen name in the eks + hyperpod
+        // bootstrap modules is either MLCC-fully-owned (passed explicitly / exact-ARN /
+        // live handle) or an AWS-canonical name (add-on names like
+        // amazon-sagemaker-hyperpod-inference; chart namespaces/SAs like
+        // hyperpod-inference-system / aws-load-balancer-controller) that already conforms.
+        // NO name is resolved by a `mlcc-` prefix convention, so no rename is needed.
         const bucketName = `mlcc-hyperpod-tls-${profileName}`;
-        let tlsBucket: s3.IBucket;
+        let newTlsBucket: s3.Bucket | undefined;
 
         if (props.adoptTlsBucket) {
-            tlsBucket = s3.Bucket.fromBucketName(this, 'TlsBucket', bucketName);
+            s3.Bucket.fromBucketName(this, 'TlsBucket', bucketName);
         } else {
-            const newBucket = new s3.Bucket(this, 'TlsBucket', {
+            newTlsBucket = new s3.Bucket(this, 'TlsBucket', {
                 bucketName,
                 removalPolicy: cdk.RemovalPolicy.RETAIN,
                 autoDeleteObjects: false,
                 encryption: s3.BucketEncryption.S3_MANAGED,
                 blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
             });
-            tlsBucket = newBucket;
         }
 
-        // ─── Inference Operator EKS Add-on ──────────────────────────────────
-        // NOTE: The inference operator addon is installed by the module-runner
-        // as a post-stack CLI step (not via CloudFormation) because its health
-        // check can exceed CloudFormation's timeout. The addon's controller
-        // calls EnableClusterInference which is an async SageMaker operation
-        // that can take 5-15+ minutes to complete. CloudFormation fails the
-        // resource if any pod is still initializing when it times out.
-        // See module-runner.cjs _installInferenceAddon().
+        // ─── Inference Operator EKS Add-on (CDK-owned — BL161) ──────────────
+        // The inference add-on is a CDK resource (not an out-of-band `aws eks
+        // create-addon` module-runner step), mirroring the four sibling
+        // `eks.CfnAddon`s in eks-cluster-stack.ts. This makes create AND destroy
+        // symmetric through the normal stack lifecycle — `cdk destroy` removes the
+        // add-on with its stack, eliminating the old stale-`hyperpodClusterArn`
+        // dangling-add-on wedge and the hand-rolled `_deleteInferenceAddon` hook.
+        //
+        // BL143 decoupling (R2): `AWS::EKS::Addon` completes when the add-on reaches
+        // ACTIVE, which is DECOUPLED from the slow async `EnableClusterInference`
+        // watcher enablement. The watcher verification stays a read-only, warn-not-block
+        // post-deploy module-runner step (_ensureHyperPodClusterInferenceEnabled) — it is
+        // not a CloudFormation concern and must not gate this stack.
+        //
+        // Build the config from stack props/context (R3) — the SAME blob the imperative
+        // path assembled, now declarative. No runtime SSM read.
+        const inferenceConfig: Record<string, unknown> = {
+            executionRoleArn: hyperpodInferenceRoleArn,
+            // The TLS bucket name is passed EXPLICITLY here (naming-audit guard, R4) —
+            // never resolved by a service prefix.
+            tlsCertificateS3Bucket: bucketName,
+            hyperpodClusterArn: hyperPodClusterArn,
+            // MLCC does NOT configure an Inference Gateway; the add-on defaults this ON,
+            // so set it OFF explicitly (matches the console Quick Install).
+            inferenceGateway: { enabled: false },
+            alb: {
+                enabled: true,
+                serviceAccount: { create: false, roleArn: albControllerRoleArn },
+            },
+            keda: {
+                enabled: true,
+                auth: { aws: { irsa: { enabled: true, roleArn: kedaOperatorRoleArn } } },
+            },
+        };
+        // Conditional: include jumpstartGatedModelDownloadRoleArn ONLY when present. The
+        // add-on schema types this as an IAM role ARN (pattern ^arn:aws:iam::...:role/.+$),
+        // so an empty string would FAIL configurationValues validation. MLCC does not
+        // provision one by default; the console Quick Install does.
+        const jumpstartGatedRoleArn = props.jumpstartGatedModelDownloadRoleArn
+            || this.node.tryGetContext('JumpstartGatedModelDownloadRoleArn')
+            || '';
+        if (jumpstartGatedRoleArn) {
+            inferenceConfig.jumpstartGatedModelDownloadRoleArn = jumpstartGatedRoleArn;
+        }
+
+        const inferenceAddon = new eks.CfnAddon(this, 'HyperPodInferenceAddon', {
+            clusterName: eksClusterName,
+            addonName: 'amazon-sagemaker-hyperpod-inference',
+            // OQ-2 (addonVersion): the four sibling add-ons PIN a version, and pinning is
+            // the repo default for reproducibility. The imperative path passed NO
+            // --addon-version (it resolved the account/region default), which is the
+            // known-working behavior; omitting here preserves exactly that resolution.
+            // FLAG: pin `addonVersion` to the value `aws eks describe-addon-versions
+            // --addon-name amazon-sagemaker-hyperpod-inference` reports once confirmed
+            // against a live account (the version is AWS-published and cannot be
+            // determined offline without fabricating a literal).
+            resolveConflicts: 'OVERWRITE',
+            configurationValues: JSON.stringify(inferenceConfig),
+        });
+        // The add-on consumes the TLS bucket; when MLCC creates it, ensure it exists
+        // first. (An adopted bucket already exists, so no dependency is needed.)
+        if (newTlsBucket) {
+            inferenceAddon.node.addDependency(newTlsBucket);
+        }
 
         // ─── SSM Exports ────────────────────────────────────────────────────
 

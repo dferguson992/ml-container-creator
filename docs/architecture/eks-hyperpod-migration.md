@@ -227,14 +227,55 @@ with a new ARN, but `_installInferenceAddon` early-returns when it sees the add-
 `ACTIVE` — so the add-on keeps its stale ARN and the operator tries to enable inference on
 the deleted cluster. (Compounds with the "watcher being deleted" transient — see below.)
 
-**Fix:** `teardown` now deletes the inference add-on (`_deleteInferenceAddon`) when the
-module owns the `inference-operator` stack — symmetric with its out-of-band creation,
-idempotent (missing add-on = success). Pre-fix clusters: delete it manually before
-re-adding:
+**Fix (BL143, superseded by BL161):** `teardown` deleted the inference add-on out-of-band,
+symmetric with its out-of-band creation. This was an imperative delete papering over an
+imperative create.
+
+**Resolution (BL161 — the add-on is now CDK-owned):** the inference add-on is a CDK
+resource — `new eks.CfnAddon(this, 'HyperPodInferenceAddon', …)` in
+`inference-operator-stack.ts`, mirroring the four sibling `eks.CfnAddon`s in
+`eks-cluster-stack.ts`. The normal stack loop materializes it on deploy, and the normal
+reverse `cdk destroy` removes it with its stack on teardown — create and destroy are now
+**symmetric**. The out-of-band `aws eks create-addon`/`delete-addon` hooks
+(`_installInferenceAddon` / `_deleteInferenceAddon`) and the stale-ACTIVE early-return that
+wedged a recreate are **gone**: a changed `hyperpodClusterArn` is now a normal stack update,
+not a wedge. The add-on `configurationValues` are assembled in the stack from props/context
+(no runtime SSM read), preserving the conditional `jumpstartGatedModelDownloadRoleArn`
+(included only when present). Two concerns stay as post-deploy module-runner steps because
+they are NOT CloudFormation resources: the read-only, warn-not-block cluster-inference
+watcher verification (`_ensureHyperPodClusterInferenceEnabled`) and the kubectl post-install
+patches (`_postInstallInferenceOperator`). This relies on the BL143 decoupling (below): the
+`AWS::EKS::Addon` completes at ACTIVE, independent of the slow async
+`EnableClusterInference` — a live `add-module hyperpod` confirm is owed before shipping, and
+the `addonVersion` should be pinned once confirmed against a live account.
+
+Pre-BL161 clusters with a dangling out-of-band add-on: delete it manually before re-adding:
 ```
 aws eks delete-addon --cluster-name mlcc-<profile>-eks \
   --addon-name amazon-sagemaker-hyperpod-inference --region <region>
 ```
+
+### Naming audit (BL161 R4 — ADR-012 Q3 corollary: no rename)
+
+ADR-012's Q3 corollary requires MLCC to conform to the AWS service's naming convention
+wherever the control plane resolves a resource by name/prefix, and to impose `mlcc-` naming
+only where MLCC **fully owns** the resource. The backlog flagged the TLS bucket as a
+suspect; the audit CONFIRMS it (and every other `mlcc-` name) is MLCC-owned — **no rename
+needed**:
+
+- The TLS bucket `mlcc-hyperpod-tls-<profile>` is passed EXPLICITLY as the add-on's
+  `tlsCertificateS3Bucket` configurationValue, granted IAM by EXACT ARN
+  (`HyperPodInferenceTlsBucketAccess` in `eks-cluster-stack.ts`), and the add-on's
+  `configurationSchema` for that field requires only the substring `tls` — so the `mlcc-`
+  prefix is schema-valid and NOT resolved by a `sagemaker-`/`hyperpod-` prefix convention.
+- Census conclusion: every MLCC-chosen name in the eks + hyperpod bootstrap modules is
+  either MLCC-fully-owned (passed explicitly / exact-ARN / live handle) or an AWS-canonical
+  name (add-on names like `amazon-sagemaker-hyperpod-inference`; chart namespaces/SAs like
+  `hyperpod-inference-system` / `aws-load-balancer-controller`) that already conforms. NO
+  name is resolved by a `mlcc-` prefix convention.
+- Guard: a source-analysis assertion in `test/unit/hyperpod-cdk-stacks.test.js` pins that
+  the add-on config references the TLS bucket name explicitly (not by prefix), so a future
+  switch to convention-based resolution fails loudly.
 
 !!! warning "Stuck inference watcher after repeated enable/disable"
     Cycling enable/disable/reinstall on one cluster (as happens during debugging) can leave
@@ -1096,6 +1137,38 @@ entry was granted to. Add a regression note; this fails for ANY operator whose s
   already uses the add-on path — stay there.
 
 ### Wave 4 backlog (structural, future — informed by steps 1–2 above)
+> **✅ UPDATE (2026-10-19, BL161 implemented — spec `v2-w4-05-bl161`).** The first two bullets
+> below are DONE; the third is deferred to BL162. Key caveats recorded for BL162:
+>
+> - **(a) DONE — add-on is a CDK-owned `eks.CfnAddon`.** The inference add-on is now
+>   `new eks.CfnAddon('HyperPodInferenceAddon', addonName: 'amazon-sagemaker-hyperpod-inference',
+>   resolveConflicts: OVERWRITE)` in `inference-operator-stack.ts` (config built from stack
+>   props, not an SSM read). The imperative `_installInferenceAddon`/`_deleteInferenceAddon`
+>   functions + their deploy/teardown hooks + the stale-`ACTIVE` early-return wedge are REMOVED;
+>   create/destroy are now symmetric through CloudFormation. The kubectl post-install patches +
+>   the read-only watcher verification (`_ensureHyperPodClusterInferenceEnabled`) remain as a
+>   post-deploy module-runner step (`_postDeployInferenceOperator`). `tsc` + lint + full test
+>   gate green. OWED a live `add-module hyperpod` confirm of two things: OQ-1 — that
+>   `AWS::EKS::Addon` ACTIVE is DECOUPLED from the slow async `EnableClusterInference` (so the CFN
+>   create does not time out); OQ-2 — pin `addonVersion` (currently OMITTED = resolves default,
+>   identical to the old imperative path) via `aws eks describe-addon-versions`.
+> - **(b) DONE — naming audit = confirm/document/guard, NO rename.** The TLS bucket
+>   `mlcc-hyperpod-tls-<profile>` is VERIFIED MLCC-owned: passed explicitly as the add-on's
+>   `tlsCertificateS3Bucket`, granted by exact ARN, and the add-on schema needs only the
+>   substring `tls` — nothing resolves it by a `sagemaker-`/`hyperpod-` PREFIX. The full census
+>   found ZERO convention-resolved `mlcc-` names. Documented in-code + guarded by a drift test.
+> - **(c) DEFERRED to BL162 — IRSA relocation + operator-recreate spike.**
+> - **⚠️ REACHABILITY CAVEAT (for BL162).** The hardened CfnAddon install lives in the
+>   `inference-operator` stack, which is welded to the DEPRECATED `hyperpod-cluster` provisioning
+>   stack inside the single `hyperpod` module (`stacks: [hyperpod-cluster, inference-operator]`).
+>   So it is only reachable via `add-module hyperpod --force` (plain `add-module hyperpod` refuses
+>   on `deprecated:true`); there is NO independent `add-module inference-operator`-only path. On
+>   the SUPPORTED route (console/CFT-provisioned cluster → `do/deploy --target hyperpod-eks`) the
+>   operator add-on is installed by AWS's provisioning, NOT by MLCC. BL162 must decide whether
+>   AWS's HP-native CFT installs the add-on itself (making MLCC's CfnAddon a bridge to retire) or
+>   whether to split `inference-operator` into its own non-deprecated module so the CfnAddon is
+>   reachable against a BYO cluster.
+
 - Move the inference add-on into **CDK ownership (`CfnAddon`)** so teardown/recreate stop
   needing the imperative `_deleteInferenceAddon` hack and the stale-ARN recreate wedge.
 - **Naming-convention alignment (Q3).** The operator derives the cluster ARN from the

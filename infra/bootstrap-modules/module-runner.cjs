@@ -847,11 +847,16 @@ class CdkMultiStackModuleRunner {
             Object.assign(allOutputs, outputs);
         }
 
-        // Post-deploy: install inference operator addon via CLI (not CloudFormation)
-        // to avoid CloudFormation timeout on the slow EnableClusterInference call.
+        // Post-deploy inference-operator steps (BL161). The add-on itself is now a
+        // CDK-owned eks.CfnAddon in the inference-operator stack (created/destroyed by
+        // CloudFormation, symmetric, no stale-ARN wedge). What REMAINS here are the two
+        // non-CloudFormation concerns that cannot live in the stack:
+        //   • the read-only, warn-not-block cluster-inference watcher verification
+        //     (_ensureHyperPodClusterInferenceEnabled — R2), and
+        //   • the kubectl post-install patches (_postInstallInferenceOperator — R3).
         // HyperPod-only (BL143 — the `eks` module has no inference operator).
         if (ownsHyperPod) {
-            await this._installInferenceAddon(profile);
+            this._postDeployInferenceOperator(profile);
         }
 
         console.log(`  ✅ All ${this.stacks.length} stacks deployed for ${this.name}`);
@@ -893,178 +898,47 @@ class CdkMultiStackModuleRunner {
     }
 
     /**
-     * Install the SageMaker HyperPod inference operator as an EKS addon via CLI.
-     * Done outside CloudFormation because the addon's controller calls
-     * EnableClusterInference (async SageMaker API) which can take 5-15+ minutes,
-     * exceeding CloudFormation's health check timeout.
-     * Idempotent: skips if addon already exists and is ACTIVE/DEGRADED.
+     * Post-deploy inference-operator steps (BL161).
+     *
+     * The inference add-on itself is now a CDK-owned `eks.CfnAddon` in the
+     * inference-operator stack — the normal stack loop materializes it, and
+     * `cdk destroy` removes it (symmetric, no stale-ARN wedge). What remains here are
+     * the two concerns that are NOT CloudFormation resources and so cannot live in the
+     * stack:
+     *   • the kubectl post-install patches (HYPERPOD_CLUSTER_ARN env + the conditional
+     *     gateway nodeSelector — R3), and
+     *   • the read-only, warn-not-block cluster-inference watcher verification (R2).
+     * Both run AFTER the stack loop (the add-on already exists by then). Neither gates
+     * the stack.
+     *
+     * Idempotent + best-effort: a missing HyperPod cluster ARN (e.g. a partial deploy)
+     * is logged and skipped rather than failing the deploy.
      * @param {object} profile
      */
-    async _installInferenceAddon(profile) {
+    _postDeployInferenceOperator(profile) {
         const awsFlags = (profile.awsProfile ? ` --profile ${profile.awsProfile}` : '');
-        const eksClusterName = `mlcc-${profile.profileName}-eks`;
-
-        // Check if addon already exists
-        try {
-            const result = execSync(
-                `aws eks describe-addon --cluster-name ${eksClusterName} --addon-name amazon-sagemaker-hyperpod-inference --region ${profile.awsRegion}${awsFlags} --query "addon.status" --output text`,
-                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-            );
-            const status = result.trim();
-            if (status === 'ACTIVE' || status === 'DEGRADED') {
-                console.log(`  ✅ Inference operator addon already installed (${status})`);
-                // Even when the add-on is already installed, VERIFY the cluster's inference
-                // capability actually enabled — the add-on being ACTIVE does NOT guarantee
-                // EnableClusterInference completed, and a cluster at InferenceConfig: null
-                // silently breaks every model deploy (BL143 finding). This re-check is
-                // idempotent and returns fast if already enabled.
-                this._ensureHyperPodClusterInferenceEnabled(profile);
-                return;
-            }
-            // If CREATE_FAILED, delete and recreate
-            if (status === 'CREATE_FAILED') {
-                console.log('  ♻️  Inference addon in CREATE_FAILED state — deleting for reinstall...');
-                execSync(
-                    `aws eks delete-addon --cluster-name ${eksClusterName} --addon-name amazon-sagemaker-hyperpod-inference --region ${profile.awsRegion}${awsFlags}`,
-                    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-                );
-                // Wait a bit for deletion
-                execSync('sleep 30', { stdio: 'pipe' });
-            }
-        } catch {
-            // Addon doesn't exist — proceed with creation
-        }
-
-        // Read context values for addon config
         const ssmPrefix = `/mlcc/${profile.profileName}/hyperpod`;
-        const getParam = (key) => {
-            try {
-                return execSync(
-                    `aws ssm get-parameter --name ${ssmPrefix}/${key} --region ${profile.awsRegion}${awsFlags} --query "Parameter.Value" --output text`,
-                    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-                ).trim();
-            } catch { return ''; }
-        };
-
-        const hyperpodClusterArn = getParam('HyperPodClusterArn')
-            || this._readSsmParamsForContext?.(profile)?.HyperPodClusterArn || '';
-        const hyperpodInferenceRoleArn = getParam('HyperpodInferenceRoleArn') || '';
-        const albControllerRoleArn = getParam('AlbControllerRoleArn') || '';
-        const kedaOperatorRoleArn = getParam('KedaOperatorRoleArn') || '';
-        // Optional: a dedicated role for JumpStart GATED model downloads. The console
-        // Quick Install sets this; MLCC does not provision one by default. Include it ONLY
-        // if a role ARN is present in SSM — the add-on schema types this as an IAM role ARN
-        // (pattern ^arn:aws:iam::...:role/.+$), so an empty string would FAIL validation.
-        const jumpstartGatedRoleArn = getParam('JumpstartGatedModelDownloadRoleArn') || '';
-        const tlsBucketName = `mlcc-hyperpod-tls-${profile.profileName}`;
+        let hyperpodClusterArn = '';
+        try {
+            hyperpodClusterArn = execSync(
+                `aws ssm get-parameter --name ${ssmPrefix}/HyperPodClusterArn --region ${profile.awsRegion}${awsFlags} --query "Parameter.Value" --output text`,
+                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+            ).trim();
+        } catch {
+            hyperpodClusterArn = '';
+        }
+        if (!hyperpodClusterArn || hyperpodClusterArn === 'None') {
+            hyperpodClusterArn = this._readSsmParamsForContext?.(profile)?.HyperPodClusterArn || '';
+        }
 
         if (!hyperpodClusterArn) {
-            console.log('  ⚠️  Skipping inference addon — HyperPod cluster ARN not found');
+            console.log('  ⚠️  Skipping inference operator post-install — HyperPod cluster ARN not found');
             return;
         }
 
-        // Mirror the SHAPE of the console HyperPod Quick Install's add-on config (BL143
-        // 2026-10-15 finding). The add-on configurationSchema requires only
-        // executionRoleArn + tlsCertificateS3Bucket, but several optional fields DEFAULT in
-        // ways that diverge from the working HP path and left MLCC's operator "pending /
-        // never fully deployed":
-        //   • inferenceGateway.enabled DEFAULTS TO true. MLCC does NOT configure an
-        //     Inference Gateway, so defaulting it ON leaves an enabled-but-unconfigured
-        //     gateway (the inference-gateway-controller) with unmet needs. The HP Quick
-        //     Install explicitly sets {enabled:false}; match it.
-        //   • keda.enabled / alb.enabled / keda IRSA enabled — HP sets these explicitly;
-        //     make them explicit here too rather than relying on nested-only inference.
-        //   • jumpstartGatedModelDownloadRoleArn — included only when provisioned (above).
-        const configObj = {
-            executionRoleArn: hyperpodInferenceRoleArn,
-            tlsCertificateS3Bucket: tlsBucketName,
-            hyperpodClusterArn: hyperpodClusterArn,
-            inferenceGateway: {
-                enabled: false,
-            },
-            alb: {
-                enabled: true,
-                serviceAccount: {
-                    create: true,
-                    roleArn: albControllerRoleArn,
-                },
-            },
-            keda: {
-                enabled: true,
-                auth: {
-                    aws: {
-                        irsa: {
-                            enabled: true,
-                            roleArn: kedaOperatorRoleArn,
-                        },
-                    },
-                },
-            },
-        };
-        if (jumpstartGatedRoleArn) {
-            configObj.jumpstartGatedModelDownloadRoleArn = jumpstartGatedRoleArn;
-        }
-        const configValues = JSON.stringify(configObj);
-
-        console.log('  📦 Installing inference operator addon...');
-        try {
-            execSync(
-                `aws eks create-addon --cluster-name ${eksClusterName} --addon-name amazon-sagemaker-hyperpod-inference --configuration-values '${configValues.replace(/'/g, "'\\''")}' --resolve-conflicts OVERWRITE --region ${profile.awsRegion}${awsFlags}`,
-                { encoding: 'utf8', stdio: 'inherit' }
-            );
-        } catch (err) {
-            console.log(`  ⚠️  Inference addon creation command failed: ${err.message.split('\n')[0]}`);
-            console.log('      The addon may still be initializing. Check status with:');
-            console.log(`      aws eks describe-addon --cluster-name ${eksClusterName} --addon-name amazon-sagemaker-hyperpod-inference --region ${profile.awsRegion}`);
-            return;
-        }
-
-        // Poll for addon to become ACTIVE. The addon's controller calls
-        // EnableClusterInference (async SageMaker op, documented 5-15+ min), so the
-        // window MUST cover that — a 10-min poll (the previous value) can give up WHILE
-        // enablement is still in flight, leaving the cluster at InferenceConfig: null.
-        // That silently breaks SageMaker-endpoint creation: pods + ALB come up, but the
-        // operator's SageMakerEndpointRegistration polls DescribeEndpoint forever because
-        // the cluster inference capability it registers against never materialized.
-        // (BL143 live-rehearsal finding.)
-        console.log('  ⏳ Waiting for inference operator to become active (up to 20 min)...');
-        const startTime = Date.now();
-        const timeout = 1200000; // 20 minutes — covers the documented 15+ min enablement
-        let addonActive = false;
-        while (Date.now() - startTime < timeout) {
-            try {
-                const result = execSync(
-                    `aws eks describe-addon --cluster-name ${eksClusterName} --addon-name amazon-sagemaker-hyperpod-inference --region ${profile.awsRegion}${awsFlags} --query "addon.status" --output text`,
-                    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-                );
-                const status = result.trim();
-                if (status === 'ACTIVE') {
-                    console.log('  ✅ Inference operator addon is ACTIVE');
-                    this._postInstallInferenceOperator(profile, hyperpodClusterArn);
-                    addonActive = true;
-                    break;
-                }
-                if (status === 'CREATE_FAILED') {
-                    console.log(`  ⚠️  Inference operator addon failed. Check pods in hyperpod-inference-system namespace.`);
-                    return;
-                }
-                // CREATING or DEGRADED — keep waiting
-            } catch {
-                // describe failed — keep trying
-            }
-            execSync('sleep 30', { stdio: 'pipe' });
-        }
-        if (!addonActive) {
-            console.log('  ⚠️  Inference operator addon did not reach ACTIVE within 20 minutes.');
-            console.log('      It may still be initializing. This is non-blocking for basic deploys.');
-            return;
-        }
-
-        // Addon is ACTIVE — but ACTIVE only means the EKS add-on installed. The SAGEMAKER
-        // endpoint-creation stage is gated on the CLUSTER being inference-enabled
-        // (describe-cluster → InferenceConfig != null). The add-on controller enables it
-        // asynchronously; verify it actually took effect, because without it a model
-        // deploy's pods + ALB succeed while the SageMaker endpoint is never created.
+        // The add-on is created by CDK; apply the kubectl fixups it needs, then verify
+        // the cluster-inference watcher reached Enabled (read-only, warn-not-block).
+        this._postInstallInferenceOperator(profile, hyperpodClusterArn);
         this._ensureHyperPodClusterInferenceEnabled(profile);
     }
 
@@ -1131,43 +1005,6 @@ class CdkMultiStackModuleRunner {
         console.log('      This is a non-blocking check. Inspect the operator directly:');
         console.log(`      kubectl logs -n ${ns} deployment/hyperpod-inference-controller-manager -c manager | grep -i watcher`);
         console.log(`      (describe-cluster InferenceConfig is NOT a reliable signal — it stays null even when enabled.)`);
-    }
-
-    /**
-     * Delete the inference EKS add-on during hyperpod teardown.
-     *
-     * The add-on is created out-of-band (aws eks create-addon in _installInferenceAddon),
-     * so it is NOT part of any CDK stack and `cdk destroy` does not remove it. Left behind,
-     * it dangles on the eks cluster carrying a STALE hyperpodClusterArn (the deleted
-     * HyperPod cluster). Since _installInferenceAddon early-returns on an already-ACTIVE
-     * add-on, a subsequent add-module hyperpod would reuse that stale config instead of
-     * re-pointing at the newly-created cluster — wedging the recreate. Deleting the add-on
-     * here keeps teardown symmetric with the out-of-band install so a recreate starts clean.
-     *
-     * Idempotent and best-effort: a missing add-on (ResourceNotFound) is success; any other
-     * error is logged with the manual command but does not fail teardown (the CDK stacks
-     * still need to come down).
-     */
-    _deleteInferenceAddon(profile) {
-        const awsFlags = profile.awsProfile ? ` --profile ${profile.awsProfile}` : '';
-        const eksClusterName = `mlcc-${profile.profileName}-eks`;
-        console.log('  🗑️  Deleting inference operator add-on (out-of-band; not in any CDK stack)...');
-        try {
-            execSync(
-                `aws eks delete-addon --cluster-name ${eksClusterName} --addon-name amazon-sagemaker-hyperpod-inference --region ${profile.awsRegion}${awsFlags}`,
-                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-            );
-            console.log('  ✅ Inference operator add-on deleted');
-        } catch (err) {
-            const msg = err.message || '';
-            if (/ResourceNotFound|No addon|not found/i.test(msg)) {
-                console.log('  ✅ Inference operator add-on already absent');
-                return;
-            }
-            console.log(`  ⚠️  Could not delete inference add-on: ${msg.split('\n')[0]}`);
-            console.log('     Delete it manually before re-adding hyperpod (it carries a stale cluster ARN):');
-            console.log(`     aws eks delete-addon --cluster-name ${eksClusterName} --addon-name amazon-sagemaker-hyperpod-inference --region ${profile.awsRegion}`);
-        }
     }
 
     /**
@@ -2008,18 +1845,11 @@ class CdkMultiStackModuleRunner {
     async teardown(profile, opts = {}) {
         const reversed = [...this.stacks].reverse();
 
-        // The inference EKS add-on is installed OUT-OF-BAND (aws eks create-addon in
-        // _installInferenceAddon), so it is NOT in any CDK stack and `cdk destroy` below
-        // never removes it. If left behind, it dangles on the eks cluster with a STALE
-        // hyperpodClusterArn pointing at the now-deleted HyperPod cluster — and because
-        // _installInferenceAddon early-returns when the add-on is already ACTIVE, a later
-        // add-module hyperpod would reuse that stale config instead of pointing at the new
-        // cluster, wedging the recreate. So delete the add-on here, symmetric with its
-        // out-of-band creation. (BL143 live-rehearsal finding.) Only when this module owns
-        // the inference-operator stack.
-        if (this.stacks.includes('inference-operator')) {
-            this._deleteInferenceAddon(profile);
-        }
+        // BL161: the inference EKS add-on is now a CDK-owned `eks.CfnAddon` in the
+        // inference-operator stack, so the normal reverse `cdk destroy` below removes it
+        // with its stack. No out-of-band delete hook is needed — the old
+        // stale-`hyperpodClusterArn` dangling-add-on wedge (and the imperative delete
+        // hack that papered over it) are gone; create and destroy are now symmetric.
 
         console.log(`  🗑️  Destroying ${this.name} module (${this.stacks.length} stacks, reverse order)...`);
 
