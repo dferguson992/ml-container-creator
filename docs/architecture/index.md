@@ -74,3 +74,5 @@ See the ADR log:
   injection.
 - [ADR-011](../adr/ADR-011-tune-technique-descriptor.md) — per-technique tune
   descriptor / single source of truth (v2.0 Wave 3, BL129).
+- [ADR-012](../adr/ADR-012-consume-dont-provision-clusters.md) — consume-don't-provision
+  for EKS / HyperPod clusters (v2.0 Wave 4; the BYO-cluster contract posture).

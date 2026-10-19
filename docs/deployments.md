@@ -142,12 +142,24 @@ hardcoded per model.
 |---|---|---|
 | `EKS_INFERENCE_ROLE_ARN` | IAM role ARN the pod's ServiceAccount is annotated with (IRSA), so `code/serve` can `aws s3 sync` an S3-staged model. Required when `MODEL_SOURCE=s3`. | — (SA annotated only if set) |
 | `HP_MODEL_HOSTPATH` | Base path of a pre-mounted node-local NVMe volume (e.g. the DLAMI instance-store at `/opt/dlami/nvme`). When set, the model volume is a `hostPath` at `<base>/<project>` instead of an `emptyDir` on the node root. Use for models too large for the node's EBS root (the driver otherwise evicts the pod under DiskPressure). | unset → bounded `emptyDir` on node root |
-| `HP_EPHEMERAL_STORAGE` | `ephemeral-storage` request/limit for the `emptyDir` model path (ignored on the `hostPath` path, which does not draw from it). | `HP_GPU_COUNT × 20Gi` |
+| `EKS_MODEL_MOUNT` | Select a CSI mount for the model volume: `s3` (read-only stream from the staged S3 prefix via the Mountpoint-S3 CSI driver — no local download), `ebs`, or `fsx` (download the model onto a larger CSI volume). Emits a namespaced PVC; the backing PV/StorageClass is cluster-provided (see the contract above). Wrapper engines only (vLLM/SGLang/TensorRT-LLM). | unset → emptyDir/hostPath path |
+| `EKS_STORAGE_CLASS` | StorageClass the `ebs`/`fsx` PVC references (ignored for `s3`, which binds a static PV). | cluster default StorageClass |
+| `HP_EPHEMERAL_STORAGE` | `ephemeral-storage` request/limit for the `emptyDir` model path (ignored on the `hostPath` and CSI-mount paths, which do not draw from it). Also the PVC size request on the `ebs`/`fsx` path. | `HP_GPU_COUNT × 20Gi` |
 | `HP_SHM_SIZE` | Size of the RAM-backed `/dev/shm` the Deployment mounts for NCCL. Multi-GPU tensor-parallel models need more than the Kubernetes default of 64Mi, or NCCL fails to initialize. | `HP_GPU_COUNT × 8Gi` |
 
-The serving container reads its model from `/opt/ml/model` regardless of which
-volume backs it, and derives tensor-parallel degree from `HP_GPU_COUNT`
-(overridable per engine, e.g. `VLLM_TENSOR_PARALLEL_SIZE`).
+The four storage modes are mutually exclusive, selected by one precedence:
+`HP_MODEL_HOSTPATH` (hostPath NVMe) > `EKS_MODEL_MOUNT` (`s3` stream / `ebs`·`fsx`
+PVC) > the default bounded `emptyDir` on the node root. The serving container
+reads its model from `/opt/ml/model` regardless of which volume backs it, and
+derives tensor-parallel degree from `HP_GPU_COUNT` (overridable per engine, e.g.
+`VLLM_TENSOR_PARALLEL_SIZE`).
+
+Before applying anything, `do/deploy --target eks` also runs a deploy-time
+**ephemeral-storage fail-fast** on the default `emptyDir` path: if the largest
+GPU node's allocatable root volume cannot fit the model footprint
+(`HP_EPHEMERAL_STORAGE`, else `HP_GPU_COUNT × 20Gi`), it fails fast (exit `4`)
+with the remediations above, instead of letting the pod schedule and then hit a
+silent kubelet eviction loop. An unreadable node list warns and proceeds.
 
 !!! note "Engine-specific pass-through"
     Arbitrary engine flags are set via the engine's env-var prefix in `do/config`
@@ -155,6 +167,34 @@ volume backs it, and derives tensor-parallel degree from `HP_GPU_COUNT`
     the server verbatim (ADR-010 Tier-2 pass-through). Note: `mcc regenerate`
     currently preserves only the vars it knows about — re-add any hand-set
     `<PREFIX>*` engine knobs after a regenerate.
+
+#### Vanilla-EKS cluster contract
+
+The plain `eks` target follows a **consume-don't-provision** posture
+([ADR-012](adr/ADR-012-consume-dont-provision-clusters.md)): MLCC deploys its own
+workload objects (the Deployment, Service, ConfigMap, and the namespaced
+`mlcc-eks-inference-sa` ServiceAccount) but it does **not** provision cluster
+infrastructure. Instead, before applying anything, `do/deploy --target eks` runs a
+read-only **cluster-contract preflight** that detects + validates the
+cluster-provided capabilities this deploy needs and **fails fast** (exit code `4`)
+with a remediation when one is missing. A bring-your-own (BYO) cluster that
+satisfies the contract is a first-class path; the optional `eks` bootstrap module
+is convenience, not a requirement.
+
+The preflight checks these Contract Elements. Each is conditional — it only runs
+when the deploy actually needs it:
+
+| Contract Element | When it applies | Cluster must provide | If missing |
+|---|---|---|---|
+| **Pod identity** | `MODEL_SOURCE=s3` (an S3-staged model — the pod downloads it) | A resolvable inference role (`EKS_INFERENCE_ROLE_ARN`) **and** pod identity via **either** IRSA (an associated IAM OIDC provider) **or** EKS Pod Identity (the agent add-on + an association for `mlcc-eks-inference-sa`) | Fail fast with the `eksctl`/OIDC/Pod-Identity remediation |
+| **CSI driver** | `EKS_MODEL_MOUNT` is set (`s3`/`ebs`/`fsx`) | The matching CSI driver installed: `s3.csi.aws.com`, `ebs.csi.aws.com`, or `fsx.csi.aws.com` | Fail fast naming the driver + its add-on/Helm install |
+| **Volume backing** | `EKS_MODEL_MOUNT` is set | The volume the namespaced PVC binds: for `s3`, a **static `PersistentVolume`** on `s3.csi.aws.com` whose bucket + prefix match the staged path; for `ebs`/`fsx`, the target `StorageClass` (`EKS_STORAGE_CLASS`, else the cluster default) | Fail fast with a "pre-create this PV/StorageClass" remediation |
+
+MLCC emits **only the namespaced PVC** for a mount, never the cluster-scoped PV or
+StorageClass — those are infrastructure the cluster provides. An S3 static PV is
+specific to one bucket + prefix, so a BYO operator pre-creates one per staged
+dataset. The preflight is strictly read-only (`describe`/`get`/`list`); the only
+write a plain-EKS deploy performs is its own ServiceAccount.
 
 ## Deploy-time workflow
 
