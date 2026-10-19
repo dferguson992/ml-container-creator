@@ -2,22 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * BL155 — vanilla-EKS large-model storage modes (render side).
+ * Vanilla-EKS large-model storage modes (render side).
  *
- * BL155 adds two storage modes to the plain-EKS Deployment alongside the shipped
+ * The plain-EKS Deployment supports two large-model storage modes alongside the shipped
  * emptyDir (default) and hostPath-NVMe modes: a PVC mount (EBS/FSx CSI,
  * download-to-a-bigger-disk) and an S3-CSI read-only stream — both selected by
  * EKS_MODEL_MOUNT and backed by a NAMESPACED PersistentVolumeClaim
  * (ModelPvc.yaml.ejs). consume-don't-provision (ADR-012): MLCC emits ONLY the
  * PVC; the PV (s3 static) / StorageClass (ebs|fsx) is cluster-provided and
- * validated by the BL156 contract preflight.
+ * validated by the cluster-contract preflight.
  *
  * These tests render Deployment.yaml.ejs + ModelPvc.yaml.ejs via the SHIPPED
  * renderer (the same do/deploy.d/eks invokes), then resolve ${VAR} placeholders
- * with the driver's envsubst shim. kubectl is never invoked. Mirrors the
- * bl103/bl111 eks render-assertion pattern.
- *
- * Feature: v2-w4-02-bl155
+ * with the driver's envsubst shim. kubectl is never invoked. Mirrors the existing
+ * eks render-assertion test pattern.
  */
 
 import { describe, it } from 'mocha';
@@ -84,9 +82,9 @@ function modelStoreVolume(deploymentYaml) {
     return vols.find((v) => v.name === 'model-store');
 }
 
-describe('BL155: vanilla-EKS storage modes (render)', () => {
+describe('vanilla-EKS storage modes (render)', () => {
 
-    describe('Feature: v2-w4-02-bl155, one storage mode by precedence', () => {
+    describe('one storage mode by precedence', () => {
         it('each mode emits EXACTLY ONE model-store volume of the expected kind', () => {
             for (const mode of MODES) {
                 const v = modelStoreVolume(render('Deployment', modeEnv(mode)));
@@ -119,7 +117,7 @@ describe('BL155: vanilla-EKS storage modes (render)', () => {
         });
     });
 
-    describe('Feature: v2-w4-02-bl155, ephemeral-storage only on emptyDir', () => {
+    describe('ephemeral-storage only on emptyDir', () => {
         it('ephemeral-storage request/limit present IFF emptyDir', () => {
             for (const mode of MODES) {
                 const doc = yaml.load(render('Deployment', modeEnv(mode)));
@@ -134,7 +132,7 @@ describe('BL155: vanilla-EKS storage modes (render)', () => {
         });
     });
 
-    describe('Feature: v2-w4-02-bl155, dshm preserved across all modes', () => {
+    describe('dshm preserved across all modes', () => {
         it('every mode keeps the RAM-backed /dev/shm (dshm) mount', () => {
             for (const mode of MODES) {
                 const doc = yaml.load(render('Deployment', modeEnv(mode)));
@@ -148,7 +146,7 @@ describe('BL155: vanilla-EKS storage modes (render)', () => {
         });
     });
 
-    describe('Feature: v2-w4-02-bl155, PVC emission (OQ-2 — PVC only, never PV/StorageClass)', () => {
+    describe('PVC emission (OQ-2 — PVC only, never PV/StorageClass)', () => {
         it('EKS_MODEL_MOUNT unset → ModelPvc renders nothing (no kind)', () => {
             const out = render('ModelPvc', {});
             assert.ok(!/^kind:/m.test(out), 'no PVC on the emptyDir/hostPath path');
@@ -190,7 +188,7 @@ describe('BL155: vanilla-EKS storage modes (render)', () => {
         });
     });
 
-    describe('Feature: v2-w4-02-bl155, download-path invariants (Req 2.3 / 3.3)', () => {
+    describe('download-path invariants (Req 2.3 / 3.3)', () => {
         it('all modes still mount the model at the BYOC path /opt/ml/model', () => {
             for (const mode of MODES) {
                 const doc = yaml.load(render('Deployment', modeEnv(mode)));
@@ -209,7 +207,7 @@ describe('BL155: vanilla-EKS storage modes (render)', () => {
         });
     });
 
-    describe('Feature: v2-w4-02-bl155, no-regression (emptyDir + hostPath unchanged)', () => {
+    describe('no-regression (emptyDir + hostPath unchanged)', () => {
         it('emptyDir still requests ephemeral-storage and uses a bounded emptyDir', () => {
             const doc = yaml.load(render('Deployment', modeEnv('emptyDir')));
             const spec = doc.spec.template.spec;

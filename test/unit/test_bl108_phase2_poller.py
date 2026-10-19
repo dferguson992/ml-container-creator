@@ -322,7 +322,12 @@ class TestBenchmarkWriterUnchanged:
     # to allow a hyphen in the family segment so Blackwell Ultra instance types
     # (ml.p6-b300.48xlarge) validate. That is a deliberate, reviewed writer change
     # unrelated to BL108, so the pin is updated to the reviewed state.
-    _EXPECTED_SHA256 = "06ffb4a09ed079e29a85e6202bdb6b51960db413104378302c2ad1bd7fb2ed01"
+    #
+    # Re-pinned (plain-EKS benchmark parity): added a plain-`eks` branch to the
+    # _collect_gpu_signals metrics_source provenance derivation so an eks run with
+    # engine signals is labeled 'engine_metrics_only' (like hyperpod-eks) instead of
+    # falling through to 'none'. Deliberate, spec-mandated writer change; pin updated.
+    _EXPECTED_SHA256 = "7dc107228273493c0beaaf466df7e33c3153271dcb32d179504c4e80129f7887"
 
     def test_writer_hash_unchanged(self):
         with open(_WRITER_PATH, "rb") as f:

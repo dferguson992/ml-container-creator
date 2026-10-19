@@ -1,15 +1,15 @@
 # Benchmarking
 
-Measure LLM endpoint performance using SageMaker AI Benchmarking (NVIDIA AIPerf). The `do/benchmark` script creates a workload configuration, launches a benchmark job, polls for completion, and displays results — all in one command.
+Measure LLM endpoint performance using NVIDIA AIPerf. On the SageMaker-endpoint targets (`realtime-inference` / `hyperpod-eks`) `do/benchmark` drives the SageMaker AI Benchmarking service, which runs AIPerf server-side. On the plain `eks` target it runs the SAME tool — AIPerf — locally against the port-forwarded pod (see [Plain EKS](#plain-eks-local-aiperf)). Either way the `do/benchmark` script resolves a workload configuration, runs the load, and displays results — all in one command.
 
 ## Prerequisites
 
 | Requirement | Details |
 |---|---|
-| Endpoint status | Must be `InService` (run `./do/deploy` first) |
+| Endpoint status | Must be `InService` (run `./do/deploy` first). Not applicable to `eks`, which has no SageMaker endpoint — it port-forwards the serving pod instead. |
 | Architecture | Transformers or Diffusors only (HTTP and Triton not supported) |
-| Deployment target | `realtime-inference` and `hyperpod-eks` (HyperPod EKS requires `ENDPOINT_NAME` written by `do/deploy` — set automatically after successful deployment) |
-| Python dependencies | Installed automatically via `npm install` (see `requirements.txt`) |
+| Deployment target | `realtime-inference` and `hyperpod-eks` (HyperPod EKS requires `ENDPOINT_NAME` written by `do/deploy` — set automatically after successful deployment). `eks` runs local AIPerf against the pod and needs `pip install aiperf` (see [Plain EKS](#plain-eks-local-aiperf)). |
+| Python dependencies | Installed automatically via `npm install` (see `requirements.txt`). The `eks` path additionally needs `aiperf` (`pip install aiperf`). |
 | AWS credentials | Must be configured for the deployment region |
 | Bootstrap | Recommended — provides the IAM role with benchmarking permissions and S3 bucket for results |
 
@@ -309,6 +309,66 @@ underlying compute outside of the standard `CreateEndpointConfig` path — so th
 These columns are `NULL` for benchmark runs on pre-v1.7 tables and for endpoints where
 neither phase collected data. Run `mcc bootstrap update` to migrate an existing Athena
 table — the CDK stack update adds the columns via Glue `UpdateTable` (idempotent).
+
+---
+
+## Plain EKS (local AIPerf)
+
+The plain `eks` target has no SageMaker endpoint, so it cannot call the SageMaker AI
+Benchmarking service. Instead it runs the SAME load generator that service runs —
+NVIDIA **AIPerf** — **locally** against the port-forwarded serving pod, and emits the
+same per-request `profile_export.jsonl`. Because the artifacts are byte-compatible, the
+concurrency sweep, aggregator, `.benchmark_writer.py`, analytics verbs, Athena upload,
+and Phase-2 GPU metrics all work unchanged — `eks` benchmarks are directly comparable to
+`realtime-inference` / `hyperpod-eks` runs. This works against the wrapper engines (vLLM /
+SGLang / TensorRT-LLM), whose pods serve the OpenAI `/v1/chat/completions` route AIPerf
+drives.
+
+**Prerequisite.** Install AIPerf into the active Python env the `do/` scripts use:
+
+```bash
+pip install aiperf
+```
+
+If `aiperf` is not on `PATH`, `do/benchmark` **fails loud** with this guidance rather
+than silently degrading — there is no fallback to a blank request loop.
+
+**Same flags as the other targets.** `eks` honors `--workload`, `--dataset`, and the
+`BENCHMARK_CONCURRENCY_LEVELS` sweep exactly as the SageMaker-endpoint targets:
+
+```bash
+# named workload profile (multi-level sweep), GPU/engine metrics on
+HP_BENCHMARK_METRICS_ENABLED=true ./do/benchmark --workload multi-turn-chat
+# bring-your-own dataset (resolved from the registry, downloaded, replayed)
+./do/benchmark --dataset my-traffic@v2
+```
+
+The serving port is derived from the engine manifest (`serve.d/<engine>/manifest.json`),
+not hardcoded. BYOD datasets are resolved with the same `resolve-dataset` helper the
+service path uses, downloaded client-side, and replayed one request per JSONL line
+(`--input-file`); synthetic token-length means are omitted (mutually exclusive, same rule
+as the service path).
+
+**Same Athena table + analytics.** Results are written through the shared
+`.benchmark_writer.py` with `deployment_target=eks`, so they land in the SAME benchmark
+results table. The read-only analytics verbs work on `eks` runs identically:
+
+```bash
+./do/benchmark --list              # all runs across configs/targets
+./do/benchmark --compare-baseline  # latest run vs best historical for this config
+./do/benchmark --peak              # best historical record for this config
+```
+
+`--recommend` shows recommendations on `eks`, but `--recommend --apply` is **not**
+supported — it would write `do/ic/default.conf`, a realtime-inference Inference-Component
+artifact that does not apply to a plain-EKS Deployment. On `eks` it prints the
+recommendations and a clear message to edit `do/config` / the eks manifest by hand.
+
+**GPU & engine metrics (opt-in).** Set `HP_BENCHMARK_METRICS_ENABLED=true` to scrape the
+engine's Prometheus `/metrics` during the run and merge the GPU-efficiency columns into
+the Athena record. The Phase-2 poller resolves the cluster via `aws eks
+update-kubeconfig` for a plain-EKS cluster (not the HyperPod `describe-cluster` API), and
+an `eks` run with engine signals is labeled `engine_metrics_only` in `metrics_source`.
 
 ---
 

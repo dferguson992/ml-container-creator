@@ -131,6 +131,29 @@ export function serveEngineRuntimeVarsUnion(serveDir = SERVE_D) {
     return [...vars].sort();
 }
 
+/**
+ * The set of serve-engine environment-variable PREFIXES (e.g. `['SGLANG_',
+ * 'VLLM_']`), DERIVED from every serve engine's manifest `env_var_prefix`.
+ *
+ * This is the single source the eks deploy's unbounded Tier-2 pass-through keys
+ * on (`deploy.d/eks`: forward any `<prefix>*` engine var). `mcc regenerate` uses
+ * it (BL158) to PRESERVE those same prefix-matched vars across a re-render, so a
+ * user-set advanced engine knob is not silently dropped — deriving the prefixes
+ * here rather than hardcoding `VLLM_`/`SGLANG_` keeps the two sides in agreement
+ * and covers any new engine with a manifest prefix automatically (ADR-008).
+ *
+ * @param {string} [serveDir] - Optional serve.d root override (tests).
+ * @returns {string[]} Sorted, de-duplicated engine prefixes (non-empty only).
+ */
+export function serveEnginePrefixes(serveDir = SERVE_D) {
+    const prefixes = new Set();
+    for (const engine of listServeEngines(serveDir)) {
+        const prefix = readEnvVarPrefix(engine, serveDir);
+        if (prefix) prefixes.add(prefix);
+    }
+    return [...prefixes].sort();
+}
+
 // ── Capability versioning (BL129) ──────────────────────────────────────────────
 //
 // Node/generation-time mirror of the version logic in

@@ -121,13 +121,57 @@ HyperPod EKS cluster used as plain EKS.
 Because there is no SageMaker endpoint, verbs that operate on the serving pod
 directly work via a `kubectl` port-forward (same mechanism as `hyperpod-eks`):
 
-- **Supported:** `do/deploy`, `do/test eks`, `do/benchmark` (direct pod
-  port-forward), `do/adapter` (vLLM LoRA hot-load), `do/logs`, `do/status`,
-  `do/clean eks`.
+- **Supported:** `do/deploy`, `do/test eks`, `do/benchmark` (local AIPerf via pod
+  port-forward — see below), `do/adapter` (vLLM LoRA hot-load), `do/logs`,
+  `do/status`, `do/clean eks`.
 - **Not applicable:** `do/optimize` (SageMaker AI Recommendations need a SageMaker
   endpoint), `do/add-ic` (Inference Components are real-time-only), `do/ci` (the CI
   harness is SageMaker-managed-inference specific). These print a clear message and
   exit with code `3`.
+
+#### Benchmarking plain EKS (local AIPerf)
+
+`do/benchmark` on `eks` has the SAME capability as the SageMaker-endpoint targets
+(`realtime-inference` / `hyperpod-eks`) — workload profiles, the concurrency
+sweep, BYOD datasets, TTFT/ITL/throughput, and the same Athena persistence. Since
+`eks` has no SageMaker endpoint to drive the managed benchmarking service, it runs
+the SAME tool that service runs — NVIDIA **AIPerf** — **locally** against the
+port-forwarded pod and emits the same per-request `profile_export.jsonl` the rest
+of the pipeline consumes. This works against the wrapper engines (vLLM / SGLang /
+TensorRT-LLM), whose pods serve the OpenAI `/v1/chat/completions` route AIPerf
+drives.
+
+- **Prerequisite:** install AIPerf into the active Python env the `do/` scripts
+  use: `pip install aiperf`. If it is missing, `do/benchmark` **fails loud** with
+  install guidance rather than silently degrading.
+- **Same flags as the other targets:** `./do/benchmark --workload <name>` selects a
+  profile from the workload catalog; `--dataset <name>[@ver]` replays a registered
+  dataset (resolved, downloaded client-side, and replayed as `--input-file`);
+  `BENCHMARK_CONCURRENCY_LEVELS` runs the multi-level sweep (one row per level). The
+  serving port is derived from the engine manifest (`serve.d/<engine>/manifest.json`),
+  not hardcoded.
+- **Same Athena table:** results are written through the shared `.benchmark_writer.py`
+  with `deployment_target=eks`, so they land in the SAME benchmark results table and
+  the read-only analytics verbs — `--compare-baseline`, `--peak`, `--list` — operate
+  on eks runs identically. `--recommend` shows recommendations, but `--recommend
+  --apply` is **not** supported on eks (it would write `do/ic/default.conf`, a
+  realtime-inference Inference-Component artifact that does not apply to a plain-EKS
+  Deployment); it degrades with a clear message.
+- **GPU/engine metrics (opt-in):** set `HP_BENCHMARK_METRICS_ENABLED=true` to scrape
+  the engine's `/metrics` during the run and merge the GPU-efficiency columns into
+  the Athena record (same Phase-2 poller as `hyperpod-eks`, resolved via `aws eks
+  update-kubeconfig` for a plain-EKS cluster).
+
+```bash
+# install the local load generator once
+pip install aiperf
+# a multi-level sweep with a named workload, GPU metrics on
+HP_BENCHMARK_METRICS_ENABLED=true ./do/benchmark --workload multi-turn-chat
+# a BYOD replay
+./do/benchmark --dataset my-traffic@v2
+# read-only analytics (Athena)
+./do/benchmark --list
+```
 
 #### Large models and multi-GPU on plain EKS
 
@@ -164,9 +208,11 @@ silent kubelet eviction loop. An unreadable node list warns and proceeds.
 !!! note "Engine-specific pass-through"
     Arbitrary engine flags are set via the engine's env-var prefix in `do/config`
     (e.g. `SGLANG_MEM_FRACTION_STATIC`, `SGLANG_TRUST_REMOTE_CODE`) and forwarded to
-    the server verbatim (ADR-010 Tier-2 pass-through). Note: `mcc regenerate`
-    currently preserves only the vars it knows about — re-add any hand-set
-    `<PREFIX>*` engine knobs after a regenerate.
+    the server verbatim (ADR-010 Tier-2 pass-through). `mcc regenerate` preserves any
+    var that starts with a serve engine's prefix (`VLLM_`, `SGLANG_`, …), so hand-set
+    advanced engine knobs survive a regenerate — the one exception is the
+    speculative-decoding components (reassembled from the `HP_SPECULATIVE_*` vars,
+    which are themselves preserved).
 
 #### Vanilla-EKS cluster contract
 

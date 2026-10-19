@@ -108,17 +108,29 @@ except Exception:
     # Resolve kubeconfig for the cluster. The exec credential (aws eks get-token)
     # must run with the correct AWS profile, only available after do/config is
     # sourced — so always run update-kubeconfig rather than reusing a stale file.
-    local _kubeconfig="${HOME}/.kube/hyperpod-${HP_CLUSTER_NAME:-}"
-    local _eks_arn _eks_name
-    _eks_arn=$(aws sagemaker describe-cluster \
-        --cluster-name "${HP_CLUSTER_NAME:-}" \
-        --region "${AWS_REGION}" \
-        --query "Orchestrator.Eks.ClusterArn" \
-        --output text 2>/dev/null) || return 0
-    [ -z "${_eks_arn}" ] || [ "${_eks_arn}" = "None" ] && return 0
-    _eks_name=$(echo "${_eks_arn}" | awk -F'/' '{print $NF}')
+    local _kubeconfig _eks_name
     local _profile_arg=""
     [ -n "${AWS_PROFILE:-}" ] && _profile_arg="--profile ${AWS_PROFILE}"
+    if [ "${DEPLOYMENT_TARGET:-}" = "eks" ]; then
+        # Plain EKS (BL157/R5): the cluster is a native EKS cluster, NOT a HyperPod
+        # cluster — resolve it directly via `aws eks update-kubeconfig` on
+        # HP_CLUSTER_NAME (mirror the eks run's kubeconfig block), not the HyperPod
+        # `aws sagemaker describe-cluster` API. Skip silently when unset.
+        [ -z "${HP_CLUSTER_NAME:-}" ] && return 0
+        _eks_name="${HP_CLUSTER_NAME}"
+        _kubeconfig="${HOME}/.kube/eks-${HP_CLUSTER_NAME}"
+    else
+        # HyperPod EKS: the EKS cluster ARN is resolved from the HyperPod cluster.
+        _kubeconfig="${HOME}/.kube/hyperpod-${HP_CLUSTER_NAME:-}"
+        local _eks_arn
+        _eks_arn=$(aws sagemaker describe-cluster \
+            --cluster-name "${HP_CLUSTER_NAME:-}" \
+            --region "${AWS_REGION}" \
+            --query "Orchestrator.Eks.ClusterArn" \
+            --output text 2>/dev/null) || return 0
+        [ -z "${_eks_arn}" ] || [ "${_eks_arn}" = "None" ] && return 0
+        _eks_name=$(echo "${_eks_arn}" | awk -F'/' '{print $NF}')
+    fi
     aws eks update-kubeconfig \
         --name "${_eks_name}" \
         --region "${AWS_REGION}" \
@@ -232,26 +244,59 @@ if [ "${DEPLOYMENT_TARGET:-}" = "batch-transform" ]; then
         "Switch target: do/deploy --target realtime-inference"
 fi
 
-# ── Plain EKS benchmark: direct pod port-forward (BL103, Requirement 6) ────────
+# ── Plain EKS benchmark: local AIPerf via pod port-forward (BL103 + BL157) ─────
 # The eks target has no SageMaker endpoint, so the SageMaker AI Benchmarking
-# service path below does not apply. Instead, reach the serving pod directly via
-# `kubectl port-forward pod/<pod> 8080` (same mechanism hyperpod-eks uses for its
-# pod-facing paths) and drive a local latency/throughput measurement. If the
-# port-forward cannot be established, fail fast with a clear error (Req 6.2).
-if [ "${DEPLOYMENT_TARGET:-}" = "eks" ]; then
+# service path below (create-ai-workload-config / create-ai-benchmark-job) does
+# not apply. BL157 gives eks the SAME capability as the SageMaker-endpoint path
+# (workload profiles, concurrency sweep, BYOD, TTFT/ITL/throughput, Athena) by
+# running NVIDIA AIPerf LOCALLY against the port-forwarded pod and emitting the
+# SAME profile_export.jsonl the pipeline already consumes.
+#
+# The actual run is DEFERRED until after the flag parser, the workload-catalog
+# read, the dataset resolver, and the multi-level sweep setup, so eks honors
+# --workload / --dataset / BENCHMARK_CONCURRENCY_LEVELS exactly as the other
+# targets (R1). _run_eks_aiperf_benchmark (defined below) is invoked at that
+# single-level execution point; the port-forward + fail-fast (BL103 edge 6.1/6.2)
+# and endpoint derivation (R4) live inside it.
+
+# ── _run_eks_aiperf_benchmark() — the local-AIPerf eks path (BL157) ───────────
+# Invoked once per concurrency level (the sweep sets _BENCHMARK_SINGLE_LEVEL=1)
+# AFTER flags/workload/dataset are resolved. Preserves the BL103 invariants:
+# reaches the pod via `kubectl port-forward` and fails fast with a clear error.
+# Endpoint port is DERIVED from serve.d/<engine>/manifest.json (R4), not the old
+# hardcoded :8080/ping. Produces ${JOB_DIR}/output/profile_export.jsonl + the
+# /tmp marker so the shared sweep/aggregator/writer consume it unchanged.
+_run_eks_aiperf_benchmark() {
+    [ "${DEPLOYMENT_TARGET:-}" = "eks" ] || return 0
+    local _sd
+    _sd="$(dirname "${BASH_SOURCE[0]}")"
     HP_NAMESPACE="${HP_NAMESPACE:-default}"
-    _profile_arg=""
+    local _profile_arg=""
     [ -n "${_PROFILE_awsProfile:-${AWS_PROFILE:-}}" ] && _profile_arg="--profile ${_PROFILE_awsProfile:-${AWS_PROFILE}}"
 
-    echo "📊 Plain EKS benchmark (direct pod port-forward)"
+    echo "📊 Plain EKS benchmark (local AIPerf via pod port-forward)"
     echo "   Project: ${PROJECT_NAME}"
     echo "   Namespace: ${HP_NAMESPACE}"
     echo "   Model server: ${MODEL_SERVER}"
+    echo "   Concurrency: ${BENCHMARK_CONCURRENCY}"
+
+    # ── AIPerf availability (R6, OQ-2): fail loud, never silently degrade. ────
+    # AIPerf (`pip install aiperf`) is the SAME load generator SageMaker managed
+    # benchmarking runs server-side; here it runs locally in the project venv.
+    if ! command -v aiperf >/dev/null 2>&1; then
+        echo "❌ do/benchmark: AIPerf is not installed."
+        echo "   The eks benchmark path drives NVIDIA AIPerf locally against the"
+        echo "   port-forwarded pod. Install it into the active Python env:"
+        echo "     pip install aiperf"
+        echo "   (The same venv do/ scripts use — see 'mcc hey init'.)"
+        exit 1
+    fi
 
     # Kubeconfig update is gated on HP_CLUSTER_NAME (as in deploy/test).
     if [ -n "${HP_CLUSTER_NAME:-}" ]; then
-        KUBECONFIG_PATH="${HOME}/.kube/eks-${HP_CLUSTER_NAME}"
-        _eks_name="${HP_CLUSTER_NAME}"
+        local KUBECONFIG_PATH="${HOME}/.kube/eks-${HP_CLUSTER_NAME}"
+        local _eks_name="${HP_CLUSTER_NAME}"
+        local _eks_arn
         _eks_arn=$(aws sagemaker describe-cluster \
             --cluster-name "${HP_CLUSTER_NAME}" \
             --region "${AWS_REGION}" \
@@ -274,6 +319,7 @@ if [ "${DEPLOYMENT_TARGET:-}" = "eks" ]; then
     fi
 
     # Resolve the running serving pod by label.
+    local _EKS_POD
     _EKS_POD=$(kubectl get pods -n "${HP_NAMESPACE}" \
         -l "app=${PROJECT_NAME}" \
         --field-selector=status.phase=Running \
@@ -285,82 +331,132 @@ if [ "${DEPLOYMENT_TARGET:-}" = "eks" ]; then
         exit 1
     fi
 
-    _EKS_LOCAL_PORT="${HP_BENCHMARK_PORT:-18080}"
-    echo "🔌 Port-forwarding pod/${_EKS_POD}:8080 to localhost:${_EKS_LOCAL_PORT}..."
-    kubectl port-forward "pod/${_EKS_POD}" "${_EKS_LOCAL_PORT}:8080" \
+    # Derive the pod's serving port from the engine manifest (R4, ADR-008),
+    # replacing the stub's hardcoded :8080. Falls back to 8080 only when the
+    # manifest declares no port.
+    local _EKS_REMOTE_PORT
+    _EKS_REMOTE_PORT=$(python3 "${_sd}/lib/python/eks_aiperf.py" serving-port "${MODEL_SERVER}" 2>/dev/null) || _EKS_REMOTE_PORT=8080
+    [ -z "${_EKS_REMOTE_PORT}" ] && _EKS_REMOTE_PORT=8080
+
+    local _EKS_LOCAL_PORT="${HP_BENCHMARK_PORT:-18080}"
+    echo "🔌 Port-forwarding pod/${_EKS_POD}:${_EKS_REMOTE_PORT} to localhost:${_EKS_LOCAL_PORT}..."
+    kubectl port-forward "pod/${_EKS_POD}" "${_EKS_LOCAL_PORT}:${_EKS_REMOTE_PORT}" \
         -n "${HP_NAMESPACE}" >/dev/null 2>&1 &
-    _EKS_PF_PID=$!
+    local _EKS_PF_PID=$!
     sleep 3
     trap "kill ${_EKS_PF_PID} 2>/dev/null || true" EXIT
 
-    # Fail fast on port-forward failure (Requirement 6.2).
+    # Fail fast on port-forward failure (Requirement 6.2, BL103 edge 6.1/6.2).
     if ! kill -0 "${_EKS_PF_PID}" 2>/dev/null; then
         echo "❌ do/benchmark: port-forward to pod/${_EKS_POD} failed."
         echo "   The serving pod could not be reached via kubectl port-forward."
         echo "   Check: kubectl get pods -n ${HP_NAMESPACE} -l app=${PROJECT_NAME}"
         exit 1
     fi
-    if ! curl -s -o /dev/null -m 10 "http://localhost:${_EKS_LOCAL_PORT}/ping"; then
-        echo "❌ do/benchmark: port-forward established but /ping did not respond."
-        echo "   The serving pod is not ready to accept traffic."
+
+    # Per-run output dir mirrors the SageMaker path's benchmarks/<job>/output/
+    # layout so the multi-level sweep + aggregator find the jsonl unchanged.
+    local _EKS_JOB_DIR="${SCRIPT_DIR}/../benchmarks/${BENCHMARK_JOB_NAME}"
+    local _EKS_ARTIFACT_DIR="${_EKS_JOB_DIR}/aiperf"
+    local _EKS_OUTPUT_JSONL="${_EKS_JOB_DIR}/output/profile_export.jsonl"
+    mkdir -p "${_EKS_ARTIFACT_DIR}" "${_EKS_JOB_DIR}/output"
+
+    # Build the `aiperf profile` invocation from the resolved config (the SAME
+    # workload-spec parameterization SageMaker managed benchmarking uses). The
+    # served-model + flag map are DERIVED in eks_aiperf.py (no hardcoding, R3/R4).
+    local _EKS_AIPERF_CMD=()
+    while IFS= read -r _tok; do
+        _EKS_AIPERF_CMD+=("${_tok}")
+    done < <(BENCHMARK_DATASET_LOCAL_FILE="${BENCHMARK_DATASET_LOCAL_FILE:-}" \
+        python3 "${_sd}/lib/python/eks_aiperf.py" build-command \
+        --local-port "${_EKS_LOCAL_PORT}" --artifact-dir "${_EKS_ARTIFACT_DIR}")
+
+    if [ ${#_EKS_AIPERF_CMD[@]} -eq 0 ]; then
+        echo "❌ do/benchmark: failed to build the aiperf invocation."
         kill "${_EKS_PF_PID}" 2>/dev/null || true
         exit 1
     fi
-    echo "✅ Port-forward established — pod is reachable at http://localhost:${_EKS_LOCAL_PORT}"
 
-    # Drive a lightweight local latency/throughput measurement against the pod.
-    _EKS_BENCH_URL="http://localhost:${_EKS_LOCAL_PORT}"
-    if [ "${FRAMEWORK}" = "diffusors" ]; then
-        _EKS_BENCH_PATH="/v1/images/generations"
-        _EKS_BENCH_PAYLOAD='{"prompt": "A white cat", "n": 1, "size": "512x512"}'
-    elif [ "${MODEL_SERVER}" = "vllm" ] || [ "${MODEL_SERVER}" = "sglang" ]; then
-        _EKS_MODEL="${MODEL_NAME}"
-        if [[ "${MODEL_NAME}" == s3://* ]] || [[ "${MODEL_NAME}" == /opt/ml/* ]]; then
-            _EKS_MODEL="/opt/ml/model"
-        fi
-        _EKS_BENCH_PATH="/invocations"
-        _EKS_BENCH_PAYLOAD='{"model": "'"${_EKS_MODEL}"'", "messages": [{"role": "user", "content": "What is machine learning?"}], "max_tokens": 64, "temperature": 0.7}'
-    else
-        _EKS_BENCH_PATH="/invocations"
-        _EKS_BENCH_PAYLOAD='{"inputs": "What is machine learning?", "parameters": {"max_new_tokens": 64}}'
-    fi
+    # Phase 2 GPU metrics (R5, BL108): opt-in poller scrapes the engine /metrics
+    # for the whole run. Self-skips unless HP_BENCHMARK_METRICS_ENABLED=true and
+    # the engine manifest declares a metrics_endpoint; always non-fatal. It uses
+    # its OWN port-forward (independent of the one above) and the eks-aware
+    # kubeconfig branch added to _phase2_start_poller.
+    _phase2_start_poller || true
 
-    _EKS_ITERS="${BENCHMARK_REQUEST_COUNT:-20}"
     echo ""
-    echo "🏁 Running ${_EKS_ITERS} sequential requests against ${_EKS_BENCH_URL}${_EKS_BENCH_PATH}..."
-    _EKS_OK=0
-    _EKS_TOTAL_MS=0
-    for _i in $(seq 1 "${_EKS_ITERS}"); do
-        _t=$(curl -s -o /dev/null -m 120 -w "%{http_code} %{time_total}" -X POST \
-            "${_EKS_BENCH_URL}${_EKS_BENCH_PATH}" \
-            -H "Content-Type: application/json" \
-            -d "${_EKS_BENCH_PAYLOAD}" 2>/dev/null) || _t="000 0"
-        _code=$(echo "${_t}" | awk '{print $1}')
-        _secs=$(echo "${_t}" | awk '{print $2}')
-        if [ "${_code}" = "200" ]; then
-            _EKS_OK=$((_EKS_OK + 1))
-            _ms=$(awk "BEGIN{printf \"%d\", ${_secs} * 1000}")
-            _EKS_TOTAL_MS=$((_EKS_TOTAL_MS + _ms))
-        fi
-    done
+    echo "🏁 Running AIPerf (concurrency ${BENCHMARK_CONCURRENCY}) against localhost:${_EKS_LOCAL_PORT}/v1/chat/completions..."
+    local _EKS_RC=0
+    "${_EKS_AIPERF_CMD[@]}" || _EKS_RC=$?
+
+    # Stop Phase 2 (aggregates + writes .last_gpu_metrics.json) before tearing
+    # down the load port-forward.
+    _phase2_stop_poller || true
 
     kill "${_EKS_PF_PID}" 2>/dev/null || true
     trap - EXIT
 
-    echo ""
-    echo "📊 Plain EKS benchmark results:"
-    echo "   Requests:   ${_EKS_ITERS}"
-    echo "   Successful: ${_EKS_OK}"
-    if [ "${_EKS_OK}" -gt 0 ]; then
-        _EKS_AVG_MS=$((_EKS_TOTAL_MS / _EKS_OK))
-        echo "   Avg latency: ${_EKS_AVG_MS} ms"
+    if [ ${_EKS_RC} -ne 0 ]; then
+        echo "❌ do/benchmark: aiperf profile exited ${_EKS_RC}."
+        echo "   The port-forwarded pod may not serve the OpenAI /v1/chat/completions route,"
+        echo "   or the tokenizer (${HF_MODEL_ID:-${MODEL_NAME}}) could not be loaded."
+        exit "${_EKS_RC}"
     fi
+
+    # Relocate AIPerf's profile_export.jsonl to the aggregator's expected path
+    # (no change to the shared aggregator — findings §2/§5, R2).
+    if ! python3 "${_sd}/lib/python/eks_aiperf.py" relocate \
+        "${_EKS_ARTIFACT_DIR}" "${_EKS_OUTPUT_JSONL}" >/dev/null; then
+        echo "❌ do/benchmark: aiperf produced no profile_export.jsonl under ${_EKS_ARTIFACT_DIR}."
+        exit 1
+    fi
+    echo "✅ AIPerf run complete — results at ${_EKS_OUTPUT_JSONL}"
+
+    # Marker for the multi-level parent to find this results dir (findings §2).
+    echo "${_EKS_JOB_DIR}" > "/tmp/.mlcc-benchmark-latest-${PROJECT_NAME}" 2>/dev/null || true
+
+    # ── Persist to Athena via the SHARED writer (R2, R7) ──────────────────────
+    # Skip when a child of multi-level mode — the parent aggregates one row per
+    # level (same contract as the SageMaker path). --deployment-target eks is
+    # already carried through by the writer.
+    if [ -n "${CI_BENCHMARK_RESULTS_BUCKET:-}" ] && [ -z "${_BENCHMARK_SINGLE_LEVEL:-}" ]; then
+        echo ""
+        echo "📊 Persisting benchmark results to Athena..."
+        local _EKS_GPU_METRICS_FILE="${SCRIPT_DIR}/../benchmarks/.last_gpu_metrics.json"
+        [ -f "${_EKS_GPU_METRICS_FILE}" ] || _EKS_GPU_METRICS_FILE=""
+        # deployment_target=eks is carried through the --config-file (do/config
+        # has DEPLOYMENT_TARGET=eks); the writer maps it to the Athena column and
+        # derives the eks metrics_source branch from it (findings §5, R5).
+        # Instance type: eks has no SageMaker endpoint, so use BENCHMARK_INSTANCE_TYPE
+        # / HP_INSTANCE_TYPE / INSTANCE_TYPE (same key resolve-serving-config.sh uses).
+        local _EKS_INSTANCE_TYPE="${BENCHMARK_INSTANCE_TYPE:-${HP_INSTANCE_TYPE:-${INSTANCE_TYPE:-}}}"
+        if python3 "${_sd}/.benchmark_writer.py" write \
+            --results-file "${_EKS_OUTPUT_JSONL}" \
+            --config-file "${_sd}/config" \
+            --project-name "${PROJECT_NAME}" \
+            --workload "${BENCHMARK_WORKLOAD:-manual}" \
+            --concurrency "${BENCHMARK_CONCURRENCY}" \
+            --bucket "${CI_BENCHMARK_RESULTS_BUCKET}" \
+            --region "${AWS_REGION:-${REGION}}" \
+            ${_EKS_INSTANCE_TYPE:+--instance-type "${_EKS_INSTANCE_TYPE}"} \
+            ${ADAPTER_ARG:+--adapter-name "${ADAPTER_ARG}"} \
+            ${BENCHMARK_JOB_NAME:+--benchmark-job-name "${BENCHMARK_JOB_NAME}"} \
+            ${BENCHMARK_RUN_NAME:+--run-name "${BENCHMARK_RUN_NAME}"} \
+            ${_EKS_GPU_METRICS_FILE:+--gpu-metrics-file "${_EKS_GPU_METRICS_FILE}"}; then
+            echo "✅ Benchmark results persisted to S3"
+        else
+            echo "⚠️  Failed to persist benchmark results to Athena (non-fatal)"
+            echo "   Results remain available locally in: benchmarks/${BENCHMARK_JOB_NAME}/"
+        fi
+    fi
+
     echo ""
-    echo "ℹ️  The eks target serves plain Kubernetes objects with no SageMaker"
-    echo "   endpoint, so the SageMaker AI Benchmarking service is not used."
-    echo "   For richer engine metrics, set HP_BENCHMARK_METRICS_ENABLED=true."
-    exit 0
-fi
+    echo "ℹ️  eks runs NVIDIA AIPerf locally against the port-forwarded pod; no"
+    echo "   SageMaker AI Benchmarking service is used. Results land in the SAME"
+    echo "   Athena table as the SageMaker-endpoint targets."
+    echo "   For engine/GPU metrics, set HP_BENCHMARK_METRICS_ENABLED=true."
+    return 0
+}
 
 # ── Parse flags ───────────────────────────────────────────────────────────────
 CLEAN_AFTER=false
@@ -1208,6 +1304,21 @@ _recommend_update_or_append() {
     fi
 
     if [ "${ARG_RECOMMEND_APPLY}" = "true" ]; then
+        # OQ-3 (BL157): read-only recommendations work on eks (Athena is
+        # target-agnostic), but --apply writes do/ic/default.conf — a
+        # realtime-inference Inference-Component artifact that does NOT apply to
+        # a plain-eks Kubernetes Deployment. Degrade with a clear message rather
+        # than mis-applying realtime-only config to an eks project.
+        if [ "${DEPLOYMENT_TARGET:-}" = "eks" ]; then
+            _display_recommendations "${_RECOMMEND_RESULT}"
+            echo ""
+            echo "ℹ️  --apply does not apply on the eks target (read-only recommendations only)."
+            echo "   --apply writes do/ic/default.conf (an Inference-Component artifact used by"
+            echo "   realtime-inference); plain eks serves a Kubernetes Deployment with no IC."
+            echo "   The recommendations above still hold — edit do/config / your eks manifest"
+            echo "   manually, then ./do/deploy --target eks."
+            exit 0
+        fi
         _display_recommendations "${_RECOMMEND_RESULT}"
         _apply_recommendations "${_RECOMMEND_RESULT}"
         exit 0
@@ -1759,6 +1870,44 @@ print(f'Combined {n_metrics} concurrency level results')
         fi
         exit 0
     fi
+fi
+
+# ── Plain EKS single-level run: local AIPerf (BL157) ──────────────────────────
+# Reached AFTER the flag parser, workload catalog, dataset resolver, and the
+# multi-level sweep setup — so eks honors --workload / --dataset / concurrency
+# exactly as the SageMaker-endpoint targets (R1). A multi-level parent run is
+# handled entirely by the sweep above (which re-invokes self per level with
+# _BENCHMARK_SINGLE_LEVEL=1 and exits); only a single-level run (child or an
+# eks invocation with no levels) reaches here. The SageMaker service path below
+# (endpoint preflight, create-ai-*, poll, S3 download) is skipped for eks (R6).
+if [ "${DEPLOYMENT_TARGET:-}" = "eks" ]; then
+    # Derive a unique per-run job name (the SageMaker path sets this later; eks
+    # needs it now for the benchmarks/<job>/ layout the sweep/aggregator expect).
+    BENCHMARK_JOB_NAME="${BENCHMARK_JOB_NAME:-${PROJECT_NAME}-benchmark-$(date +%Y%m%d-%H%M%S)}"
+
+    # BYOD: the service path hands the dataset to SageMaker by S3 reference; eks
+    # has no DatasetConfig mount, so download the resolved JSONL client-side and
+    # replay it via AIPerf --input-file (R3, findings §3). resolve-dataset already
+    # ran above (target-agnostic); here we only fetch the object.
+    BENCHMARK_DATASET_LOCAL_FILE="${BENCHMARK_DATASET_LOCAL_FILE:-}"
+    if [ -n "${BENCHMARK_DATASET_S3URI:-}" ]; then
+        _EKS_DS_DIR="${SCRIPT_DIR}/../benchmarks/${BENCHMARK_JOB_NAME}/dataset"
+        mkdir -p "${_EKS_DS_DIR}"
+        _EKS_DS_BASENAME="${BENCHMARK_DATASET_S3URI##*/}"
+        [ -n "${_EKS_DS_BASENAME}" ] && [[ "${_EKS_DS_BASENAME}" == *.* ]] || _EKS_DS_BASENAME="dataset.jsonl"
+        BENCHMARK_DATASET_LOCAL_FILE="${_EKS_DS_DIR}/${_EKS_DS_BASENAME}"
+        echo "📥 Downloading BYOD dataset for local replay: ${BENCHMARK_DATASET_S3URI}"
+        if ! aws s3 cp "${BENCHMARK_DATASET_S3URI}" "${BENCHMARK_DATASET_LOCAL_FILE}" \
+            --region "${AWS_REGION}" ${_PROFILE_awsProfile:+--profile "${_PROFILE_awsProfile}"} >/dev/null 2>&1; then
+            echo "❌ do/benchmark: could not download dataset from ${BENCHMARK_DATASET_S3URI}."
+            echo "   Check the S3 URI and your AWS credentials, then retry."
+            exit 1
+        fi
+    fi
+    export BENCHMARK_DATASET_LOCAL_FILE
+
+    _run_eks_aiperf_benchmark
+    exit $?
 fi
 
 # ── _check_schema_registry_staleness() ────────────────────────────────────────

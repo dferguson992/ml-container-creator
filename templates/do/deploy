@@ -66,7 +66,9 @@ while [ $# -gt 0 ]; do
         --target)
             shift
             if [ $# -eq 0 ]; then
+            # >>> GENERATED: target-list (scripts/codegen-target-guard.js; ADR-008) — DO NOT EDIT
                 echo "❌ --target requires a value (realtime-inference, async-inference, batch-transform, hyperpod-eks, eks)"
+            # <<< END GENERATED target-list
                 exit 1
             fi
             FLAG_TARGET="$1"

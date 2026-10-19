@@ -108,6 +108,26 @@ describe('target-descriptor conformance (ADR-008 T3 — safety net)', () => {
                     `generated block "${region.name}" drifted — run \`npm run codegen\``);
             }
         });
+
+        // The generated target-enumeration regions carry the canonical set,
+        // and the stale `managed-inference` no longer appears in a USER-FACING
+        // target list (it survives only as a back-compat alias in dispatch arms).
+        it('target-list regions carry the full canonical target set', async () => {
+            const { REGIONS, renderRegion } = await import('../../scripts/codegen-target-guard.js');
+            const canonical = descriptors.map((d) => d.target); // listTargets order
+            const listRegions = REGIONS.filter((r) => r.kind === 'targetList');
+            assert.ok(listRegions.length >= 5,
+                'expected a generated target-list region for each enumeration script');
+            for (const region of listRegions) {
+                const rendered = renderRegion(region, descriptors);
+                for (const target of canonical) {
+                    assert.ok(rendered.includes(target),
+                        `generated "${region.name}" must list the canonical target ${target}`);
+                }
+                assert.ok(!rendered.includes('managed-inference'),
+                    `generated "${region.name}" must NOT list the stale alias managed-inference`);
+            }
+        });
     });
 
     it('do-config.js SHELL_VAR_TO_ANSWER agrees with the descriptors', async () => {

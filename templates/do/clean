@@ -27,7 +27,9 @@ while [ $# -gt 0 ]; do
         --target)
             shift
             if [ $# -eq 0 ]; then
-                echo "❌ --target requires a value"
+            # >>> GENERATED: target-list (scripts/codegen-target-guard.js; ADR-008) — DO NOT EDIT
+                echo "❌ --target requires a value (realtime-inference, async-inference, batch-transform, hyperpod-eks, eks)"
+            # <<< END GENERATED target-list
                 exit 1
             fi
             DEPLOYMENT_TARGET="$1"
@@ -36,7 +38,9 @@ while [ $# -gt 0 ]; do
         --help|-h)
             echo "Usage: ./do/clean [--target <mode>] [clean-script-flags...]"
             echo ""
-            echo "Targets: managed-inference, async-inference, batch-transform, hyperpod-eks, eks"
+            # >>> GENERATED: target-list-usage (scripts/codegen-target-guard.js; ADR-008) — DO NOT EDIT
+            echo "Targets: realtime-inference, async-inference, batch-transform, hyperpod-eks, eks"
+            # <<< END GENERATED target-list-usage
             exit 0
             ;;
         *)
@@ -59,7 +63,7 @@ import { select } from '@inquirer/prompts';
 const target = await select({
     message: 'Which deployment to clean up?',
     choices: [
-        { name: 'Managed Inference', value: 'managed-inference' },
+        { name: 'Realtime Inference', value: 'realtime-inference' },
         { name: 'Async Inference', value: 'async-inference' },
         { name: 'Batch Transform', value: 'batch-transform' },
         { name: 'HyperPod EKS', value: 'hyperpod-eks' },

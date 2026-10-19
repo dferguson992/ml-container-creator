@@ -1359,6 +1359,13 @@ def _collect_gpu_signals(args, input_data):
         signals['metrics_source'] = 'both'
     elif deployment_target == 'hyperpod-eks' and has_engine:
         signals['metrics_source'] = 'engine_metrics_only'
+    elif deployment_target == 'eks' and has_engine:
+        # Plain EKS (BL157): like hyperpod-eks, the Phase-2 poller scrapes the
+        # engine /metrics directly (no CloudWatch OTel path from a plain K8s
+        # Deployment), so an eks run with engine signals is engine_metrics_only.
+        # Without the eks branch an eks run falls through to the default below and
+        # is mislabeled 'none' even when the poller contributed signals.
+        signals['metrics_source'] = 'engine_metrics_only'
     elif deployment_target == 'realtime-inference' and has_cw and not has_engine:
         signals['metrics_source'] = 'cloudwatch_only'
     else:

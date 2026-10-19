@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * BL156 — Vanilla-EKS cluster-contract preflight (templates/do/lib/eks-contract.sh).
+ * Vanilla-EKS cluster-contract preflight (templates/do/lib/eks-contract.sh).
  *
  * The lib is a SOURCED helper (ADR-007 pattern, like aws-preflight.sh): it
  * defines _eks_contract_preflight + its per-element functions and does nothing
@@ -14,8 +14,6 @@
  * consume-don't-provision (ADR-012): the lib is READ-ONLY. A dedicated case
  * asserts the command stubs logged only describe/get/list verbs — never a
  * create/apply/install (and never provisioning a PV/StorageClass).
- *
- * Feature: v2-w4-01-bl156
  */
 
 import { describe, it } from 'mocha';
@@ -43,7 +41,7 @@ const DEPLOY_EKS = readFileSync(path.join(REPO, 'templates/do/deploy.d/eks'), 'u
  * @returns { status, stdout, cmdlog }  — status is the process exit code.
  */
 function runContract({ env = {}, stubs = {}, call = '_eks_contract_preflight' } = {}) {
-    const dir = mkdtempSync(path.join(os.tmpdir(), 'bl156-'));
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'eks-contract-'));
     const bin = path.join(dir, 'bin');
     mkdirSync(bin, { recursive: true });
     const cmdlog = path.join(dir, 'cmdlog');
@@ -123,10 +121,10 @@ function realPython3LoggingStub() {
     return `echo "python3 $*" >> "$CMDLOG"\nexec "${REAL_PYTHON3}" "$@"`;
 }
 
-describe('BL156: vanilla-EKS cluster-contract preflight', () => {
+describe('vanilla-EKS cluster-contract preflight', () => {
 
     // ── Identity element (Req 2) ──────────────────────────────────────────────
-    describe('Feature: v2-w4-01-bl156, identity element', () => {
+    describe('identity element', () => {
         it('HF-source (no STAGED_MODEL_PATH) → skip, exit 0', () => {
             const r = runContract({ call: '_eks_contract_identity' });
             assert.strictEqual(r.status, 0);
@@ -208,7 +206,7 @@ esac`
     });
 
     // ── CSI driver element (Req 3) ────────────────────────────────────────────
-    describe('Feature: v2-w4-01-bl156, CSI driver element', () => {
+    describe('CSI driver element', () => {
         it('EKS_MODEL_MOUNT unset → skip, exit 0', () => {
             const r = runContract({ call: '_eks_contract_storage_csi' });
             assert.strictEqual(r.status, 0);
@@ -318,7 +316,7 @@ esac`
     });
 
     // ── Origin-agnostic (Req 1.3) ─────────────────────────────────────────────
-    describe('Feature: v2-w4-01-bl156, origin-agnostic', () => {
+    describe('origin-agnostic', () => {
         it('identical pass with and without a "bootstrapped" marker env var', () => {
             const base = {
                 call: '_eks_contract_identity',
@@ -346,7 +344,7 @@ esac`
     });
 
     // ── Read-only (Req 5.3, ADR-012) ──────────────────────────────────────────
-    describe('Feature: v2-w4-01-bl156, read-only (consume-don\'t-provision)', () => {
+    describe('read-only (consume-don\'t-provision)', () => {
         it('the lib issues only describe/get/list — never create/apply/install', () => {
             const r = runContract({
                 env: {
@@ -383,7 +381,7 @@ esac`
     });
 
     // ── Gate wiring in deploy.d/eks (source assertions) ───────────────────────
-    describe('Feature: v2-w4-01-bl156, gate wiring', () => {
+    describe('gate wiring', () => {
         it('deploy.d/eks sources the contract lib', () => {
             assert.ok(DEPLOY_EKS.includes('source "${SCRIPT_DIR}/lib/eks-contract.sh"'),
                 'deploy.d/eks must source lib/eks-contract.sh');
@@ -406,7 +404,7 @@ esac`
                 'the warn-style identity branch must be gone (moved into the gate)');
         });
 
-        it('deploy.d/eks calls the ephemeral-storage capacity check AFTER HP_GPU_COUNT resolution and BEFORE the manifest render/apply (BL155)', () => {
+        it('deploy.d/eks calls the ephemeral-storage capacity check AFTER HP_GPU_COUNT resolution and BEFORE the manifest render/apply', () => {
             const gpuResolve = DEPLOY_EKS.indexOf('GPU count (auto-detected)');
             const capacity = DEPLOY_EKS.indexOf('_eks_storage_capacity_preflight');
             // The MANIFEST apply is the render loop, marked by the renderer invocation
@@ -418,8 +416,8 @@ esac`
         });
     });
 
-    // ── Ephemeral-storage capacity fail-fast (BL155 Req 1, OQ-3) ──────────────
-    describe('Feature: v2-w4-02-bl155, ephemeral-storage capacity (emptyDir path)', () => {
+    // ── Ephemeral-storage capacity fail-fast (emptyDir path, OQ-3) ──────────────
+    describe('ephemeral-storage capacity (emptyDir path)', () => {
         const nodesJson = (gib) =>
             `{"items":[{"status":{"allocatable":{"ephemeral-storage":"${gib}Gi","nvidia.com/gpu":"8"}}}]}`;
 
@@ -482,8 +480,8 @@ esac`
         });
     });
 
-    // ── Mount-mode guards (BL155 Req 3.2 / 3.4) ───────────────────────────────
-    describe('Feature: v2-w4-02-bl155, mount-mode guards', () => {
+    // ── Mount-mode guards (wrapper-engine-only) ───────────────────────────────
+    describe('mount-mode guards', () => {
         it('EKS_MODEL_MOUNT=s3 without a staged model → fail (exit 4), do/stage guidance', () => {
             const r = runContract({
                 call: '_eks_mount_guards',
