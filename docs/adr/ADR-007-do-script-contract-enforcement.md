@@ -141,9 +141,9 @@ A per-script re-audit after the wave produced
 [`do-scripts-wave6-changelog.md`](../architecture/do-scripts-wave6-changelog.md)
 (a reviewable before/after record) and caught one behavior change that had been
 made implicitly: `do/adapter` had started *rejecting* the `eks` target. `eks`
-(EKS without the HyperPod Inference Operator) is a first-class — if currently
-untested — target, so this was corrected to *allow* LoRA on `eks` (routed through
-the same vLLM hot-load path as `hyperpod-eks`). The audit also found `eks` was
+(EKS without the HyperPod Inference Operator) is a first-class target, so this was
+corrected to *allow* LoRA on `eks` (routed through the same vLLM hot-load path as
+`hyperpod-eks`). The audit also found `eks` was
 missing from `_guard_deployment_active`, the `config` status vars, `do-config.js`,
 the `regenerate` preservation list, and the conformance target enum; all were
 wired so `eks` is first-class at the guard/status layer. Adding a new target is

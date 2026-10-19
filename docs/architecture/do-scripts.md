@@ -71,11 +71,13 @@ is first-class; each writes its own `DEPLOYMENT_TARGET_<T>_STATUS` variable that
 | `eks` | EKS **without** the HyperPod Inference Operator — standard Deployment + Service + ConfigMap | `DEPLOYMENT_TARGET_EKS_STATUS` | `Running` |
 
 > **`eks` status:** `eks` is a first-class, supported target — *not* legacy. It is
-> currently **untested / unvalidated** end-to-end (BL103). Because it serves vLLM
-> as plain Kubernetes pods without the operator, verbs that operate on the serving
-> pod directly (`do/adapter`, `do/test`, `do/benchmark`) treat it like
-> `hyperpod-eks` via a direct-pod `kubectl port-forward`; verbs that require a
-> SageMaker endpoint (`do/optimize`, `do/add-ic`, `do/ci`) do not apply to it.
+> a bring-your-own cluster target: MLCC consumes a cluster you provisioned and
+> validates a deploy-time contract (pod identity, CSI driver, volume backing)
+> rather than creating the cluster. Because it serves vLLM as plain Kubernetes
+> pods without the operator, verbs that operate on the serving pod directly
+> (`do/adapter`, `do/test`, `do/benchmark`) treat it like `hyperpod-eks` via a
+> direct-pod `kubectl port-forward`; verbs that require a SageMaker endpoint
+> (`do/optimize`, `do/add-ic`, `do/ci`) do not apply to it.
 
 To add your own target, see
 [Adding a Deployment Target](deployment-target-authoring.md) — the full

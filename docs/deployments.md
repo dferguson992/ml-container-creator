@@ -26,7 +26,7 @@ MCC supports five deployment targets. Select the active target at deploy time us
 | `async-inference` | SageMaker async endpoint | Large payloads / long jobs |
 | `batch-transform` | SageMaker batch transform job | Offline batch |
 | `hyperpod-eks` | EKS via the HyperPod Inference Operator | Registers a SageMaker endpoint |
-| `eks` | EKS **without** the HyperPod operator (standard Deployment + Service + ConfigMap) | First-class, **currently untested/unvalidated** |
+| `eks` | EKS **without** the HyperPod operator (standard Deployment + Service + ConfigMap) | Bring-your-own cluster; MLCC validates a deploy-time contract |
 
 ### SageMaker AI Real-Time Inference (`realtime-inference`)
 
@@ -114,9 +114,12 @@ HyperPod EKS cluster used as plain EKS.
 ./do/deploy --target eks
 ```
 
-!!! warning "Untested target"
-    `eks` is a first-class, supported target, but it is **currently untested and
-    unvalidated** end-to-end. Treat it as experimental.
+!!! note "Bring-your-own cluster"
+    `eks` consumes a cluster you already provisioned — MLCC does not create it.
+    Before applying anything, `./do/deploy --target eks` validates a deploy-time
+    contract (pod identity, the CSI driver, and the volume backing a mount) and
+    fails fast with a clear remediation when the cluster does not satisfy it. See
+    the [vanilla-EKS cluster contract](#vanilla-eks-cluster-contract) below.
 
 Because there is no SageMaker endpoint, verbs that operate on the serving pod
 directly work via a `kubectl` port-forward (same mechanism as `hyperpod-eks`):
