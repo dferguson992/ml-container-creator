@@ -67,7 +67,7 @@ graph LR
 3. **Adapter automatically deployed** — When `do/tune` completes a LoRA job, it automatically:
    1. Stages adapter weights to S3 via a Processing Job
    2. Deploys the adapter as an inference component on your endpoint
-   3. Registers the adapter in the deployment Model Package Group
+   3. Registers the adapter through the MLflow → Model Registry bridge (as a `lora_adapter`, linked to its base) — see [Deployment Registry](deployment-registry.md)
 
    The auto-deployed adapter is named `tuned-<technique>-<dataset-slug>` (e.g. `tuned-sft-alpaca`).
 
@@ -120,6 +120,14 @@ By default, `--from-tune` stages adapter weights via a **SageMaker Processing Jo
 # Stage locally instead of via Processing Job
 ./do/adapter add tuned-sft --from-tune --local
 ```
+
+!!! tip "Post-tune deploy-fit (rank/alpha)"
+    When a LoRA tune completes, `do/tune` surfaces the adapter's effective rank and
+    alpha (read from its `adapter_config.json`). If the rank exceeds the serving
+    engine's `VLLM_MAX_LORA_RANK`, it **warns** — the engine will reject or truncate
+    the adapter at load, so raise `VLLM_MAX_LORA_RANK` in `do/config` (to at least
+    the adapter's rank) and redeploy before hot-loading. The warning never blocks the
+    tune.
 
 ### Full model output
 

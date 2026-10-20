@@ -146,19 +146,25 @@ Each adapter in `do/adapters/*.conf` is registered as a linked ModelPackage vers
 Use `do/adapter add --from-registry` to pull a previously registered adapter back into a project and deploy it as an inference component:
 
 ```bash
-# Deploy using a specific version ARN from the deployment MPG
-./do/adapter add my-sft --from-registry arn:aws:sagemaker:us-west-2:123456789012:model-package/my-project/24
+# Deploy using a specific version ARN from the project's registry
+./do/adapter add my-sft --from-registry arn:aws:sagemaker:us-west-2:123456789012:model-package/my-project-c76813/24
 
-# Interactive selection (queries the deployment MPG for adapter versions)
+# Interactive selection (queries the project's registry for adapter versions)
 ./do/adapter add --from-registry
 ```
 
-!!! warning "Use the deployment MPG, not the tune MPG"
-    `--from-registry` expects an ARN from the **deployment MPG** (`{project-name}`), not the tune MPG (`{project-name}-tune-models`). The tune MPG is auto-managed by SageMaker and doesn't contain the metadata needed for deployment (adapter S3 URI, technique, parent model linkage).
+!!! note "Artifact-kind gate (ADR-013)"
+    `--from-registry` resolves the version's `mlcc.artifact_kind` and REFUSES a
+    `full_model` — a full fine-tuned model cannot be hot-loaded as a LoRA adapter;
+    use `do/add-ic` (realtime) or `do/add-pod` (cluster) for those. An adapter
+    version (`lora_adapter`) is accepted. A legacy version with no recorded
+    artifact kind falls back to an `adapter_config.json` content check rather than
+    being hard-blocked.
 
-    To find available adapter versions in the deployment MPG:
+    With the MLflow bridge (BL164) there is ONE registry group per project
+    (`{registered-model-name}-{hash}`) — the old split between a "deployment MPG"
+    and a `{project}-tune-models` MPG is gone. List adapter versions with:
     ```bash
-    # List registered adapters
     python3 ./do/.register_helper.py list-adapters \
       --project-name my-project \
       --region us-west-2
@@ -166,14 +172,15 @@ Use `do/adapter add --from-registry` to pull a previously registered adapter bac
 
 **What `--from-registry` does:**
 
-1. Calls `get-version` with the provided ARN to retrieve adapter metadata
-2. Reads `modelDataUrl` from `CustomerMetadataProperties` (the adapter weights S3 path)
-3. Creates/updates `do/adapters/<name>.conf` with the retrieved weights URI
-4. Deploys the adapter as an inference component on the running endpoint
+1. Calls `get-version` with the provided ARN to retrieve the version metadata (incl. `mlcc.artifact_kind`)
+2. Runs the artifact-kind gate — refuses a `full_model`, accepts a `lora_adapter`
+3. Reads `modelDataUrl` from `CustomerMetadataProperties` (the adapter weights S3 path)
+4. Creates/updates `do/adapters/<name>.conf` with the retrieved weights URI
+5. Deploys the adapter as an inference component on the running endpoint
 
 **Prerequisites:**
 
-- The adapter must be registered in the **deployment MPG** (run `./do/register` first)
+- The adapter must be registered in the project's registry (run `./do/register` first)
 - The endpoint must be deployed and InService
 - The adapter weights must still exist at the registered S3 path
 
