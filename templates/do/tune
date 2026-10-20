@@ -1585,6 +1585,20 @@ print(entry.get('provider', ''))
         submit_args+=(--accept-eula)
     fi
 
+    # BL166 (R3): ensure the per-project MLflow experiment exists BEFORE submit so
+    # the tune job's first logged step has a project home (the trainer's
+    # mlflow_experiment_name pin, set in tune_submit, names an existing experiment).
+    # Idempotent + non-fatal (no-op when MLflow unconfigured).
+    python3 -c "
+import sys
+sys.path.insert(0, '${SCRIPT_DIR}/lib/python')
+try:
+    import mlcc_mlflow as m
+    m.ensure_project_experiment('${PROJECT_NAME}')
+except Exception:
+    pass
+" 2>/dev/null || true
+
     # Invoke Python helper (stderr visible to user for diagnostics)
     local submit_result
     local submit_stderr

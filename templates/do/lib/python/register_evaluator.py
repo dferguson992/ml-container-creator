@@ -313,3 +313,38 @@ def cmd_register_prompt(args):
         description=getattr(args, "description", None),
         verb="prompt", register_hint="do/register prompt",
     )
+
+    # BL167 R2: ADDITIVELY register the reward prompt in the MLflow GenAI Prompt
+    # Registry (the AI-Registry evaluator above stays the Studio record + the
+    # deploy-time reference do/tune resolves). Under the OQ-1 hybrid: the AI
+    # Registry create already succeeded (fatal, done); the MLflow copy is
+    # additive — a transient unreachable App WARNS and reconciles on re-run, a
+    # real error is surfaced. Reward FUNCTIONS register nothing to MLflow.
+    try:
+        import mlcc_mlflow
+        if mlcc_mlflow._mlflow_configured() and source.startswith("s3://"):
+            template = _read_s3_text(source, region)
+            if template:
+                mlcc_mlflow.hybrid_record(
+                    local_write=lambda: None,  # AI Registry already wrote the record
+                    mlflow_write=lambda: mlcc_mlflow.register_prompt_native(name, template),
+                    name=name, kind="prompt",
+                )
+    except Exception as e:  # noqa: BLE001 — the AI Registry asset already stands
+        import sys
+        print(f"\u26a0\ufe0f  MLflow Prompt Registry copy skipped ({e}); the AI "
+              "Registry evaluator stands.", file=sys.stderr)
+
+
+def _read_s3_text(s3_uri, region=None):
+    """Read a small text object (a reward prompt file) from S3; '' on any failure."""
+    try:
+        import boto3
+        from urllib.parse import urlparse
+        p = urlparse(s3_uri)
+        obj = boto3.client("s3", region_name=region).get_object(
+            Bucket=p.netloc, Key=p.path.lstrip("/"),
+        )
+        return obj["Body"].read().decode("utf-8")
+    except Exception:  # noqa: BLE001 — best-effort; no template → skip MLflow copy
+        return ""

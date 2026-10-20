@@ -147,6 +147,210 @@ def _resolve_search_client(client=None):
         return None
 
 
+def ensure_project_experiment(project_name=None, client=None):
+    """Create-or-resolve the per-project MLflow experiment; return its id or None.
+
+    BL166: ensured at every lifecycle entry point (register/tune/train submit +
+    deploy) so a job's first logged step has a project home (not a trainer-default
+    bucket). Idempotent — whichever verb runs first creates it, the rest resolve
+    it, so entry-point order never matters. Non-fatal: when MLflow is unconfigured
+    the verb proceeds without it (returns None); NEVER creates a local mlruns dir.
+
+    Reuses the BL163 single source for the name (``_project_experiment_name``) and
+    the ref resolution (``_mlflow_configured`` applies the tracking env). Returns
+    None for a nameless context (the shared "Default"/"0" case needs no create).
+    """
+    if not _mlflow_configured():
+        return None
+    name = _project_experiment_name(project_name)
+    if name == "Default":
+        return None
+    try:
+        import mlflow
+        exp = mlflow.get_experiment_by_name(name)
+        if exp is not None:
+            return exp.experiment_id
+        return mlflow.create_experiment(name)
+    except Exception:  # noqa: BLE001 — a race or transient; set_experiment create-on-use still covers writes
+        return None
+
+
+def mlflow_env_for_job(project_name=None, config_path=None):
+    """Return the MLflow env vars to inject into a TRAINING JOB's environment.
+
+    BL166: a custom training container's MLflow autolog reads the tracking ref +
+    experiment from its env. This returns the ``{env_var: value}`` dict to merge
+    into the job Environment — the SAME ARN/URI split ``_mlflow_configured`` uses
+    (ARN → ``MLFLOW_TRACKING_SERVER_ARN``, HTTPS URL → ``MLFLOW_TRACKING_URI``) so
+    train/tune/register resolve the ref identically — plus
+    ``MLFLOW_EXPERIMENT_NAME = _project_experiment_name(...)``.
+
+    Returns an EMPTY dict when MLflow is unconfigured (the job submits exactly as
+    today, no MLflow env, no error — never a local mlruns dir).
+    """
+    env = {}
+    ref = None
+    # Prefer an explicit env ref (standard MLflow), else resolve from the profile.
+    if os.environ.get("MLFLOW_TRACKING_SERVER_ARN"):
+        env["MLFLOW_TRACKING_SERVER_ARN"] = os.environ["MLFLOW_TRACKING_SERVER_ARN"]
+    elif os.environ.get("MLFLOW_TRACKING_URI"):
+        env["MLFLOW_TRACKING_URI"] = os.environ["MLFLOW_TRACKING_URI"]
+    else:
+        ref = _config_tracking_uri(config_path)
+        if ref:
+            if ref.startswith("arn:"):
+                env["MLFLOW_TRACKING_SERVER_ARN"] = ref
+            else:
+                env["MLFLOW_TRACKING_URI"] = ref
+    if not env:
+        return {}
+    exp_name = _project_experiment_name(project_name)
+    if exp_name and exp_name != "Default":
+        env["MLFLOW_EXPERIMENT_NAME"] = exp_name
+    return env
+
+
+# ---------------------------------------------------------------------------
+# BL167: MLflow as the durable source of record — user-owned-reconcile hybrid.
+# No state machine: local record first (always), MLflow second (warn+succeed on
+# a TRANSIENT unreachable App, fatal on a REAL error), converge on an idempotent
+# do/register re-run, detect drift with a cheap smoke-test read.
+# ---------------------------------------------------------------------------
+
+class MlflowTransientError(RuntimeError):
+    """An MLflow write failed because the App was (probably) UNREACHABLE — a
+    transient condition the user reconciles by re-running. Distinct from a REAL
+    error (bad input, permissions) which is fatal."""
+
+
+def _is_transient_mlflow_error(exc):
+    """Conservatively classify an MLflow exception as transient (unreachable) vs
+    real (bad request / permissions). AMBIGUOUS → FALSE (treat as real/fatal), so
+    a genuine failure is never hidden behind a reconcile warning (design risk).
+
+    Transient signals: connection/timeout/DNS/5xx/throttling. Real signals:
+    4xx-class validation, access denied, not found, invalid parameter.
+    """
+    msg = str(exc).lower()
+    real_markers = (
+        "validation", "invalid", "accessdenied", "access denied", "not authorized",
+        "notfound", "does not exist", "already exists", "badrequest", "bad request",
+        "resourcenotfound",
+    )
+    if any(m in msg for m in real_markers):
+        return False
+    transient_markers = (
+        "timeout", "timed out", "connection", "could not connect", "unreachable",
+        "temporarily", "throttl", "serviceunavailable", "service unavailable",
+        "503", "502", "504", "name resolution", "endpointconnectionerror",
+    )
+    return any(m in msg for m in transient_markers)
+
+
+def hybrid_record(*, local_write, mlflow_write, name, kind):
+    """Record a resource with MLflow as the durable record + the local store as a
+    reconcilable copy (BL167 OQ-1). NO state machine.
+
+    1. ``local_write()`` — ALWAYS first; fatal on failure (the local record must
+       persist so a re-run can reconcile).
+    2. ``mlflow_write()`` — attempted next. A REAL error (bad input/permissions)
+       propagates (fatal). A TRANSIENT unreachable WARNS ("saved locally, not yet
+       in MLflow — re-run `do/register <kind>` to reconcile") and returns
+       ``degraded=True`` without failing registration.
+
+    Idempotent: a plain re-run of ``do/register`` re-invokes this and converges
+    MLflow to the local record — reconciliation IS the re-run, not a queue/daemon.
+
+    Returns ``{"local": <local_write result>, "mlflow_degraded": bool}``.
+    """
+    local_result = local_write()  # fatal on failure — do not catch
+    degraded = False
+    try:
+        mlflow_write()
+    except MlflowUnavailableError:
+        degraded = True
+        _warn_sync(name, kind, "MLflow is not installed/available")
+    except Exception as exc:  # noqa: BLE001 — classify transient vs real
+        if _is_transient_mlflow_error(exc):
+            degraded = True
+            _warn_sync(name, kind, str(exc))
+        else:
+            raise  # REAL error — fatal, never hidden behind a reconcile warning
+    return {"local": local_result, "mlflow_degraded": degraded}
+
+
+def _warn_sync(name, kind, reason):
+    import sys
+    print(f"\u26a0\ufe0f  '{name}' saved locally but not yet recorded in MLflow "
+          f"({reason}). Re-run `do/register {kind}` when the MLflow App is reachable "
+          f"to reconcile.", file=sys.stderr)
+
+
+def log_first_class_dataset(source, name, meta=None, context="training"):
+    """Log a dataset as a FIRST-CLASS mlflow.data Dataset input (BL167 R1), so it
+    is browsable in the Experiment Datasets catalog — not only the buried bare
+    MetaDataset. Must be called inside an active MLflow run.
+
+    Uses ``mlflow.data.from_pandas`` with the S3 ``source`` + the carried
+    provenance as a tiny descriptor frame (no bytes downloaded — a 1-row schema
+    marker), then ``log_input``. Complements (does not replace) ``log_dataset``'s
+    run-input lineage edge. Best-effort/raises like any MLflow call so the caller's
+    hybrid/guard decides fatality.
+    """
+    import mlflow
+    safe_name = sanitize_name(name)
+    provenance = _meta_provenance(meta)
+    try:
+        import pandas as pd
+        # A minimal descriptor frame — carries the provenance, downloads nothing.
+        frame = pd.DataFrame([{k: v for k, v in provenance.items()}] or [{}])
+        ds = mlflow.data.from_pandas(frame, source=source, name=safe_name)
+    except Exception:  # noqa: BLE001 — pandas/from_pandas unavailable → fall back to meta dataset
+        return log_dataset(source=source, name=name, context=context, meta=meta)
+    mlflow.log_input(ds, context=context)
+    return (safe_name, _derive_digest(source, safe_name, meta))
+
+
+def register_prompt_native(name, template, aliases=None):
+    """Register a reward PROMPT to the MLflow GenAI Prompt Registry (BL167 R2).
+
+    Uses the ``mlflow.genai`` namespace (the bare ``mlflow.register_prompt`` is
+    deprecated). Native versioning: re-registering the same name creates a new
+    version. Optional aliases are assigned. Returns the registered prompt handle.
+    Raises like any MLflow call so the caller's hybrid decides fatality.
+    """
+    import mlflow.genai as _genai
+    safe_name = sanitize_name(name)
+    prompt = _genai.register_prompt(name=safe_name, template=template)
+    for alias in (aliases or []):
+        try:
+            _genai.set_prompt_alias(name=safe_name, alias=alias, version=prompt.version)
+        except Exception:  # noqa: BLE001 — alias assignment best-effort
+            pass
+    return prompt
+
+
+def mlflow_check_present(name, kind, client=None, project_name=None):
+    """Cheap smoke-test read: is ``name`` present in MLflow for this kind?
+
+    Used by the read paths (--list / resolve) to DETECT drift (local record exists
+    but MLflow does not) and WARN. Best-effort: any failure returns None (unknown),
+    so drift detection never breaks a read. ``kind`` ∈ {"dataset", "prompt"}.
+    Reuses BL163 experiment resolution for datasets.
+    """
+    try:
+        if kind == "prompt":
+            import mlflow.genai as _genai
+            safe = sanitize_name(name)
+            return any(getattr(p, "name", None) == safe for p in _genai.search_prompts())
+        if kind == "dataset":
+            safe = sanitize_name(name)
+            return resolve_dataset_by_name(name, client=client, project_name=project_name) is not None
+    except Exception:  # noqa: BLE001 — detection is best-effort; unknown on failure
+        return None
+    return None
+
+
 def family_tags(base_id, artifact_type):
     """Return the standard family-membership tag dict for an artifact.
 

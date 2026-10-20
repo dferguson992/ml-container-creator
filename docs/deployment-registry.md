@@ -210,12 +210,22 @@ optimization jobs. The canonical destination is:
 s3://<CORE_BUCKET>/datasets/<name>/
 ```
 
-Dataset metadata is recorded in an **S3 sidecar** beside the data at
-`s3://<CORE_BUCKET>/datasets/<name>/_dataset.json`. The sidecar is the source of
-truth for versions, content hashes, and custom metadata — it replaces the legacy
-local `~/.ml-container-creator/datasets.json` index (removed; a pre-existing file
-is ignored). Because it lives in S3, the registry is durable and shared across
-machines.
+When MLflow is configured, a dataset is registered as a **first-class
+`mlflow.data` Dataset** in the project's experiment (browsable in the MLflow
+Experiment **Datasets** tab), alongside the run-input lineage edge — MLflow is the
+**record of truth** (BL167). The **S3 sidecar** beside the data at
+`s3://<CORE_BUCKET>/datasets/<name>/_dataset.json` is written first as the durable
+**local record** and the fallback when MLflow is unconfigured; it also remains the
+**version ledger** (`@v<N>` / semver pinning resolves from it). It replaces the
+legacy local `~/.ml-container-creator/datasets.json` index (removed).
+
+!!! note "Record of truth + reconcile (no sync daemon)"
+    Registration writes the local sidecar first (always), then MLflow. If the
+    MLflow App is briefly **unreachable**, `do/register` warns ("saved locally —
+    re-run to reconcile") and still succeeds — it never fails on App downtime. A
+    plain **re-run** of `do/register` converges MLflow to the local record (the
+    write is idempotent). A **real** error (bad input, permissions) fails loudly.
+    There is no background sync — you own reconciliation by re-running.
 
 `CORE_BUCKET` is the `mlcc-core` bucket recorded in your active profile as
 `codebuildSourceS3Bucket` (e.g. `mlcc-core-<account>-<region>`), provisioned by
@@ -328,6 +338,14 @@ Register a reward function (RLVR) or preference model (RLAIF):
 | `--arn <arn>` | Lambda ARN or model S3 URI (required) |
 | `--technique <tech>` | Technique: `rlvr` or `rlaif` (required) |
 | `--description <text>` | Optional description |
+
+!!! note "Reward prompts also land in the MLflow Prompt Registry"
+    A reward **prompt** (`do/register prompt`, RLAIF LLM-as-judge) is registered to
+    SageMaker's AI Registry (the Studio record + the reference `do/tune` resolves)
+    AND **additively** to the MLflow GenAI **Prompt Registry** — versioned,
+    browsable in the MLflow Prompts tab (BL167). The MLflow copy follows the same
+    local-first/reconcile-on-re-run hybrid. Reward **functions** (code/Lambda) have
+    no MLflow home and register only to the AI Registry.
 
 !!! note "Backward Compatibility"
     The older flag-based syntax (`./do/register --dataset --dataset-name ...` and `./do/register --evaluator --evaluator-name ...`) still works but is deprecated in favor of subcommands.

@@ -900,6 +900,32 @@ _build_job_request() {
     timestamp=$(date +%Y%m%d-%H%M%S)
     JOB_NAME="${PROJECT_NAME}-train-${timestamp}"
 
+    # ── BL166: MLflow parity with do/tune ────────────────────────────────────
+    # Ensure the per-project experiment exists (idempotent, non-fatal), then merge
+    # the MLflow job env (tracking ref + MLFLOW_EXPERIMENT_NAME) into the training
+    # job's Environment so the container's autolog publishes to the shared App
+    # under the project experiment. Unconfigured profile → empty merge → no change.
+    local _mlflow_env
+    _mlflow_env=$(python3 -c "
+import sys, json
+sys.path.insert(0, '${SCRIPT_DIR}/lib/python')
+import mlcc_mlflow as m
+m.ensure_project_experiment('${PROJECT_NAME}')
+print(json.dumps(m.mlflow_env_for_job('${PROJECT_NAME}')))
+" 2>/dev/null || echo "{}")
+    if [ -n "${_mlflow_env}" ] && [ "${_mlflow_env}" != "{}" ]; then
+        # Merge _mlflow_env into TRAIN_ENVIRONMENT (job env wins on key clash is
+        # avoided: user-set env takes precedence, MLflow fills only unset keys).
+        TRAIN_ENVIRONMENT=$(python3 -c "
+import sys, json
+base = json.loads('''${TRAIN_ENVIRONMENT:-{}}''' or '{}')
+extra = json.loads('''${_mlflow_env}''')
+for k, v in extra.items():
+    base.setdefault(k, v)
+print(json.dumps(base))
+" 2>/dev/null || echo "${TRAIN_ENVIRONMENT}")
+    fi
+
     # Construct the JSON request file using python3
     JOB_REQUEST_FILE="/tmp/train-request-${JOB_NAME}.json"
 

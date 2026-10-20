@@ -191,3 +191,161 @@ def test_profile_sh_maps_mlflow_app_arn_from_profile():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ── BL166: ensure_project_experiment + mlflow_env_for_job (job-env parity) ────
+
+
+def test_mlflow_env_for_job_empty_when_unconfigured(monkeypatch, tmp_path):
+    """Unconfigured profile → empty env dict (the job submits as today, no MLflow)."""
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.delenv("MLFLOW_TRACKING_SERVER_ARN", raising=False)
+    # Point config resolution at a nonexistent file so nothing resolves.
+    env = mlcc_mlflow.mlflow_env_for_job("myproj", config_path=str(tmp_path / "nope.json"))
+    assert env == {}
+
+
+def test_mlflow_env_for_job_arn_ref_and_experiment(monkeypatch):
+    """An ARN tracking ref in the env → MLFLOW_TRACKING_SERVER_ARN + experiment name."""
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.setenv("MLFLOW_TRACKING_SERVER_ARN", "arn:aws:sagemaker:us-west-2:1:mlflow-app/app-X")
+    monkeypatch.setenv("PROJECT_NAME", "my/proj")
+    env = mlcc_mlflow.mlflow_env_for_job()
+    assert env["MLFLOW_TRACKING_SERVER_ARN"] == "arn:aws:sagemaker:us-west-2:1:mlflow-app/app-X"
+    # Experiment name is the sanitized project name (slashes → --), BL163 single source.
+    assert env["MLFLOW_EXPERIMENT_NAME"] == "my--proj"
+
+
+def test_mlflow_env_for_job_https_ref_uses_tracking_uri(monkeypatch):
+    """An HTTPS tracking ref → MLFLOW_TRACKING_URI (the non-ARN branch)."""
+    monkeypatch.delenv("MLFLOW_TRACKING_SERVER_ARN", raising=False)
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
+    monkeypatch.setenv("PROJECT_NAME", "proj")
+    env = mlcc_mlflow.mlflow_env_for_job()
+    assert env["MLFLOW_TRACKING_URI"] == "https://mlflow.example.com"
+    assert env["MLFLOW_EXPERIMENT_NAME"] == "proj"
+
+
+def test_ensure_project_experiment_noop_when_unconfigured(monkeypatch):
+    """Unconfigured → returns None, never creates a local ./mlruns."""
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.delenv("MLFLOW_TRACKING_SERVER_ARN", raising=False)
+    monkeypatch.setattr(mlcc_mlflow, "_mlflow_configured", lambda *a, **k: False)
+    assert mlcc_mlflow.ensure_project_experiment("myproj") is None
+
+
+def test_ensure_project_experiment_resolves_existing(monkeypatch):
+    """When the project experiment already exists, resolve it (idempotent) — no re-create."""
+    monkeypatch.setattr(mlcc_mlflow, "_mlflow_configured", lambda *a, **k: True)
+
+    class _FakeMlflow:
+        class _Exp:
+            experiment_id = "7"
+        def get_experiment_by_name(self, name):
+            assert name == "myproj"
+            return self._Exp()
+        def create_experiment(self, name):  # pragma: no cover - must NOT be called
+            raise AssertionError("create_experiment called though the experiment exists")
+
+    monkeypatch.setitem(sys.modules, "mlflow", _FakeMlflow())
+    assert mlcc_mlflow.ensure_project_experiment("myproj") == "7"
+
+
+def test_ensure_project_experiment_creates_when_absent(monkeypatch):
+    """When the project experiment does not exist, create it and return the new id."""
+    monkeypatch.setattr(mlcc_mlflow, "_mlflow_configured", lambda *a, **k: True)
+
+    class _FakeMlflow:
+        def get_experiment_by_name(self, name):
+            return None
+        def create_experiment(self, name):
+            assert name == "newproj"
+            return "42"
+
+    monkeypatch.setitem(sys.modules, "mlflow", _FakeMlflow())
+    assert mlcc_mlflow.ensure_project_experiment("newproj") == "42"
+
+
+def test_ensure_project_experiment_nameless_is_noop(monkeypatch):
+    """A nameless context (no project) → None (the shared Default/0 needs no create)."""
+    monkeypatch.setattr(mlcc_mlflow, "_mlflow_configured", lambda *a, **k: True)
+    monkeypatch.delenv("PROJECT_NAME", raising=False)
+    assert mlcc_mlflow.ensure_project_experiment("") is None
+
+
+# ── BL167: hybrid-write core + error classifier + helpers ─────────────────────
+
+
+def test_transient_classifier_timeout_is_transient():
+    assert mlcc_mlflow._is_transient_mlflow_error(Exception("Connection timed out")) is True
+    assert mlcc_mlflow._is_transient_mlflow_error(Exception("ServiceUnavailable 503")) is True
+
+
+def test_transient_classifier_validation_is_real():
+    assert mlcc_mlflow._is_transient_mlflow_error(Exception("ValidationException: bad param")) is False
+    assert mlcc_mlflow._is_transient_mlflow_error(Exception("AccessDenied")) is False
+
+
+def test_transient_classifier_ambiguous_defaults_to_real():
+    # Conservative: an unrecognized error is treated as REAL (fatal), never hidden.
+    assert mlcc_mlflow._is_transient_mlflow_error(Exception("something weird happened")) is False
+
+
+def test_hybrid_record_local_first_then_mlflow_success():
+    calls = []
+    res = mlcc_mlflow.hybrid_record(
+        local_write=lambda: calls.append("local") or "L",
+        mlflow_write=lambda: calls.append("mlflow"),
+        name="ds1", kind="dataset",
+    )
+    assert calls == ["local", "mlflow"]  # local ALWAYS first
+    assert res == {"local": "L", "mlflow_degraded": False}
+
+
+def test_hybrid_record_transient_mlflow_warns_and_succeeds(capsys):
+    def _boom():
+        raise Exception("Connection timed out reaching the App")
+    res = mlcc_mlflow.hybrid_record(
+        local_write=lambda: "L", mlflow_write=_boom, name="ds2", kind="dataset",
+    )
+    assert res["mlflow_degraded"] is True  # degraded, NOT fatal
+    assert res["local"] == "L"
+    err = capsys.readouterr().err
+    assert "re-run" in err.lower() and "reconcile" in err.lower()
+
+
+def test_hybrid_record_real_mlflow_error_is_fatal():
+    def _boom():
+        raise Exception("ValidationException: invalid prompt template")
+    with pytest.raises(Exception, match="ValidationException"):
+        mlcc_mlflow.hybrid_record(
+            local_write=lambda: "L", mlflow_write=_boom, name="p1", kind="prompt",
+        )
+
+
+def test_hybrid_record_local_failure_is_fatal():
+    # The local record MUST persist (it's what a re-run reconciles from).
+    def _local_boom():
+        raise RuntimeError("sidecar write failed")
+    with pytest.raises(RuntimeError, match="sidecar write failed"):
+        mlcc_mlflow.hybrid_record(
+            local_write=_local_boom, mlflow_write=lambda: None, name="ds3", kind="dataset",
+        )
+
+
+def test_mlflow_check_present_dataset_unknown_on_error(monkeypatch):
+    # Best-effort: a failure in the underlying resolve → None (unknown), never raises.
+    def _boom(*a, **k):
+        raise Exception("boom")
+    monkeypatch.setattr(mlcc_mlflow, "resolve_dataset_by_name", _boom)
+    assert mlcc_mlflow.mlflow_check_present("ds", "dataset") is None
+
+
+def test_mlflow_check_present_dataset_found(monkeypatch):
+    monkeypatch.setattr(mlcc_mlflow, "resolve_dataset_by_name",
+                        lambda name, **k: {"name": "ds", "s3_uri": "s3://x"})
+    assert mlcc_mlflow.mlflow_check_present("ds", "dataset") is True
+
+
+def test_mlflow_check_present_unknown_kind_returns_none():
+    assert mlcc_mlflow.mlflow_check_present("x", "evaluator") is None

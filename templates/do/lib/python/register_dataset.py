@@ -316,6 +316,10 @@ def _log_dataset_to_mlflow(*, s3_uri, name, content_hash, row_count, data_format
 
         active = mlflow.active_run()
         if active is not None:
+            # BL167: first-class Dataset (browsable catalog) + the run-input edge.
+            mlcc_mlflow.log_first_class_dataset(
+                source=s3_uri, name=name, meta=meta, context=context,
+            )
             return mlcc_mlflow.log_dataset(
                 source=s3_uri, name=name, context=context, meta=meta,
             )
@@ -327,13 +331,19 @@ def _log_dataset_to_mlflow(*, s3_uri, name, content_hash, row_count, data_format
         # still required.
         mlflow.set_experiment(mlcc_mlflow._project_experiment_name(project_name))
         with mlflow.start_run(run_name=f"register-dataset-{name}"):
+            # BL167: first-class mlflow.data Dataset so it shows in the Experiment
+            # Datasets catalog, PLUS the existing log_dataset run-input lineage edge.
+            mlcc_mlflow.log_first_class_dataset(
+                source=s3_uri, name=name, meta=meta, context=context,
+            )
             return mlcc_mlflow.log_dataset(
                 source=s3_uri, name=name, context=context, meta=meta,
             )
-    except Exception as e:  # noqa: BLE001 — MLflow logging is best-effort
+    except Exception as e:  # noqa: BLE001 — BL167 hybrid: local record stands, reconcile on re-run
         _warn(
-            f"MLflow dataset logging failed ({e}); the S3 sidecar remains the "
-            "durable record."
+            f"MLflow dataset logging failed ({e}); '{name}' is saved locally (S3 "
+            "sidecar) — re-run `do/register dataset` when the MLflow App is "
+            "reachable to reconcile the record into MLflow."
         )
         return None
 
@@ -517,6 +527,12 @@ def cmd_register_dataset(args):
             mlflow_logged = handle is not None
             if mlflow_logged:
                 print(f"Logged dataset to MLflow as run input: {handle[0]}", file=sys.stderr)
+            else:
+                # BL167: MLflow is configured but the write did not land — drift.
+                # The sidecar (local record) stands; tell the user to reconcile.
+                _warn(f"'{name}' saved locally but not yet recorded in MLflow. "
+                      f"Re-run `do/register dataset {name} ...` when the MLflow App "
+                      f"is reachable to reconcile.")
     except Exception as e:  # noqa: BLE001 — never let MLflow break a persisted registration
         _warn(f"MLflow dataset logging skipped ({e}); the S3 sidecar remains the record.")
 

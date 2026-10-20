@@ -873,6 +873,21 @@ case "${DEPLOYMENT_TARGET}" in
         ;;
 esac
 
+# ── BL166: ensure the per-project MLflow experiment exists at first touch ──
+# Deploy is a lifecycle entry point too (OQ-1): a deploy-a-pre-existing-model flow
+# with no prior tune/register still gets a project experiment on first touch.
+# Idempotent (resolves if already created) and non-fatal (no-op when MLflow is
+# unconfigured). Runs here — past --help/dry-run, before the real deploy.
+python3 -c "
+import sys
+sys.path.insert(0, '${SCRIPT_DIR}/lib/python')
+try:
+    import mlcc_mlflow as m
+    m.ensure_project_experiment('${PROJECT_NAME}')
+except Exception:
+    pass
+" 2>/dev/null || true
+
 # Dispatch to target-specific deploy script
 case "$DEPLOYMENT_TARGET" in
     realtime-inference|managed-inference)

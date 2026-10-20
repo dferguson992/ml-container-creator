@@ -217,6 +217,12 @@ def resolve_dataset_uri(name, *, version=None, region=None, core_bucket=None,
     if sidecar is None:
         raise DatasetNotFoundError(f"Dataset not found: {name}")
 
+    # BL167 (R4 / OQ-2): the VERSION ledger stays in the sidecar. mlflow.data
+    # Datasets have no first-class semver ledger (unlike the Model Registry), so
+    # @v<N> / semver pinning resolves from the sidecar `versions` array for both
+    # pre- and post-BL167 datasets. Deprecating the sidecar version ledger is a
+    # later patch if MLflow gains a fit; until then the sidecar is the index even
+    # when MLflow holds the catalog.
     versions = sidecar.get("versions") or []
     entry, ordinal = _select_version(versions, version)
 

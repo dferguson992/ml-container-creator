@@ -300,6 +300,28 @@ By default, `do/train` auto-registers the dataset on completion (same as `do/tun
 ./do/train --technique sft --dataset "hf://tatsu-lab/alpaca" --no-register
 ```
 
+### Experiment Tracking (MLflow)
+
+`do/train` publishes training telemetry to the same shared MLflow App as `do/tune`
+and `do/register` — at **parity** with the managed tune path (BL166). When your
+profile has an MLflow App configured (`mlflowAppArn`), `do/train` injects the
+tracking ref (`MLFLOW_TRACKING_SERVER_ARN` / `MLFLOW_TRACKING_URI`) and
+`MLFLOW_EXPERIMENT_NAME` into the training job's **Environment**, scoped to a
+**per-project experiment** (named after your project). Your training container's
+MLflow autolog reads these and logs there.
+
+The per-project experiment is ensured (create-or-resolve) at every lifecycle entry
+point — `do/register`, `do/tune`, `do/train`, and `do/deploy` — so whichever runs
+first creates it and the rest resolve it; the job's first logged step always has a
+project home. When MLflow is not configured, `do/train` submits exactly as before
+(no MLflow env, no error).
+
+!!! note "The container does the logging"
+    `do/train` gives the job the tracking ref + experiment; the actual metric
+    logging is your training script's MLflow autolog / calls. MLCC does not inject
+    an autolog callback into your code — a script that logs nothing to MLflow still
+    produces no run metrics, it just now has a project experiment to log into.
+
 ### Comparison Workflow
 
 ```bash
