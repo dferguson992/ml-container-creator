@@ -120,6 +120,8 @@ def cmd_resolve_dataset(args):
             version=version_spec,
             region=getattr(args, "region", None),
             core_bucket=core_bucket,
+            project_name=getattr(args, "project_name", None),
+            all_projects=getattr(args, "all_projects", False),
         )
     except DatasetVersionNotFoundError as e:
         _version_not_found(name, version_spec, e.available)
@@ -137,7 +139,7 @@ def cmd_resolve_dataset(args):
 
 
 def resolve_dataset_uri(name, *, version=None, region=None, core_bucket=None,
-                        s3_client=None):
+                        s3_client=None, project_name=None, all_projects=False):
     """Resolve a registered dataset name to its S3 URI and metadata.
 
     Shared resolution core used by both the ``resolve-dataset`` CLI
@@ -175,7 +177,9 @@ def resolve_dataset_uri(name, *, version=None, region=None, core_bucket=None,
     import mlcc_mlflow
     if mlcc_mlflow._mlflow_configured():
         try:
-            entry = mlcc_mlflow.resolve_dataset_by_name(name)
+            entry = mlcc_mlflow.resolve_dataset_by_name(
+                name, project_name=project_name, all_projects=all_projects,
+            )
         except mlcc_mlflow.MlflowUnavailableError as e:
             raise DatasetResolveError(str(e), code="MLFLOW_UNAVAILABLE") from e
         except Exception as e:  # noqa: BLE001 — surface, do not silently fall back

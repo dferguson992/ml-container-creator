@@ -283,7 +283,7 @@ def _resolve_core_bucket(args):
 
 
 def _log_dataset_to_mlflow(*, s3_uri, name, content_hash, row_count, data_format,
-                           technique, source_type="s3-uri"):
+                           technique, project_name="", source_type="s3-uri"):
     """Log the dataset to MLflow as a run input (BL110), non-fatally.
 
     Called only when MLflow is configured, AFTER the durable sidecar write.
@@ -319,10 +319,13 @@ def _log_dataset_to_mlflow(*, s3_uri, name, content_hash, row_count, data_format
             return mlcc_mlflow.log_dataset(
                 source=s3_uri, name=name, context=context, meta=meta,
             )
-        # Set experiment explicitly so datasets appear in the "Default" experiment
-        # in the MLflow UI (#/experiments/0/datasets). Without this, SageMaker
-        # MLflow Serverless may auto-create a new experiment per-call.
-        mlflow.set_experiment("Default")
+        # BL163: set the per-project experiment explicitly so each project's
+        # datasets group under their own experiment (sanitized project name)
+        # instead of colliding in the shared "Default" experiment. set_experiment
+        # creates it on first use (idempotent). SageMaker MLflow Serverless would
+        # otherwise auto-create a new experiment per-call, so an explicit name is
+        # still required.
+        mlflow.set_experiment(mlcc_mlflow._project_experiment_name(project_name))
         with mlflow.start_run(run_name=f"register-dataset-{name}"):
             return mlcc_mlflow.log_dataset(
                 source=s3_uri, name=name, context=context, meta=meta,
@@ -509,6 +512,7 @@ def cmd_register_dataset(args):
             handle = _log_dataset_to_mlflow(
                 s3_uri=s3_uri, name=name, content_hash=content_hash,
                 row_count=row_count, data_format=data_format, technique=technique,
+                project_name=project_name,
             )
             mlflow_logged = handle is not None
             if mlflow_logged:
@@ -670,7 +674,9 @@ def cmd_delete_dataset(args):
         try:
             import mlcc_mlflow
             if mlcc_mlflow._mlflow_configured():
-                mlcc_mlflow.tag_dataset_runs_deleted(name)
+                mlcc_mlflow.tag_dataset_runs_deleted(
+                    name, project_name=getattr(args, "project_name", None),
+                )
         except Exception:  # noqa: BLE001 — MLflow tagging is best-effort
             pass
         print(f"Deregistered dataset '{name}' (sidecar removed; data bytes untouched)", file=sys.stderr)

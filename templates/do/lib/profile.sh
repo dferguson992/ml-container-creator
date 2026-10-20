@@ -22,7 +22,7 @@
 #   awsRegion, accountId, awsProfile, roleArn, ecrRepositoryName,
 #   benchmarkS3Bucket, ciBenchmarkResultsBucket, asyncS3Bucket, batchS3Bucket,
 #   trainingS3Bucket, adapterS3Bucket, modelsS3Bucket,
-#   ciTableName, ciInfraProvisioned
+#   ciTableName, ciInfraProvisioned, mlflowAppArn
 
 # Temporarily disable unbound variable checking for profile loading
 set +u 2>/dev/null || true
@@ -64,6 +64,17 @@ ADAPTER_S3_BUCKET="${ADAPTER_S3_BUCKET:-${_PROFILE_adapterS3Bucket:-}}"
 # _PROFILE_coreS3Bucket is the canonical key (BL072); _PROFILE_modelsS3Bucket is the deprecated alias
 MODELS_S3_BUCKET="${MODELS_S3_BUCKET:-${_PROFILE_coreS3Bucket:-${_PROFILE_modelsS3Bucket:-}}}"
 CODEBUILD_SOURCE_S3_BUCKET="${CODEBUILD_SOURCE_S3_BUCKET:-${_PROFILE_codebuildSourceS3Bucket:-}}"
+# ── MLflow tracking ref (BL163) ───────────────────────────────────────────
+# Map the profile's mlflowAppArn (the one key the bootstrap ensureMlflowApp()
+# denormalizes) to the env var the tune path consumes (tune_submit.py reads
+# MLFLOW_APP_ARN from the environment). This gives the tune flow the SAME
+# profile-resolved tracking ref the register/list/resolve flows already use
+# via _config_tracking_uri(), with no manual step. EXPORTED (unlike the bucket
+# vars) because tune_submit.py reads it through os.environ. When the profile
+# has no mlflowAppArn the value stays empty and the tune path wires no MLflow
+# (today's behavior) — it never falls back to a local ./mlruns store.
+MLFLOW_APP_ARN="${MLFLOW_APP_ARN:-${_PROFILE_mlflowAppArn:-}}"
+[ -n "${MLFLOW_APP_ARN}" ] && export MLFLOW_APP_ARN
 
 # ── Profile secrets (BL076) ───────────────────────────────────────────────
 # Secret ARNs are stored in the active bootstrap profile's 'secrets' map.

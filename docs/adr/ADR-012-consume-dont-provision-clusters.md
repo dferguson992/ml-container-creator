@@ -7,10 +7,10 @@ SPDX-License-Identifier: Apache-2.0
 ## Status
 
 Accepted (v2.0, 2026-09-29). Codifies a principle reached across the v1.9 plain-EKS
-deploys and the v2.0 Wave-2/Wave-4 EKS/HyperPod work, and crystallized by the
-HyperPod-provisioning deprecation (BL143 → BL162 spike). It governs Wave-4 (BL155–BL161)
-and the HyperPod provisioning spike (BL162), and sets the default posture for any future
-cluster-backed deploy target.
+deploys and the v2.0 EKS/HyperPod work, and crystallized by the
+HyperPod-provisioning deprecation (BL143 → BL162 spike). It governs the vanilla-EKS
+deploy-time work (BL155–BL161) and the HyperPod provisioning spike (BL162), and sets the
+default posture for any future cluster-backed deploy target.
 
 ## Context
 
@@ -101,16 +101,18 @@ Concretely:
 ## Consequences
 
 - **Positive:** cluster-backed deploys fail fast with actionable guidance instead of looping
-  silently; the vanilla-EKS and HyperPod targets share one coherent posture; Wave 4 becomes
-  a scopable deliverable (BL155–BL161) rather than an open provisioning problem; the
+  silently; the vanilla-EKS and HyperPod targets share one coherent posture; the vanilla-EKS
+  deploy-time work becomes a scopable deliverable (BL155–BL161) rather than an open
+  provisioning problem; the
   HyperPod deprecation stops being a loss and becomes an instance of the principle; the
   naming-mismatch + swallowed-error failure class (BL141) shrinks.
 - **Cost / constraint:** users deploying to BYO clusters must satisfy a documented contract
   (IRSA, storage, CSI driver) — MLCC will refuse (clearly) rather than paper over a
   non-conforming cluster. HyperPod users need a console/CFT-provisioned cluster until BL162
   resolves an HP-native provisioning path MLCC can adopt.
-- **Scope:** governs Wave 4 (BL155 storage, BL156 contract, BL157 benchmark parity, BL161
-  add-on CfnAddon + naming audit) and BL162 (the provisioning spike). The deprecated
+- **Scope:** governs the vanilla-EKS deploy-time work (BL155 storage, BL156 contract,
+  BL157 benchmark parity, BL161 add-on CfnAddon + naming audit) and BL162 (the provisioning
+  spike). The deprecated
   `hyperpod` provisioning module stays deprecated; the `hyperpod-eks` DEPLOY target stands
   (proven `InService`).
 

@@ -267,7 +267,8 @@ Provide **exactly one** input source:
 | `--origination <text>` | Custom metadata: origination (e.g. `hf://org/name@rev`) |
 | `--application <text>` | Custom metadata: application |
 | `--force` | Register a new version even if the content hash is unchanged |
-| `--list` | List registered datasets (from the S3 sidecars) and exit |
+| `--list` | List registered datasets and exit. When MLflow is configured the read source is the shared MLflow catalog scoped to the active project; otherwise the S3 sidecars |
+| `--all` | With `--list`: list datasets across every project under the profile, not just the active one |
 | `--from-tune [technique]` | Auto-populate `--s3-uri` from the last tune job's persisted state |
 
 !!! note "One source only"
@@ -279,6 +280,20 @@ Provide **exactly one** input source:
 !!! note "Idempotent versioning"
     Registering unchanged content (same content hash) without `--force` is a
     no-op — no new sidecar version is created.
+
+!!! note "Shared MLflow catalog, grouped per project"
+    When MLflow tracking is configured, the catalog is **shared across the whole
+    bootstrap profile** (one serverless MLflow store per profile). Runs are
+    grouped into a **per-project experiment** named after your project, so
+    `do/register dataset --list` and name resolution default to the active
+    project and do not collide across projects. Pass `--all` to list across every
+    project under the profile. Datasets registered before this grouping existed
+    live in the default experiment and remain visible (reads include both).
+
+    The `do/tune` flow reaches this same shared catalog automatically: the
+    profile's MLflow reference is resolved for you at runtime (no manual env var
+    to set). If your profile has no MLflow store configured, tuning proceeds
+    without MLflow tracking — it never falls back to a local tracking file.
 
 ### Evaluator Registration
 

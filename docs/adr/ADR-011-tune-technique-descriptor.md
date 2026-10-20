@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Status
 
-Accepted — implemented (v2.0 Wave 3, BL129, spec `v2-w3-01-bl129`).
+Accepted — implemented (v2.0, BL129, spec `v2-w3-01-bl129`).
 
 **Implementation summary (what shipped).** One descriptor per managed-customization
 technique at `templates/code/tune.d/<technique>/manifest.json`, validated by

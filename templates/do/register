@@ -213,6 +213,7 @@ DATASET_LINEAGE=""
 DATASET_ORIGINATION=""
 DATASET_APPLICATION=""
 DATASET_LIST=false
+DATASET_LIST_ALL=false
 DATASET_LIST_VERSIONS=""
 DATASET_DISCOVER=""
 DATASET_DELETE=""
@@ -288,6 +289,7 @@ if [ "${SUBCOMMAND}" = "dataset" ]; then
             --dataset-column-schema) DATASET_COLUMN_SCHEMA="$2"; shift 2 ;;
             --force)        DATASET_FORCE=true; shift ;;
             --list|--list-datasets) DATASET_LIST=true; shift ;;
+            --all)          DATASET_LIST_ALL=true; shift ;;  # BL163: list/resolve across every project
             --json)         DATASET_JSON=true; shift ;;
             --list-versions)
                 DATASET_LIST_VERSIONS="$2"; shift 2 ;;
@@ -451,7 +453,8 @@ if rec:
         fi
 
         del_args=(delete-dataset --name "${_del_target}" \
-                  --core-bucket "${CORE_BUCKET}" --region "${AWS_REGION}")
+                  --core-bucket "${CORE_BUCKET}" --region "${AWS_REGION}" \
+                  --project-name "${PROJECT_NAME}")
         [ -n "${DATASET_DELETE_VERSION}" ] && del_args+=(--version "${DATASET_DELETE_VERSION}")
 
         del_stderr="$(mktemp)"
@@ -478,8 +481,10 @@ if rec:
         echo ""
         echo "📦 Registered datasets:"
         echo ""
-        _ds_output=$(python3 "${SCRIPT_DIR}/.register_helper.py" list-datasets \
-            --core-bucket "${CORE_BUCKET}" --region "${AWS_REGION}" 2>/dev/null) || _ds_output=""
+        _ls_args=(list-datasets --core-bucket "${CORE_BUCKET}" --region "${AWS_REGION}" \
+                  --project-name "${PROJECT_NAME}")
+        [ "${DATASET_LIST_ALL}" = true ] && _ls_args+=(--all)
+        _ds_output=$(python3 "${SCRIPT_DIR}/.register_helper.py" "${_ls_args[@]}" 2>/dev/null) || _ds_output=""
         _ds_json=$(echo "${_ds_output}" | grep -E '^\{' | tail -1)
         if [ -n "${_ds_json}" ]; then
             printf "  %-24s %-10s %-10s %-8s %s\n" "NAME" "TECHNIQUE" "LATEST" "ROWS" "S3 URI"

@@ -199,7 +199,10 @@ def cmd_list_datasets(args):
         # _mlflow_configured() predicate so list/resolve/register stay consistent.
         if mlcc_mlflow._mlflow_configured():
             try:
-                inputs = mlcc_mlflow.list_dataset_inputs()
+                inputs = mlcc_mlflow.list_dataset_inputs(
+                    project_name=getattr(args, 'project_name', None),
+                    all_projects=getattr(args, 'all_projects', False),
+                )
             except mlcc_mlflow.MlflowUnavailableError as e:
                 # Configured-but-unreachable is a hard error on a read path (no
                 # durable side effect to protect); do not silently read the

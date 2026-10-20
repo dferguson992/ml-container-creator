@@ -360,7 +360,11 @@ export TUNE_MODEL_ID="<%= tuneModelId %>"
 # export TUNE_MODEL_ID=""
 <% } %>
 <% } %>
-# MLflow App ARN for experiment tracking (set by bootstrap, or override manually)
+# MLflow App ARN for experiment tracking.
+# The active value is resolved automatically from your bootstrap profile's
+# `mlflowAppArn` by do/lib/profile.sh (which exports MLFLOW_APP_ARN) — the same
+# profile ref the register/list/resolve flows use. Uncomment to override it
+# manually for this project only; leave commented to use the profile value.
 # export MLFLOW_APP_ARN=""
 <% } %>
 <% } %>

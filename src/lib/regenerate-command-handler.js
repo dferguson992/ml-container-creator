@@ -89,6 +89,10 @@ const SHARED_RUNTIME_VARS = [
     // MLflow tracking — preserved so _mlflow_configured() doesn't need a profile lookup
     'MLFLOW_TRACKING_SERVER_ARN',
     'MLFLOW_TRACKING_URI',
+    // BL163: MLFLOW_APP_ARN is deliberately NOT preserved here. It is re-derived
+    // from the active profile's mlflowAppArn by do/lib/profile.sh on every run
+    // (like ROLE_ARN / S3_BUCKET), so preserving it across regenerate would
+    // freeze a stale value when the profile changes.
     // Endpoint name is written at runtime by realtime/async deploys; shared
     // because it is not a status var and both endpoint families reuse it.
     'ENDPOINT_NAME'

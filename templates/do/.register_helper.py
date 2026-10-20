@@ -128,6 +128,8 @@ def main():
     list_datasets_parser.add_argument("--source", choices=["remote", "local", "all"], default="all", help="Dataset source to list")
     list_datasets_parser.add_argument("--region", default=None, help="AWS region")
     list_datasets_parser.add_argument("--core-bucket", default=None, help="MLCC Core bucket (defaults to $CORE_BUCKET)")
+    list_datasets_parser.add_argument("--project-name", default=None, help="Project name — scopes the MLflow read to this project's experiment (BL163)")
+    list_datasets_parser.add_argument("--all", dest="all_projects", action="store_true", default=False, help="List datasets across every project under the profile, not just the active one (BL163)")
 
     # ── list-dataset-versions ─────────────────────────────────────────────
     list_dv_parser = subparsers.add_parser("list-dataset-versions", help="List all versions for a specific dataset by name")
@@ -149,6 +151,7 @@ def main():
     delete_parser.add_argument("--version", default=None, help="Optional version ordinal to remove (e.g., @v2, v2, or 2)")
     delete_parser.add_argument("--region", default=None, help="AWS region")
     delete_parser.add_argument("--core-bucket", default=None, help="MLCC Core bucket (defaults to $CORE_BUCKET)")
+    delete_parser.add_argument("--project-name", default=None, help="Project name — scopes the MLflow delete-tagging to this project's experiment (BL163)")
 
     # ── register-evaluator (REWARD_FUNCTION / code-based, RLVR+MTRL) ───────
     evaluator_parser = subparsers.add_parser(
@@ -211,6 +214,8 @@ def main():
     resolve_dataset_parser.add_argument("--version", type=str, default=None, help="Version to resolve: ordinal or semver")
     resolve_dataset_parser.add_argument("--region", default=None, help="AWS region")
     resolve_dataset_parser.add_argument("--core-bucket", default=None, help="MLCC Core bucket (defaults to $CORE_BUCKET)")
+    resolve_dataset_parser.add_argument("--project-name", default=None, help="Project name — scopes the MLflow read to this project's experiment (BL163)")
+    resolve_dataset_parser.add_argument("--all", dest="all_projects", action="store_true", default=False, help="Resolve across every project under the profile, not just the active one (BL163)")
 
     # ── resolve-evaluator ─────────────────────────────────────────────────
     resolve_evaluator_parser = subparsers.add_parser("resolve-evaluator", help="Resolve a registered evaluator by name")

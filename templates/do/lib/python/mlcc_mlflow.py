@@ -65,6 +65,87 @@ def sanitize_name(hf_id):
     return hf_id.replace("/", "--").replace(" ", "")
 
 
+def _project_experiment_name(project_name=None):
+    """The per-project MLflow experiment name = the sanitized project name.
+
+    Resolution order (single derived source for every write and read path):
+    the explicit ``project_name`` argument first (the register/model helpers
+    pass ``args.project_name`` directly, since they run as subprocesses that may
+    not inherit the shell's ``PROJECT_NAME``), then the ``PROJECT_NAME`` env var
+    (exported by ``do/config`` / ``profile.sh``). Falls back to ``"Default"``
+    only when neither yields a name, preserving today's behavior for a nameless
+    context. ``sanitize_name`` makes the result a valid MLflow experiment name.
+
+    BL163: replaces the hardcoded ``set_experiment("Default")`` so runs from
+    different projects no longer collide in one experiment.
+    """
+    name = (project_name or "").strip()
+    if not name:
+        name = os.environ.get("PROJECT_NAME", "").strip()
+    return sanitize_name(name) if name else "Default"
+
+
+def _resolve_experiment_ids(client=None, project_name=None, all_projects=False):
+    """Return the MLflow experiment id(s) to READ, honoring the BL163 scope.
+
+    Default (OQ-3): the active project's experiment id PLUS ``"0"`` (OQ-4
+    read-both — legacy pre-BL163 runs live in the Default experiment "0", so they
+    stay visible without a data migration). ``all_projects=True`` returns every
+    experiment id in the store (the ``--all`` opt-in).
+
+    Resolves the active project's experiment by NAME via the client; when that
+    experiment does not exist yet (nothing project-specific written), returns
+    just ``["0"]`` — never errors on a missing experiment. Returns ``["0"]`` as
+    the safe fallback whenever resolution is not possible (no client, mlflow
+    absent, lookup failure), which matches the pre-BL163 default.
+    """
+    client = _resolve_search_client(client)
+    if client is None:
+        return ["0"]
+
+    if all_projects:
+        try:
+            experiments = client.search_experiments()
+        except Exception:  # noqa: BLE001 — fall back to read-both default
+            return ["0"]
+        ids = [getattr(e, "experiment_id", None) for e in experiments]
+        ids = [i for i in ids if i is not None]
+        return ids or ["0"]
+
+    exp_name = _project_experiment_name(project_name)
+    if exp_name == "Default":
+        # Nameless context — the legacy single-experiment behavior.
+        return ["0"]
+    try:
+        experiment = client.get_experiment_by_name(exp_name)
+    except Exception:  # noqa: BLE001 — treat as not-yet-created
+        experiment = None
+    if experiment is None:
+        return ["0"]
+    exp_id = getattr(experiment, "experiment_id", None)
+    if exp_id is None or exp_id == "0":
+        return ["0"]
+    return [exp_id, "0"]
+
+
+def _resolve_search_client(client=None):
+    """Return a usable MLflow client for experiment resolution, or None.
+
+    Unlike ``_get_client`` this never raises when mlflow is absent — experiment
+    resolution degrades to the ``["0"]`` fallback instead of failing the read.
+    """
+    if client is not None:
+        return client
+    try:
+        from mlflow import MlflowClient
+    except ImportError:
+        return None
+    try:
+        return MlflowClient()
+    except Exception:  # noqa: BLE001 — unconfigured/unreachable; degrade to fallback
+        return None
+
+
 def family_tags(base_id, artifact_type):
     """Return the standard family-membership tag dict for an artifact.
 
@@ -528,19 +609,29 @@ def _source_uri_and_meta(dataset):
     return uri, meta
 
 
-def list_dataset_inputs(client=None, experiment_ids=None):
+def list_dataset_inputs(client=None, experiment_ids=None, project_name=None,
+                        all_projects=False):
     """Return the deduplicated dataset run inputs recorded by ``log_dataset``.
 
     Reads dataset inputs across MLflow runs and returns one record per
     ``(name, digest)`` pair (most recent wins), each a dict:
     ``{"name", "digest", "s3_uri", "meta": {...}}``. This is the read source
     for ``--list`` when MLflow is configured. ``client`` is injectable for
-    testing; ``experiment_ids`` scopes the search when required.
+    testing.
+
+    BL163 scope: when ``experiment_ids`` is not given explicitly, it is resolved
+    via ``_resolve_experiment_ids`` — the active project's experiment plus "0"
+    (read-both) by default, or every experiment when ``all_projects=True``. An
+    explicit ``experiment_ids`` still wins (used by tests).
 
     Raises MlflowUnavailableError when MLflow is not installed. Underlying store
     errors propagate so a configured-but-unreachable store surfaces to the
     caller rather than silently returning empty.
     """
+    if experiment_ids is None:
+        experiment_ids = _resolve_experiment_ids(
+            client=client, project_name=project_name, all_projects=all_projects,
+        )
     runs = _search_runs(client=client, experiment_ids=experiment_ids)
     # On the module (real mlflow) path, search_runs returns lightweight summaries
     # that may not include full inputs, so re-fetch each run to populate
@@ -598,7 +689,8 @@ def list_dataset_inputs(client=None, experiment_ids=None):
     return list(by_key.values())
 
 
-def resolve_dataset_by_name(name, client=None, experiment_ids=None):
+def resolve_dataset_by_name(name, client=None, experiment_ids=None,
+                            project_name=None, all_projects=False):
     """Resolve a dataset by name from MLflow run inputs, or None.
 
     Matches on ``sanitize_name(name)`` (the recorded name) and returns the most
@@ -606,11 +698,18 @@ def resolve_dataset_by_name(name, client=None, experiment_ids=None):
     when no dataset with that name is recorded. Used by ``do/tune --dataset X``
     name resolution when MLflow is configured.
 
+    BL163 scope: resolves the read experiment id(s) the same way
+    ``list_dataset_inputs`` does (active project + "0" by default, all when
+    ``all_projects=True``) unless ``experiment_ids`` is given explicitly.
+
     Raises MlflowUnavailableError when MLflow is not installed.
     """
     safe_name = sanitize_name(name)
     match = None
-    for entry in list_dataset_inputs(client=client, experiment_ids=experiment_ids):
+    for entry in list_dataset_inputs(
+        client=client, experiment_ids=experiment_ids,
+        project_name=project_name, all_projects=all_projects,
+    ):
         if entry.get("name") == safe_name:
             match = entry  # later runs overwrite → most-recent wins
     return match
@@ -668,17 +767,27 @@ def _run_dataset_inputs(run):
         dataset_inputs = inputs.get("dataset_inputs")
     return dataset_inputs or []
 
-def tag_dataset_runs_deleted(name, client=None):
+def tag_dataset_runs_deleted(name, client=None, project_name=None, all_projects=False):
     """Tag all MLflow runs for a given dataset name as deleted.
 
     Used by do/register dataset --delete so that list_dataset_inputs()
     excludes them. mlflow.delete_run() does not reliably work on
     SageMaker MLflow Serverless — tagging is the portable alternative.
+
+    BL163 scope: resolves the experiment id(s) to scan the same way the read
+    paths do (active project + "0" read-both by default, all when
+    ``all_projects=True``), so a scoped delete finds the active project's runs
+    AND any legacy runs in experiment "0".
     """
     try:
         import mlflow as _mlflow
         _client = client or _mlflow.tracking.MlflowClient()
-        runs = _search_runs(experiment_ids=["0"])
+        experiment_ids = _resolve_experiment_ids(
+            client=_client, project_name=project_name, all_projects=all_projects,
+        )
+        # Keep the module-path search (mlflow.search_runs) as before — only the
+        # experiment scope changed from the hardcoded ["0"] to the resolved set.
+        runs = _search_runs(client=client, experiment_ids=experiment_ids)
         for run in runs:
             run_id = run.info.run_id if hasattr(run, 'info') else run.get('run_id', '')
             full = _mlflow.get_run(run_id)

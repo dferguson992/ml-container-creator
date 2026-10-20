@@ -518,7 +518,12 @@ def cmd_register_adapter(args):
                                 dataset_name=adapter_name,
                             )
                         else:
-                            mlflow.set_experiment("Default")
+                            # BL163: group the lineage run under the per-project
+                            # experiment (sanitized project name) rather than the
+                            # shared "Default", so model lineage runs no longer
+                            # collide across projects. set_experiment creates it
+                            # on first use (idempotent).
+                            mlflow.set_experiment(_mm._project_experiment_name(project_name))
                             with mlflow.start_run(run_name=f"lineage-{adapter_name}"):
                                 _mm.log_training_dataset_lineage(
                                     dataset_s3_uri=_dataset_s3_uri,

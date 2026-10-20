@@ -115,6 +115,11 @@ export class MlccCoreStack extends cdk.Stack {
         }));
 
         // MLflow experiment tracking (tune/train).
+        // NOTE (BL163): MLCC uses the serverless MLflow *App* (the Ml*App* actions
+        // below). The *MlflowTrackingServer* actions are a vestige from the earlier
+        // tracking-server design and are no longer exercised by the shared-catalog
+        // flow. They are left in place deliberately (defensive, out of scope for
+        // BL163) and flagged here for a future IAM-minimization cleanup.
         this.role.addToPolicy(new iam.PolicyStatement({
             sid: 'SageMakerMLflow',
             actions: [
