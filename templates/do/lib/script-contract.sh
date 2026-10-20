@@ -15,6 +15,7 @@
 #   _require_guard          — public API for inline flag escalation
 #   _guard_met              — non-enforcing predicate query
 #   _restrict_targets       — enforce a target allow-list (exit 3 on mismatch)
+#   _guard_artifact_kind    — reusable additive-deploy artifact-kind gate (ADR-013)
 #
 # Exit codes:
 #   3 = contract violation (guard not met)
@@ -134,6 +135,46 @@ _restrict_targets() {
     _contract_violation "target" \
         "$reason" \
         "Supported targets: ${allowed}. Switch with: do/deploy --target <target>"
+}
+
+# ---------------------------------------------------------------------------
+# _guard_artifact_kind — the REUSABLE additive-deploy artifact-kind gate (ADR-013).
+#
+# Each additive-deploy verb (do/adapter, do/add-ic, future do/add-pod) accepts a
+# set of artifact kinds and REFUSES the rest. This is the one shared gate so the
+# contract is not re-implemented per script (ADR-013 / BL164): source resolves
+# uniformly, artifact_kind selects the legal verb, target selects the mechanism.
+#
+# Usage:
+#   _guard_artifact_kind "<resolved-kind>" "<accepted-kind>" "<alt-verb guidance>"
+#   e.g. _guard_artifact_kind "$kind" "lora_adapter" \
+#            "A full fine-tuned model is not a LoRA adapter — use do/add-ic / do/add-pod."
+#
+# Args:
+#   $1 — the RESOLVED artifact_kind of the source (lora_adapter|full_model|"" unknown)
+#   $2 — the kind this verb ACCEPTS (lora_adapter|full_model)
+#   $3 — (optional) guidance pointing at the correct verb
+#
+# Behavior: returns 0 when the kinds match. When $1 is a non-empty mismatch,
+# emits the standard contract violation (exit 3). When $1 is EMPTY (legacy
+# artifact with no recorded artifact_kind), returns 0 with a warning — the caller
+# falls back to its own content check (e.g. adapter_config.json presence) rather
+# than hard-blocking a legitimate legacy artifact (BL164 R4 degrade).
+# ---------------------------------------------------------------------------
+_guard_artifact_kind() {
+    local resolved="$1" accepted="$2" guidance="${3:-}"
+    if [ -z "$resolved" ]; then
+        echo "ℹ️  artifact_kind unknown for this source (legacy); falling back to a content check." >&2
+        return 0
+    fi
+    [ "$resolved" = "$accepted" ] && return 0
+    local reason="This source is a '${resolved}', but this verb accepts '${accepted}'."
+    if [ -n "$guidance" ]; then
+        reason="${reason} ${guidance}"
+    fi
+    _contract_violation "artifact-kind" \
+        "$reason" \
+        "Register/resolve an artifact whose kind is '${accepted}', or use the verb for '${resolved}'."
 }
 
 # ── Auto-enforcement on source ─────────────────────────────────────────────

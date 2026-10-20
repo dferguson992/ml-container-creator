@@ -133,6 +133,23 @@ export class MlccCoreStack extends cdk.Stack {
             resources: ['*'],
         }));
 
+        // MLflow -> Model Registry bridge (BL164 / ADR-013). When the App has
+        // AutoModelRegistrationEnabled, mlflow.register_model makes THIS role
+        // auto-create a SageMaker Model Package (+ group) and its lineage edges.
+        // The bridge needs these three beyond the base MLflow actions above;
+        // without them lineage/lifecycle silently degrade (live-verified the role
+        // was missing them, BL168 §6). Model-package create/describe already exist
+        // elsewhere in this policy.
+        this.role.addToPolicy(new iam.PolicyStatement({
+            sid: 'SageMakerModelRegistryBridge',
+            actions: [
+                'sagemaker:UpdateModelPackage',   // lifecycle (alias -> stage/status)
+                'sagemaker:CreateAction',         // lineage: experiment/run -> package
+                'sagemaker:AddAssociation',       // lineage edges
+            ],
+            resources: ['*'],
+        }));
+
         // PassRole — benchmark/training services pass THIS role to the jobs they create.
         this.role.addToPolicy(new iam.PolicyStatement({
             sid: 'PassExecutionRole',

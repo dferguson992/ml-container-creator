@@ -76,3 +76,6 @@ See the ADR log:
   descriptor / single source of truth (v2.0 Wave 3, BL129).
 - [ADR-012](../adr/ADR-012-consume-dont-provision-clusters.md) — consume-don't-provision
   for EKS / HyperPod clusters (v2.0 Wave 4; the BYO-cluster contract posture).
+- [ADR-013](../adr/ADR-013-additive-deploy-artifact-kind-contract.md) — additive-deploy is
+  artifact-kind-driven and target-uniform (source resolves uniformly, artifact_kind gates the verb,
+  target selects the load mechanism).

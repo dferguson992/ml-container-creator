@@ -463,7 +463,7 @@ _show_status() {
                     --job-name "${job_name}" \
                     --region "${AWS_REGION}" \
                     --training-type "${training_type}" \
-                    --model-package-group "${PROJECT_NAME}-tune-models" 2>/dev/null) || resolve_result=""
+                    --model-package-group "${PROJECT_NAME}" 2>/dev/null) || resolve_result=""
 
                 if [ -n "${resolve_result}" ]; then
                     local artifact_path
@@ -1553,8 +1553,9 @@ print(entry.get('provider', ''))
         --project-name "${PROJECT_NAME}"
     )
 
-    # Add model package group
-    submit_args+=(--model-package-group "${PROJECT_NAME}-tune-models")
+    # Add model package group (BL164: the PROJECT group, not -tune-models, so the
+    # tune output shares one catalog with do/register's bridge registrations).
+    submit_args+=(--model-package-group "${PROJECT_NAME}")
 
     # BL128: resolve the technique-aware hyperparameter knobs from the tune descriptor
     # (defaults + --set/legacy-flag overrides), validating each against the selected
@@ -1821,7 +1822,7 @@ _handle_completion() {
         --region "${AWS_REGION}"
         --training-type "${ARG_TRAINING_TYPE}"
     )
-    resolve_args+=(--model-package-group "${PROJECT_NAME}-tune-models")
+    resolve_args+=(--model-package-group "${PROJECT_NAME}")
 
     local resolve_result
     resolve_result=$(python3 "${HELPER_SCRIPT}" resolve "${resolve_args[@]}" 2>/dev/null) || {
@@ -1861,6 +1862,36 @@ _handle_completion() {
     echo "   Artifact: ${artifact_path}"
     if [ -n "${model_package_arn}" ]; then
         echo "   Model Package: ${model_package_arn}"
+    fi
+
+    # ── BL164 R5: post-tune deploy-fit handoff (LoRA adapters only) ───────────
+    # Surface the adapter's effective rank/alpha from its adapter_config.json
+    # (fall back to the submitted values), and WARN — never block (OQ-5) — when
+    # the rank exceeds the serving engine's buffer (VLLM_MAX_LORA_RANK). Degrade
+    # to the plain output (with a note) when the config can't be read.
+    if [ "${output_type}" = "adapter" ] && [ -n "${artifact_path}" ]; then
+        local _acfg_json _lora_r _lora_alpha
+        _acfg_json=$(aws s3 cp "${artifact_path%/}/adapter_config.json" - --region "${AWS_REGION}" 2>/dev/null || echo "")
+        if [ -n "${_acfg_json}" ]; then
+            _lora_r=$(echo "${_acfg_json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('r',''))" 2>/dev/null || echo "")
+            _lora_alpha=$(echo "${_acfg_json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('lora_alpha',''))" 2>/dev/null || echo "")
+        else
+            # Fall back to submitted hyperparameters recorded in do/config.
+            _lora_r="${LORA_RANK:-}"
+            _lora_alpha="${LORA_ALPHA:-}"
+        fi
+        if [ -n "${_lora_r}" ]; then
+            echo "   LoRA rank: ${_lora_r}${_lora_alpha:+  | alpha: ${_lora_alpha}}"
+            # Rank-fit: warn (not block) if rank exceeds the deployed serving buffer.
+            if [ -n "${VLLM_MAX_LORA_RANK:-}" ] && [ "${_lora_r}" -gt "${VLLM_MAX_LORA_RANK}" ] 2>/dev/null; then
+                echo ""
+                echo "   ⚠️  Adapter rank ${_lora_r} exceeds the serving max_lora_rank (${VLLM_MAX_LORA_RANK})."
+                echo "      The engine will reject/truncate it at load. Raise VLLM_MAX_LORA_RANK in"
+                echo "      do/config (>= ${_lora_r}) and redeploy before hot-loading this adapter."
+            fi
+        else
+            echo "   (adapter rank/alpha unavailable — adapter_config.json not readable)"
+        fi
     fi
     echo ""
 
@@ -1972,7 +2003,7 @@ _dry_run() {
     echo "   Dataset:       ${RESOLVED_DATASET_S3_URI}"
     echo "   Output bucket: ${output_bucket}"
     echo "   Role:          ${role_arn}"
-    echo "   Package group: ${PROJECT_NAME}-tune-models"
+    echo "   Package group: ${PROJECT_NAME}"
 
     # BL128: show the technique-aware knobs the user set (--set / legacy aliases), keyed
     # by the descriptor's canonical knob name. Defaults the builder fills in are NOT shown

@@ -33,6 +33,7 @@ CLI (one-shot, for bash callers):
     prompt_shape            — prints "message-list"/"string"
     dataset_format          — prints "parquet"/"jsonl"
     is_verified             — prints "true"/"false" (dataset_contract.verified)
+    artifact_kind           — prints "lora_adapter"/"full_model" (or empty when absent)
 
   [variant] is optional ('lora'|'full'); omit for the default variant
   (prefers 'lora', else the sole declared variant).
@@ -211,12 +212,29 @@ def is_verified(technique: str, variant: str | None = None,
     return bool(dataset_contract(technique, variant, tune_dir).get("verified", False))
 
 
+def artifact_kind(technique: str, variant: str | None = None,
+                  tune_dir: str | None = None) -> str | None:
+    """Return the artifact_kind for a technique+variant ("lora_adapter" |
+    "full_model"), or None when absent.
+
+    DERIVED from the variant's `peft` and schema-enforced at author time
+    (manifest.schema.json). Mirrors the Node reader `artifactKind`
+    (src/lib/tune-manifest-reader.js) so the two cannot diverge — BL164 records
+    this on the registered model/adapter version so the additive-deploy verbs
+    can gate by it (ADR-013). Variant resolution matches the other accessors
+    (prefers 'lora', else the sole declared variant).
+    """
+    v = _resolve_variant(read_manifest(technique, tune_dir), variant)
+    ak = v.get("artifact_kind")
+    return ak if isinstance(ak, str) else None
+
+
 def _cli(argv: list[str]) -> int:
     if len(argv) < 2:
         print(
             "usage: tune_manifest.py <op> <technique> [variant]\n"
             "  ops: dataset_contract | required_dataset_fields | reward_model_style |\n"
-            "       prompt_shape | dataset_format | is_verified",
+            "       prompt_shape | dataset_format | is_verified | artifact_kind",
             file=sys.stderr,
         )
         return 2
@@ -238,6 +256,8 @@ def _cli(argv: list[str]) -> int:
             print(dataset_format(technique, variant))
         elif op == "is_verified":
             print("true" if is_verified(technique, variant) else "false")
+        elif op == "artifact_kind":
+            print(artifact_kind(technique, variant) or "")
         else:
             print(f"unknown op: {op}", file=sys.stderr)
             return 2

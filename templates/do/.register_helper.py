@@ -80,6 +80,7 @@ def main():
     reg_parser.add_argument("--region", default=None, help="AWS region")
     reg_parser.add_argument("--role-arn", default="", help="IAM execution role ARN")
     reg_parser.add_argument("--benchmark-results", default=None, help="Benchmark results JSON string")
+    reg_parser.add_argument("--artifact-kind", default=None, choices=["lora_adapter", "full_model"], help="Override the artifact kind (BL164/ADR-013); default by verb intent (register-model = full_model)")
 
     # ── register-adapter ──────────────────────────────────────────────────
     adapter_parser = subparsers.add_parser("register-adapter", help="Register an adapter as a versioned Model Package linked to base model")
@@ -102,6 +103,7 @@ def main():
     adapter_parser.add_argument("--generator-version", default="", help="Generator version")
     adapter_parser.add_argument("--region", default=None, help="AWS region")
     adapter_parser.add_argument("--role-arn", default="", help="IAM execution role ARN")
+    adapter_parser.add_argument("--artifact-kind", default=None, choices=["lora_adapter", "full_model"], help="Override the artifact kind (BL164/ADR-013); default by verb intent (register-adapter = lora_adapter)")
 
     # ── register-dataset ─────────────────────────────────────────────────
     dataset_parser = subparsers.add_parser("register-dataset", help="Register a dataset with content-aware versioning")

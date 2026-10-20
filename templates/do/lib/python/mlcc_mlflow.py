@@ -11,6 +11,7 @@ import os
 TAG_FAMILY = "mlcc.family"                # base model id — the family key
 TAG_ARTIFACT_TYPE = "mlcc.artifact_type"  # e.g. "base", "adapter", "draft", "dataset"
 TAG_MANAGED_BY = "mlcc.managed_by"        # constant marker: "mlcc"
+TAG_ARTIFACT_KIND = "mlcc.artifact_kind"  # BL164/ADR-013: "lora_adapter" | "full_model"
 
 # Param keys (lineage detail)
 PARAM_BASE_MODEL_ID = "mlcc.base_model_id"
@@ -315,6 +316,121 @@ def register(model_uri, name, tags=None, params=None, aliases=None, client=None)
         client.set_registered_model_alias(safe_name, alias, version.version)
 
     return version
+
+
+# Tag the bridge stamps on a registered model version once SageMaker has
+# auto-created the corresponding Model Package (see register_via_bridge).
+SAGEMAKER_MODEL_PACKAGE_ARN_TAG = "sagemaker.model_package_arn"
+
+
+def register_via_bridge(*, registered_model_name, model_data_url, artifact_kind,
+                        experiment_name=None, tags=None, params=None, aliases=None,
+                        inference_spec=None, base_model_name=None,
+                        model_type=None, client=None):
+    """Register an S3-artifact model THROUGH MLflow so the SageMaker native bridge
+    (AutoModelRegistrationEnabled) auto-creates the Model Package Group + version.
+
+    This is the ONE registration seam for BL164 (ADR-013), uniform across base
+    models, full fine-tunes, and LoRA adapters — all of which are S3 ARTIFACTS,
+    not live MLflow model objects. LIVE-VERIFIED (BL164 probes): the mechanism is
+      1. ``mlflow.create_external_model`` — register the S3 artifact as a logged
+         model WITHOUT uploading a model object (``model_data_url`` is the S3
+         weights/adapter prefix the register paths already have);
+      2. (full_model only) ``sagemaker_mlflow.log_inference_specification`` on the
+         logged-model id so the bridge's Model Package is directly deployable;
+      3. ``mlflow.register_model(models:/<logged-model-id>, name)`` — the bridge
+         fires and SageMaker auto-creates the Model Package Group+version.
+
+    Kind-aware (OQ-1):
+      - ``full_model`` (full fine-tune, base, hand ``do/register model``): logs an
+        inference spec → deployable Model Package.
+      - ``lora_adapter``: NO inference spec (hot-loaded, no standalone serving
+        target); a native base->adapter lineage edge is tagged when
+        ``base_model_name`` is given.
+
+    ``artifact_kind`` is recorded as a version tag so the additive-deploy verbs
+    gate by it (ADR-013). ``tags``/``params`` become version tags; ``aliases`` are
+    assigned to the created version. ``experiment_name`` scopes the logged model
+    to the per-project experiment (BL163); defaults to ``_project_experiment_name()``.
+
+    Returns ``{registered_model_name, version, sagemaker_model_package_arn,
+    logged_model_id}``. The ARN is read back from the version's
+    ``sagemaker.model_package_arn`` tag — LIVE-VERIFIED present synchronously once
+    ``register_model`` returns, so a single read-back suffices (no poll). The
+    bridge group is ``<registered-model-name>-<hash>`` (6-hex App-id suffix, NO
+    ``mlflow-`` prefix — do not assume one).
+
+    Raises MlflowUnavailableError when mlflow is not installed. Real registration
+    errors (bad input, permissions, a missing S3 artifact the bridge validates)
+    propagate; the hybrid warn-and-reconcile posture for a TRANSIENT unreachable
+    App is BL167's concern, not this helper's.
+    """
+    safe_name = sanitize_name(registered_model_name)
+    tags = dict(tags or {})
+    params = params or {}
+    aliases = aliases or []
+    tags[TAG_ARTIFACT_KIND] = artifact_kind
+    if base_model_name:
+        tags[TAG_FAMILY] = sanitize_name(base_model_name)
+
+    try:
+        import mlflow
+    except ImportError as exc:
+        raise MlflowUnavailableError(
+            "mlflow is not installed; install it to register models "
+            "(pip install mlflow)"
+        ) from exc
+
+    # Scope the logged model to the per-project experiment (BL163).
+    mlflow.set_experiment(experiment_name or _project_experiment_name())
+
+    # 1. Register the S3 artifact as an external logged model (no object upload).
+    with mlflow.start_run():
+        logged = mlflow.create_external_model(
+            name=safe_name,
+            model_type=model_type or ("lora-adapter" if artifact_kind == "lora_adapter"
+                                      else "full-model"),
+        )
+    logged_model_id = logged.model_id
+
+    # 2. Full models carry an inference spec → deployable Model Package. The spec
+    #    MUST reference the real model_data_url; the bridge validates the S3 keys
+    #    exist at CreateModelPackage time (probe-confirmed). Adapters log none.
+    if artifact_kind == "full_model" and inference_spec is not None:
+        try:
+            import sagemaker_mlflow
+            sagemaker_mlflow.log_inference_specification(
+                logged_model_id, inference_specification=inference_spec,
+            )
+        except Exception as exc:  # noqa: BLE001 — spec is additive to the package
+            import sys
+            print(f"\u26a0\ufe0f  inference spec not attached ({exc}); the model "
+                  "registers without a deployable spec.", file=sys.stderr)
+
+    # 3. The bridge fires: mlflow.register_model → SageMaker auto-creates the MPG.
+    mv = mlflow.register_model(f"models:/{logged_model_id}", safe_name, tags=tags or None)
+
+    _client = _get_client(client)
+    for key, value in params.items():
+        _client.set_model_version_tag(safe_name, mv.version, key, value)
+    for alias in aliases:
+        _client.set_registered_model_alias(safe_name, alias, mv.version)
+
+    # Read back the SageMaker Model Package ARN the bridge stamps (synchronous).
+    sm_arn = None
+    try:
+        refreshed = _client.get_model_version(safe_name, mv.version)
+        version_tags = getattr(refreshed, "tags", {}) or {}
+        sm_arn = version_tags.get(SAGEMAKER_MODEL_PACKAGE_ARN_TAG)
+    except Exception:  # noqa: BLE001 — ARN read-back is best-effort
+        pass
+
+    return {
+        "registered_model_name": safe_name,
+        "logged_model_id": logged_model_id,
+        "version": mv.version,
+        "sagemaker_model_package_arn": sm_arn,
+    }
 
 
 def _make_uri_source(uri, meta=None):

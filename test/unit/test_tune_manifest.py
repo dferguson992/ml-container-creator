@@ -151,3 +151,61 @@ def test_read_hyperparameters_lora_only_default_variant(tmp_path):
     # mtrl ships lora-only; omitting the variant resolves to it (empty pre-sync is fine).
     hp = tune_manifest.read_hyperparameters("mtrl")
     assert isinstance(hp, dict)
+
+
+# -- artifact_kind (BL164: recorded on the registered version; ADR-013 gate) ---
+
+def test_artifact_kind_lora_variant_is_lora_adapter():
+    assert tune_manifest.artifact_kind("sft", "lora") == "lora_adapter"
+    assert tune_manifest.artifact_kind("dpo", "lora") == "lora_adapter"
+
+
+def test_artifact_kind_full_variant_is_full_model():
+    assert tune_manifest.artifact_kind("sft", "full") == "full_model"
+    assert tune_manifest.artifact_kind("dpo", "full") == "full_model"
+
+
+def test_artifact_kind_default_variant_resolves():
+    # Omitting the variant prefers 'lora' (present on every technique) → lora_adapter.
+    assert tune_manifest.artifact_kind("rlvr") == "lora_adapter"
+    assert tune_manifest.artifact_kind("mtrl") == "lora_adapter"  # mtrl is lora-only
+
+
+def test_artifact_kind_missing_technique_raises_not_found():
+    with pytest.raises(tune_manifest.ManifestNotFound):
+        tune_manifest.artifact_kind("nope")
+
+
+# -- Drift guard: the Python accessor must agree with EVERY committed descriptor
+#    for EVERY declared variant. Because the Node reader (tune-manifest-reader.js
+#    artifactKind) reads the SAME manifest.json field, pinning the Python accessor
+#    to the descriptor's recorded value keeps the two readers from diverging
+#    (ADR-011 posture: one declared source, conformance-checked). If a new
+#    technique/variant is added, this test exercises it automatically.
+
+def _iter_committed_variants():
+    import json
+    tune_d = os.path.join(_REPO_ROOT, "templates", "code", "tune.d")
+    for technique in sorted(os.listdir(tune_d)):
+        mpath = os.path.join(tune_d, technique, "manifest.json")
+        if not os.path.isfile(mpath):
+            continue
+        with open(mpath, encoding="utf-8") as f:
+            manifest = json.load(f)
+        for variant, vobj in (manifest.get("variants") or {}).items():
+            yield technique, variant, vobj.get("artifact_kind")
+
+
+def test_artifact_kind_accessor_matches_every_descriptor_variant():
+    seen = 0
+    for technique, variant, declared in _iter_committed_variants():
+        seen += 1
+        # Every committed variant declares an artifact_kind (schema-enforced).
+        assert declared in ("lora_adapter", "full_model"), (
+            f"{technique}/{variant} has unexpected artifact_kind {declared!r}"
+        )
+        # The reader returns exactly what the descriptor records — no drift.
+        assert tune_manifest.artifact_kind(technique, variant) == declared, (
+            f"reader disagrees with descriptor for {technique}/{variant}"
+        )
+    assert seen > 0, "no tune.d descriptors found — the drift guard exercised nothing"

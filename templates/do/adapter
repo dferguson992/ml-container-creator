@@ -1485,6 +1485,38 @@ _adapter_add() {
         fi
     fi
 
+    # ── ADR-013 artifact-kind gate (BL164 R4): do/adapter accepts lora_adapter.
+    # Resolve the source's artifact_kind, then run the REUSABLE guard
+    # (_guard_artifact_kind in script-contract.sh). A full_model is refused with
+    # a pointer to do/add-ic; an UNKNOWN kind (legacy) falls through to the
+    # content check (adapter_config.json) rather than hard-blocking.
+    _resolved_kind=""
+    if [ -n "${from_tune}" ]; then
+        if [ -n "${from_tune_technique}" ]; then
+            # Descriptor is the source of truth for a technique's artifact_kind.
+            _tech="${from_tune_technique%%-*}"
+            _resolved_kind=$(python3 "${SCRIPT_DIR}/lib/python/tune_manifest.py" \
+                artifact_kind "${_tech}" 2>/dev/null || echo "")
+        elif [ "${TUNE_OUTPUT_TYPE_LATEST:-}" = "full-model" ]; then
+            _resolved_kind="full_model"
+        elif [ "${TUNE_OUTPUT_TYPE_LATEST:-}" = "adapter" ]; then
+            _resolved_kind="lora_adapter"
+        fi
+    elif [ -n "${from_registry}" ] && [ -n "${version_line:-}" ]; then
+        # The registered version carries mlcc.artifact_kind (BL164); read it back.
+        _resolved_kind=$(echo "${version_line}" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    md = d.get('customer_metadata_properties') or d.get('metadata') or {}
+    print(md.get('mlcc.artifact_kind', '') or md.get('artifact_kind', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+    fi
+    _guard_artifact_kind "${_resolved_kind}" "lora_adapter" \
+        "A full fine-tuned model cannot be hot-loaded as a LoRA adapter — use do/add-ic (realtime) or do/add-pod (cluster)."
+
     echo "🔌 Adding adapter: ${adapter_name}"
     if [ -n "${from_hub}" ]; then
         echo "   Source: HuggingFace Hub (${from_hub})"

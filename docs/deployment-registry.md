@@ -1,21 +1,28 @@
-!!! info "Two Model Package Groups per project"
-    Each project creates **two separate MPGs** in SageMaker:
+!!! info "Registration flows through MLflow (the native Model Registry bridge)"
+    Model and adapter registration go THROUGH MLflow: `do/register` and `do/tune`
+    call `mlflow.register_model`, and SageMaker's native bridge
+    (AutoModelRegistrationEnabled on the profile's MLflow App) auto-creates the
+    corresponding SageMaker Model Package Group + version. You no longer create the
+    group by hand, and there is no separate `{project}-tune-models` group — the tune
+    output and your `do/register` records land in ONE catalog per project.
 
-    | MPG | Created by | Purpose |
-    |-----|-----------|---------|
-    | `{project-name}` | `do/register` | **Deployment registry** — base model + adapters with full deployment context (container image, instance type, benchmark data, adapter lineage) |
-    | `{project-name}-tune-models` | SageMaker `SFTTrainer`/`DPOTrainer` | **Training artifacts** — raw tuning outputs auto-registered by the managed customization service |
+    Identity is **kind-aware**: a `full_model` (base model / full fine-tune) is its
+    own MLflow registered model → its own bridge MPG, carrying an inference spec
+    (deployable via `do/add-ic` / `do/add-pod`); a `lora_adapter` is linked to its
+    base via a native lineage edge with NO inference spec (hot-loaded via
+    `do/adapter`). The bridge group is `{registered-model-name}-{hash}`. Every
+    version carries an `mlcc.artifact_kind` tag so the additive-deploy verbs gate by
+    it (ADR-013): `do/adapter` refuses a `full_model` and points you at `do/add-ic`.
 
-    These serve complementary purposes:
-
-    - **Tune MPG** is auto-managed by SageMaker training. You don't control its schema or metadata — it's the training system's record of what was produced.
-    - **Deployment MPG** is your explicit, schema-controlled registry. It records what's actually deployed, with full metadata for governance, reproducibility, and post-v1 features (`do/import`, `do/update`).
-
-    Adapters appear in **both** — the tune MPG records the raw artifact, and `do/register` records the deployment with additional context (which endpoint, which instance, benchmark results, parent model linkage).
+    **Enable + migration:** the bridge needs `UpdateModelPackage` / `CreateAction` /
+    `AddAssociation` on the `core` role (BL164) — run
+    `ml-container-creator bootstrap update --module core` once (~15 min to
+    propagate). Pre-BL164 groups (`{project}`, `{project}-tune-models`) are left in
+    place and stay resolvable by ARN; registration is go-forward only.
 
 # Model Registration (MPG)
 
-`do/register` records what you deploy as versioned Model Packages in a SageMaker Model Package Group (MPG) — base model, adapters, deployment context, and lineage. The MPG is the system of record; use it to audit what's running, govern versions, and feed the CI system with testable configurations.
+`do/register` records what you deploy as versioned Model Packages — base model, adapters, deployment context, and lineage — THROUGH the MLflow → SageMaker Model Registry bridge (see the note above). The resulting Model Package is the system of record; use it to audit what's running, govern versions, and feed the CI system with testable configurations.
 
 !!! note "The local deployment registry was removed"
     Earlier versions also wrote a machine-local `registry.json` deployment-history
