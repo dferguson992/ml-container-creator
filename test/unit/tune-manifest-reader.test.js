@@ -77,6 +77,15 @@ describe('tune-manifest-reader', () => {
         it('returns null for a missing technique', () => {
             assert.strictEqual(readDatasetContract('nope'), null);
         });
+        it('normalizes the `full-rank` training-type alias to the `full` variant', () => {
+            // do/tune's --training-type value is passed verbatim as the variant; the CLI
+            // speaks `full-rank` but the descriptor key is `full`. The reader must map the
+            // alias (parity with the Python reader's _VARIANT_ALIASES), else full-rank
+            // resolves to null → empty capability/HP data. Assert the alias reaches the
+            // SAME contract as `full` (and is not a null miss).
+            assert.deepStrictEqual(readDatasetContract('sft', 'full-rank'), readDatasetContract('sft', 'full'));
+            assert.notStrictEqual(readDatasetContract('sft', 'full-rank'), null);
+        });
     });
 
     describe('readHyperparameters', () => {

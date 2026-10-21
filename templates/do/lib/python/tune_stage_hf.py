@@ -188,6 +188,70 @@ def _stage_rl_verl(args, dataset_id, org, name, split, data_files, hf_token,
     return s3_uri, total
 
 
+def _normalize_json_array_to_jsonl(local_path, data_file, json_mod):
+    """BL179: normalize a single-JSON-ARRAY (or wrapped) ``.json`` file to JSONL.
+
+    Some HF datasets ship a ``.json`` that is one JSON document — a top-level
+    array ``[ {...}, {...} ]`` or a ``{"data"|"rows"|"examples"|"train": [...]}``
+    wrapper — rather than line-delimited JSONL. The JSONL staging path reads
+    line-by-line (``json.loads`` per line) and dies on a leading ``[`` with
+    "Expecting value: line 1 column 2 (char 1)". This detects that shape and
+    rewrites the file to JSONL (one object per line), returning the (possibly
+    new) ``(local_path, data_file)`` to continue with.
+
+    A genuine JSONL file (first non-space char ``{`` followed by newline-delimited
+    objects) is left UNTOUCHED — we only rewrite when the whole file parses as a
+    single JSON value that yields a list of records. Non-``.json`` files
+    (``.jsonl``/``.ndjson``) are left untouched. Best-effort: if the file is not
+    valid single-document JSON (i.e. it really is JSONL), we return it unchanged
+    and let the existing per-line path handle it.
+    """
+    # Only consider .json (NOT .jsonl / .ndjson — those are line-delimited by name).
+    base = os.path.basename(local_path)
+    if base.endswith(".jsonl") or base.endswith(".ndjson"):
+        return local_path, data_file
+
+    # Peek the first non-whitespace byte; a JSONL file starts with '{' then a
+    # newline-delimited stream, so a single-doc rewrite only applies when the file
+    # parses as ONE json value. Try a full json.load; on failure assume real JSONL.
+    try:
+        with open(local_path, "r", encoding="utf-8", errors="replace") as f:
+            head = f.read(64).lstrip()
+            if not head or head[0] not in "[{":
+                return local_path, data_file
+        with open(local_path, "r", encoding="utf-8", errors="replace") as f:
+            doc = json_mod.load(f)
+    except (ValueError, OSError):
+        # Not a single JSON document → it is (or is treated as) JSONL. Leave it.
+        return local_path, data_file
+
+    # Extract the record list: a bare array, or a common wrapper key.
+    if isinstance(doc, list):
+        records = doc
+    elif isinstance(doc, dict):
+        records = None
+        for key in ("data", "rows", "examples", "train", "instances"):
+            if isinstance(doc.get(key), list):
+                records = doc[key]
+                break
+        if records is None:
+            # A single object that is itself one record → wrap as a 1-row dataset.
+            records = [doc]
+    else:
+        # A scalar top-level JSON value is not a dataset — leave it for the
+        # downstream validator to reject with its own message.
+        return local_path, data_file
+
+    jsonl_path = os.path.splitext(local_path)[0] + ".from_array.jsonl"
+    with open(jsonl_path, "w", encoding="utf-8") as out_f:
+        for rec in records:
+            out_f.write(json_mod.dumps(rec, ensure_ascii=False) + "\n")
+    print(f"\u2139\ufe0f  Converted single-JSON-array file '{os.path.basename(data_file)}' "
+          f"({len(records)} records) to JSONL for staging (BL179).", file=sys.stderr)
+    new_data_file = os.path.splitext(data_file)[0] + ".from_array.jsonl"
+    return jsonl_path, new_data_file
+
+
 def cmd_stage_hf(args):
     """Download HF dataset to S3 using huggingface_hub.
 
@@ -395,6 +459,17 @@ def cmd_stage_hf(args):
                     column_map = _parse_column_map(getattr(args, 'column_map', None))
                     technique = getattr(args, 'technique', 'sft')
                     no_transform = getattr(args, 'no_transform', False)
+
+                    # BL179: some HF datasets ship a `.json` file that is a SINGLE
+                    # JSON ARRAY (e.g. [ {...}, {...} ]) or a {"data": [...]} wrapper,
+                    # NOT line-delimited JSONL. The code below reads the file
+                    # LINE-BY-LINE (json.loads per line), which fails on a leading
+                    # "[" with 'Expecting value: line 1 column 2 (char 1)'. Normalize
+                    # such a file to JSONL in place so the rest of this branch
+                    # (validate/map/flatten/take/count/upload) works unchanged. A real
+                    # JSONL file is left untouched.
+                    local_path, data_file = _normalize_json_array_to_jsonl(
+                        local_path, data_file, json_mod)
 
                     chat_columns = {}
                     with open(local_path, "r", encoding="utf-8", errors="replace") as f:

@@ -84,12 +84,21 @@ export function listVariants(technique, tuneDir = TUNE_D) {
     return Object.keys(m.variants).sort();
 }
 
+// do/tune's `--training-type` CLI values (and the tune catalog's trainingTypes)
+// speak `lora` / `full-rank`, but the descriptor keys PEFT variants as `lora` /
+// `full`. Normalize the alias so `full-rank` resolves the `full` variant instead of
+// missing (returning null → empty capability/HP data). Mirrors the Python reader's
+// `_VARIANT_ALIASES` in tune_manifest.py (kept in parity per derive-dont-hardcode).
+const VARIANT_ALIASES = { 'full-rank': 'full', full_rank: 'full' };
+
 /** Resolve a variant object, defaulting to the sole/`lora` variant when unspecified. */
 function resolveVariant(manifest, variant) {
     if (!manifest || !manifest.variants || typeof manifest.variants !== 'object') return null;
     const variants = manifest.variants;
-    if (variant && variants[variant]) return variants[variant];
-    if (variant) return null;
+    if (variant) {
+        const key = VARIANT_ALIASES[variant] || variant;
+        return variants[key] || null;
+    }
     // No variant requested: prefer 'lora', else the first declared.
     if (variants.lora) return variants.lora;
     const keys = Object.keys(variants);

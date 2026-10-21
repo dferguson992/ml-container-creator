@@ -124,12 +124,15 @@ def test_resolve_experiment_ids_no_client_degrades_to_zero():
 
 # ── 1. No local-file tracking anywhere in the runtime python ─────────────────
 
-_LOCAL_FILE_PATTERNS = [
+# A LOCAL tracking TARGET is the harm (it bypasses the shared serverless store).
+# The harm is a local *URI value*, not any particular API call: ``set_tracking_uri``
+# is the ONLY way to point the client AT the serverless App, so it is permitted —
+# what is banned is setting tracking to a LOCAL store (sqlite / file / mlruns).
+_LOCAL_TRACKING_PATTERNS = [
     re.compile(r"sqlite://"),
-    re.compile(r"mlflow\.db"),
     re.compile(r"\./mlruns"),
     re.compile(r"\bfile://"),
-    re.compile(r"set_tracking_uri"),
+    re.compile(r"""set_tracking_uri\(\s*['"][^'"]*(?:sqlite:|file:|mlruns|\.db)"""),
 ]
 
 
@@ -140,13 +143,29 @@ def _runtime_python_files():
                 yield os.path.join(root, f)
 
 
+def _strip_comments(text):
+    """Drop ``#`` comment tails and docstring-only mentions so a literal like
+    ``mlflow.db`` in an explanatory comment is not mistaken for a local target.
+    Keeps code lines intact (best-effort: splits on the first unquoted ``#``)."""
+    out = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        # Drop an inline comment tail (approximate; runtime files use plain # tails).
+        if "#" in line:
+            line = line.split("#", 1)[0]
+        out.append(line)
+    return "\n".join(out)
+
+
 def test_no_local_file_tracking_uri_in_runtime_python():
     offenders = []
     for path in _runtime_python_files():
         with open(path, encoding="utf-8") as fh:
-            text = fh.read()
-        for pat in _LOCAL_FILE_PATTERNS:
-            if pat.search(text):
+            code = _strip_comments(fh.read())
+        for pat in _LOCAL_TRACKING_PATTERNS:
+            if pat.search(code):
                 offenders.append((os.path.basename(path), pat.pattern))
     assert offenders == [], (
         "local-file MLflow tracking introduced (the shared serverless store must "
@@ -271,6 +290,87 @@ def test_ensure_project_experiment_nameless_is_noop(monkeypatch):
     monkeypatch.setattr(mlcc_mlflow, "_mlflow_configured", lambda *a, **k: True)
     monkeypatch.delenv("PROJECT_NAME", raising=False)
     assert mlcc_mlflow.ensure_project_experiment("") is None
+
+
+# ── _mlflow_configured must ROUTE the active client, not just set env ────────
+# Regression for the BL164 live bug: setting MLFLOW_TRACKING_SERVER_ARN in the
+# environment does NOT move mlflow's already-resolved (local sqlite) client, so
+# register_via_bridge wrote to a LOCAL registry and the bridge never fired
+# ("MPG registration returned incomplete data"). _mlflow_configured must call
+# mlflow.set_tracking_uri(uri) so the client actually points at the App.
+
+
+class _RoutableMlflow:
+    """Minimal mlflow stub that records set_tracking_uri like the real client:
+    get_tracking_uri() returns whatever was last set (default a local store)."""
+
+    def __init__(self):
+        self._uri = "sqlite:///mlflow.db"
+        self.set_calls = []
+
+    def get_tracking_uri(self):
+        return self._uri
+
+    def set_tracking_uri(self, uri):
+        self.set_calls.append(uri)
+        self._uri = uri
+
+
+def test_mlflow_configured_routes_client_to_config_arn(monkeypatch):
+    """Config-resolved ARN (the do/register path) → client pointed at the App."""
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.delenv("MLFLOW_TRACKING_SERVER_ARN", raising=False)
+    arn = "arn:aws:sagemaker:us-west-2:1:mlflow-app/app-X"
+    monkeypatch.setattr(mlcc_mlflow, "_config_tracking_uri", lambda *a, **k: arn)
+    fake = _RoutableMlflow()
+    monkeypatch.setitem(sys.modules, "mlflow", fake)
+
+    assert mlcc_mlflow._mlflow_configured() is True
+    # The active client was moved OFF the local default and ONTO the App ARN.
+    assert fake.get_tracking_uri() == arn
+    assert fake.set_calls == [arn]
+    # Env is also mirrored for remote tooling / the plugin.
+    assert os.environ.get("MLFLOW_TRACKING_SERVER_ARN") == arn
+
+
+def test_mlflow_configured_routes_client_when_env_arn_preset(monkeypatch):
+    """A preset env ARN must STILL route the client (the pre-fix early-return bug:
+    env set but client left on the local store)."""
+    arn = "arn:aws:sagemaker:us-west-2:1:mlflow-app/app-Y"
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.setenv("MLFLOW_TRACKING_SERVER_ARN", arn)
+    fake = _RoutableMlflow()
+    monkeypatch.setitem(sys.modules, "mlflow", fake)
+
+    assert mlcc_mlflow._mlflow_configured() is True
+    assert fake.get_tracking_uri() == arn
+    assert fake.set_calls == [arn]
+
+
+def test_mlflow_configured_https_uri_routes_to_tracking_uri(monkeypatch):
+    """A non-ARN HTTPS ref routes the client and mirrors to MLFLOW_TRACKING_URI."""
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.delenv("MLFLOW_TRACKING_SERVER_ARN", raising=False)
+    uri = "https://mlflow.example.internal"
+    monkeypatch.setattr(mlcc_mlflow, "_config_tracking_uri", lambda *a, **k: uri)
+    fake = _RoutableMlflow()
+    monkeypatch.setitem(sys.modules, "mlflow", fake)
+
+    assert mlcc_mlflow._mlflow_configured() is True
+    assert fake.get_tracking_uri() == uri
+    assert os.environ.get("MLFLOW_TRACKING_URI") == uri
+
+
+def test_mlflow_configured_unconfigured_is_false(monkeypatch):
+    """No env, no config ref → False and the client is left untouched (no local write)."""
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.delenv("MLFLOW_TRACKING_SERVER_ARN", raising=False)
+    monkeypatch.setattr(mlcc_mlflow, "_config_tracking_uri", lambda *a, **k: None)
+    fake = _RoutableMlflow()
+    monkeypatch.setitem(sys.modules, "mlflow", fake)
+
+    assert mlcc_mlflow._mlflow_configured() is False
+    assert fake.set_calls == []
 
 
 # ── BL167: hybrid-write core + error classifier + helpers ─────────────────────

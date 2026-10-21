@@ -1430,8 +1430,14 @@ print(json.dumps(vals))
     [ "${ARG_ADVANCED}" = true ] && bc_args+=(--advanced)
     [ "${ARG_NON_INTERACTIVE}" = true ] && bc_args+=(--non-interactive)
 
+    # BL178: do NOT swallow build-config's stderr. The interactive questionary
+    # prompt UI renders to stderr (so it stays out of the captured stdout JSON) —
+    # discarding stderr (2>/dev/null) made the prompt INVISIBLE and the CLI appeared
+    # to hang. Let stderr flow to the terminal so prompts show and a real error
+    # (e.g. a missing-dependency ImportError) is visible instead of the generic
+    # message (also addresses the BL165 error-swallowing class on this path).
     local bc_result
-    bc_result=$(python3 "${HELPER_SCRIPT}" build-config "${bc_args[@]}" 2>/dev/null) || {
+    bc_result=$(python3 "${HELPER_SCRIPT}" build-config "${bc_args[@]}") || {
         echo "❌ Failed to resolve hyperparameters for ${ARG_TECHNIQUE}." >&2
         return 1
     }
@@ -1952,9 +1958,32 @@ export ADAPTER_NAME="${adapter_name}"
 export ADAPTER_WEIGHTS_URI="${artifact_path}"
 export ADAPTER_TECHNIQUE="${ARG_TECHNIQUE}"
 export ADAPTER_SOURCE="tune"
+# BL176: record the base model this adapter was tuned FROM, so do/register can
+# pass --base-id to the bridge and set mlcc.family → the base→adapter linkage the
+# SageMaker console renders (without it the family tag is empty and the derivation
+# panel is missing). RESOLVED_MODEL_ID is the tune's base (TUNE_MODEL_ID / --model).
+export ADAPTER_BASE_ID="${RESOLVED_MODEL_ID}"
 ADAPTER_CONF
         echo "   ✅ Adapter registered: ${adapter_name}"
         echo "      Weights: ${artifact_path}"
+        echo ""
+
+        # ── BL174: consolidate the tune output into the MLflow bridge catalog ─────
+        # The SMTJ managed trainer SELF-REGISTERS this adapter into a verbatim
+        # project-named Model Package Group it creates server-side (BL164 Task 11
+        # live finding) — that group carries NO artifact_kind tag and is NOT the
+        # bridge's unified catalog. `do/register` ALREADY registers the base model +
+        # loops over do/adapters/*.conf to bridge-register each adapter LINKED to the
+        # base (parent-version-arn = the base's bridge package), with the lora_adapter
+        # artifact_kind + base→adapter MLflow lineage. The adapter conf we just wrote
+        # is exactly what that loop consumes. So the correct consolidation is to run
+        # `do/register` (which resolves the base parent the bridge adapter requires) —
+        # NOT a standalone adapter bridge-register (which cannot resolve its parent).
+        echo "   📦 Register this adapter into the project's bridge catalog (base + adapter,"
+        echo "      with artifact_kind + lineage) — run:"
+        echo "        ./do/register"
+        echo "      (the SMTJ trainer already self-registered a plain '${PROJECT_NAME}' Model"
+        echo "       Package Group; do/register adds the unified bridge catalog entry. BL174.)"
         echo ""
         echo "   Deploy to live endpoint:"
         echo "     ./do/adapter add ${adapter_name} --from-tune ${ARG_TECHNIQUE}"

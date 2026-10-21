@@ -1,6 +1,6 @@
 {
   "version": "2026-05-27",
-  "lastSynced": "2026-10-13T18:23:41.572Z",
+  "lastSynced": "2026-10-21T18:19:06.294Z",
   "source": "https://docs.aws.amazon.com/sagemaker/latest/dg/model-customize-open-weight.html",
   "models": {
     "huggingface-llm-qwen2-5-7b-instruct": {
@@ -14,14 +14,7 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "sft": {
           "trainingTypes": [
@@ -62,14 +55,7 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -119,28 +105,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlaif": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -156,14 +128,7 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "sft": {
           "trainingTypes": [
@@ -204,14 +169,7 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -261,28 +219,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -298,28 +242,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlaif": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "sft": {
           "trainingTypes": [
@@ -403,28 +333,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -474,28 +390,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -511,14 +413,7 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "sft": {
           "trainingTypes": [
@@ -559,14 +454,7 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -616,28 +504,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -687,28 +561,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -758,28 +618,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -829,28 +675,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -900,28 +732,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -971,28 +789,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -1042,28 +846,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -1079,14 +869,7 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "sft": {
           "trainingTypes": [
@@ -1127,14 +910,7 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -1150,28 +926,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "sft": {
           "trainingTypes": [
@@ -1221,28 +983,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "sft": {
           "trainingTypes": [
@@ -1326,28 +1074,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlaif": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -1363,14 +1097,7 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "sft": {
           "trainingTypes": [
@@ -1411,14 +1138,7 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -1468,42 +1188,21 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "mtrl": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-mtrl",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -1553,28 +1252,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlaif": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -1606,28 +1291,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "dpo": {
           "trainingTypes": [
@@ -1652,14 +1323,7 @@
             "lora"
           ],
           "datasetFormat": "default-mtrl",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -1691,28 +1355,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlaif": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "dpo": {
           "trainingTypes": [
@@ -1746,28 +1396,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "sft": {
           "trainingTypes": [
@@ -1833,28 +1469,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlaif": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "dpo": {
           "trainingTypes": [
@@ -1904,28 +1526,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlaif": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "dpo": {
           "trainingTypes": [
@@ -1975,28 +1583,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "dpo": {
           "trainingTypes": [
@@ -2023,7 +1617,7 @@
       "family": "huggingface-vlm",
       "provider": "google",
       "displayName": "gemma-4-e4b-it",
-      "huggingFaceId": "google/gemma-4-e4b-it",
+      "huggingFaceId": "google/gemma-4-E4B-it",
       "techniques": {
         "dpo": {
           "trainingTypes": [
@@ -2064,28 +1658,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlaif": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -2135,42 +1715,21 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "mtrl": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-mtrl",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -2220,28 +1779,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlaif": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -2275,28 +1820,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "sft": {
           "trainingTypes": [
@@ -2328,28 +1859,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "sft": {
           "trainingTypes": [
@@ -2415,28 +1932,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlaif": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -2486,28 +1989,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlaif": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -2557,28 +2046,14 @@
             "lora"
           ],
           "datasetFormat": "default-rlvr",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlaif": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         }
       },
       "goldenPath": false
@@ -2628,28 +2103,71 @@
             "lora"
           ],
           "datasetFormat": "default-rlaif",
-          "datasetSchema": {
-            "required": [
-              "prompt"
-            ],
-            "types": {
-              "prompt": "array"
-            }
-          }
+          "datasetSchema": {}
         },
         "rlvr": {
           "trainingTypes": [
             "lora"
           ],
           "datasetFormat": "default-rlvr",
+          "datasetSchema": {}
+        }
+      },
+      "goldenPath": false
+    },
+    "huggingface-vlm-muse-glimmer-30b": {
+      "family": "huggingface-vlm",
+      "provider": "meta-models",
+      "displayName": "Muse-Glimmer-30B",
+      "huggingFaceId": "meta-models/Muse-Glimmer-30B",
+      "techniques": {
+        "sft": {
+          "trainingTypes": [
+            "lora"
+          ],
+          "datasetFormat": "default-sft",
           "datasetSchema": {
             "required": [
-              "prompt"
+              "prompt",
+              "completion"
             ],
             "types": {
-              "prompt": "array"
+              "prompt": "string",
+              "completion": "string"
             }
           }
+        },
+        "dpo": {
+          "trainingTypes": [
+            "lora"
+          ],
+          "datasetFormat": "default-dpo",
+          "datasetSchema": {
+            "required": [
+              "prompt",
+              "chosen",
+              "rejected"
+            ],
+            "types": {
+              "prompt": "string",
+              "chosen": "string",
+              "rejected": "string"
+            }
+          }
+        },
+        "rlaif": {
+          "trainingTypes": [
+            "lora"
+          ],
+          "datasetFormat": "default-rlaif",
+          "datasetSchema": {}
+        },
+        "rlvr": {
+          "trainingTypes": [
+            "lora"
+          ],
+          "datasetFormat": "default-rlvr",
+          "datasetSchema": {}
         }
       },
       "goldenPath": false

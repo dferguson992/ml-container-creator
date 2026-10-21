@@ -144,13 +144,28 @@ def read_manifest(technique: str, tune_dir: str | None = None) -> dict:
     )
 
 
+# do/tune's `--training-type` CLI values map onto the descriptor's variant KEYS.
+# The descriptor keys PEFT variants as `lora` / `full`, but the CLI (and the
+# tune catalog's trainingTypes) speak `lora` / `full-rank`. Normalize the alias
+# here so `--training-type full-rank` resolves the `full` variant instead of
+# silently missing (variants.get("full-rank") -> None -> {} -> no hyperparameters,
+# no interactive UX, and --set rejecting every knob). One map, applied for every
+# consumer (HP builder, dataset_contract, reward_model_style, …).
+_VARIANT_ALIASES = {"full-rank": "full", "full_rank": "full"}
+
+
 def _resolve_variant(manifest: dict, variant: str | None) -> dict:
-    """Return a variant object, defaulting to 'lora' then the sole declared one."""
+    """Return a variant object, defaulting to 'lora' then the sole declared one.
+
+    `variant` accepts either a descriptor key (`lora`/`full`) or a do/tune
+    `--training-type` alias (`full-rank` → `full`); the alias is normalized first.
+    """
     variants = manifest.get("variants") or {}
     if not isinstance(variants, dict) or not variants:
         return {}
     if variant:
-        return variants.get(variant) or {}
+        key = _VARIANT_ALIASES.get(variant, variant)
+        return variants.get(key) or {}
     if "lora" in variants:
         return variants["lora"]
     first_key = next(iter(variants))

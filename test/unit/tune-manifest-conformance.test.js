@@ -101,4 +101,49 @@ describe('Feature: v2-w3-01-bl129 — tune descriptor conformance', () => {
             });
         }
     });
+
+    // BL173 (Wave-3 completion): the synced layer was populated from AWS recipe
+    // override-params. Before BL173 the descriptors shipped with EMPTY
+    // hyperparameters/_synced, which silently disabled the whole do/tune interactive
+    // HP UX (BL128). These guards keep the synced layer present and well-formed so it
+    // cannot regress to empty placeholders or to schema-invalid raw AWS types.
+    describe('BL173: synced hyperparameter layer is populated + well-formed', () => {
+        // A non-empty knob set is REQUIRED for the primary dataset-driven techniques
+        // whose SMTJ recipes expose override-params. If a technique legitimately has
+        // no synced knobs (its live recipe exposes none), add it here WITH A REASON
+        // rather than fabricating knobs (tests-that-don't-rot rule 4).
+        const REQUIRE_POPULATED = ['sft', 'dpo', 'rlvr', 'rlaif', 'mtrl'];
+        // The schema's allowed knob `type` enum — the sync must normalize AWS's raw
+        // types (float→number, array→string, …) to one of these.
+        const ALLOWED_TYPES = new Set(['string', 'integer', 'number', 'boolean']);
+
+        for (const technique of TECHNIQUE_DIRS) {
+            if (!REQUIRE_POPULATED.includes(technique)) continue;
+            it(`${technique}: the lora variant carries a non-empty synced knob set`, () => {
+                const { variants } = loadManifest(technique);
+                const lora = variants.lora;
+                assert.ok(lora, `${technique}: expected a lora variant`);
+                const hp = lora.hyperparameters || {};
+                assert.ok(Object.keys(hp).length > 0,
+                    `${technique}.lora.hyperparameters is EMPTY — run \`npm run sync:models\` ` +
+                    'to populate the synced layer (BL173). An empty knob set silently ' +
+                    'disables the do/tune interactive HP UX.');
+                // _synced provenance must accompany a populated knob set (smtj at least).
+                assert.ok(lora._synced && lora._synced.smtj,
+                    `${technique}.lora._synced must carry at least an smtj provenance entry`);
+            });
+
+            it(`${technique}: every synced knob type is in the schema's allowed enum`, () => {
+                const { variants } = loadManifest(technique);
+                for (const [vname, v] of Object.entries(variants)) {
+                    for (const [kn, ke] of Object.entries(v.hyperparameters || {})) {
+                        assert.ok(ALLOWED_TYPES.has(ke.type),
+                            `${technique}.${vname}.${kn}.type='${ke.type}' is not an allowed ` +
+                            `type ${[...ALLOWED_TYPES].join('|')} — the sync must normalize ` +
+                            'AWS raw types (e.g. float to number, array to string).');
+                    }
+                }
+            });
+        }
+    });
 });

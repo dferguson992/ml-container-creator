@@ -166,6 +166,39 @@ class NativeRegistrySkipped(Exception):
     """Raised to signal a non-fatal skip with a user-facing reason."""
 
 
+# SageMaker hub-content name constraint (ImportHubContent): the name must match
+# ``[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}`` — ONLY alphanumerics and hyphens, must start
+# with an alphanumeric, max 63 chars. This is STRICTER than MLflow's name rules
+# (mlcc_mlflow.sanitize_name keeps underscores, which are valid for MLflow), so the
+# native path needs its OWN sanitizer — otherwise a perfectly valid MLflow/dataset
+# name like ``Intel_orca_dpo`` is accepted by MLflow but REJECTED by the AI Registry
+# with a ValidationException, and (because native registration is non-fatal) the
+# failure is swallowed and the dataset silently never appears in Studio Assets
+# (BL171). Do NOT "fix" this by changing sanitize_name — underscores must stay legal
+# for MLflow; the hub-content regex is a native-only constraint.
+def sanitize_hub_content_name(name):
+    """Coerce an arbitrary dataset name into a SageMaker hub-content name.
+
+    Maps any character outside ``[A-Za-z0-9]`` to ``-``, collapses runs of ``-``,
+    trims leading/trailing ``-``, and truncates to 63 chars (re-trimming a trailing
+    ``-`` left by truncation). Guarantees a leading alphanumeric by prefixing ``d-``
+    when the result would otherwise start non-alphanumeric or be empty. Idempotent
+    on an already-valid name. Returns a string matching
+    ``[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}``.
+    """
+    import re
+    if not isinstance(name, str):
+        name = str(name)
+    # Replace every illegal char with a hyphen, then collapse/trim hyphen runs.
+    safe = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-")
+    # Must start with an alphanumeric (the regex's first char class).
+    if not safe or not safe[0].isalnum():
+        safe = "d-" + safe.lstrip("-")
+    # Max 63 chars; truncation may leave a trailing hyphen, so re-trim.
+    safe = safe[:63].rstrip("-")
+    return safe or "dataset"
+
+
 def register_dataset_native(*, name, s3_uri, technique, region,
                             description=None, role=None, domain_id=None):
     """Create (or version++) a native AI Registry DataSet for Studio discoverability.
@@ -212,8 +245,20 @@ def register_dataset_native(*, name, s3_uri, technique, region,
             f"the installed SDK's CustomizationTechnique has no '{member}' member"
         )
 
+    # The AI Registry hub-content name is STRICTER than the dataset/MLflow name
+    # (no underscores, leading alnum, <=63 chars). Sanitize here so a valid MLflow
+    # name is never silently rejected by ImportHubContent (BL171). Note the
+    # remap so the user can find the Studio asset under its sanitized name.
+    hub_name = sanitize_hub_content_name(name)
+    if hub_name != name:
+        print(
+            f"\u2139\ufe0f  AI Registry asset name '{name}' \u2192 '{hub_name}' "
+            "(hub-content names allow only letters, digits, and hyphens).",
+            file=sys.stderr,
+        )
+
     create_kwargs = {
-        "name": name,
+        "name": hub_name,
         "source": s3_uri,
         "customization_technique": technique_member,
     }
@@ -232,5 +277,9 @@ def register_dataset_native(*, name, s3_uri, technique, region,
         "arn": getattr(dataset, "arn", None),
         "version": getattr(dataset, "version", None),
         "member": member,
+        # The hub-content name actually used (sanitized from the caller's name when
+        # it contained hub-illegal chars). Surfaced so the caller can record the
+        # AI-Registry identity alongside the dataset/MLflow name when they differ.
+        "hub_content_name": hub_name,
         "domain_tagged": domain_tagged,
     }

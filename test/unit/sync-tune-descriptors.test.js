@@ -65,9 +65,15 @@ function makeFetcher(overrides = {}) {
     return async (uri) => (uri.includes('mtrl') ? mtrl : rlaif);
 }
 
+// Fixture recipe versions use a synthetic, deliberately-high version (v9x) so the
+// sync's version-skip NEVER collides with whatever version the SHIPPED descriptors
+// carry after a real `npm run sync:models` (BL173 populated them — the earlier
+// fixtures pinned v2.2.7 / v1.0.22 and started colliding once the real rlaif
+// descriptor also carried v2.2.7, silently skipping the fixture write). A version no
+// real recipe will emit keeps these behavior tests independent of the committed data.
 const RECIPES = [
-    { technique: 'rlaif', peft: 'lora', smtjOverrideParamsS3Uri: 's3://b/verl-grpo-rlaif-qwen-3-8b-lora_override_params_sm_jobs_v2.2.7.json', hpEksOverrideParamsS3Uri: 's3://b/verl-grpo-rlaif-qwen-3-8b-lora_override_params_k8s_v2.2.7.json' },
-    { technique: 'mtrl', peft: 'lora', smtjOverrideParamsS3Uri: 's3://b/mtrl-gpt-oss-20b-lora_override_params_sm_jobs_v1.0.22.json', hpEksOverrideParamsS3Uri: null }
+    { technique: 'rlaif', peft: 'lora', smtjOverrideParamsS3Uri: 's3://b/verl-grpo-rlaif-qwen-3-8b-lora_override_params_sm_jobs_v90.0.0.json', hpEksOverrideParamsS3Uri: 's3://b/verl-grpo-rlaif-qwen-3-8b-lora_override_params_k8s_v90.0.0.json' },
+    { technique: 'mtrl', peft: 'lora', smtjOverrideParamsS3Uri: 's3://b/mtrl-gpt-oss-20b-lora_override_params_sm_jobs_v90.0.0.json', hpEksOverrideParamsS3Uri: null }
 ];
 
 describe('sync-tune-descriptors (tune-descriptor synced layer)', () => {
@@ -122,10 +128,10 @@ describe('sync-tune-descriptors (tune-descriptor synced layer)', () => {
     it('records hp-eks only when the pointer exists (MTRL None → omitted)', async () => {
         await syncTuneDescriptors(RECIPES, { fetchOverrideParams: makeFetcher(), tuneDir: tmp });
         const rlaif = readVariant('rlaif')._synced;
-        assert.strictEqual(rlaif.smtj.version, '2.2.7');
-        assert.strictEqual(rlaif['hp-eks'].version, '2.2.7');
+        assert.strictEqual(rlaif.smtj.version, '90.0.0');
+        assert.strictEqual(rlaif['hp-eks'].version, '90.0.0');
         const mtrl = readVariant('mtrl')._synced;
-        assert.strictEqual(mtrl.smtj.version, '1.0.22');
+        assert.strictEqual(mtrl.smtj.version, '90.0.0');
         assert.ok(!('hp-eks' in mtrl), 'MTRL has no hp-eks backend');
     });
 
@@ -159,7 +165,7 @@ describe('sync-tune-descriptors (tune-descriptor synced layer)', () => {
         await syncTuneDescriptors(RECIPES, { fetchOverrideParams: makeFetcher(), tuneDir: tmp });
         const before = readVariant('rlaif').hyperparameters;
         const bumped = RECIPES.map(r => r.technique === 'rlaif'
-            ? { ...r, smtjOverrideParamsS3Uri: r.smtjOverrideParamsS3Uri.replace('v2.2.7', 'v2.2.8') }
+            ? { ...r, smtjOverrideParamsS3Uri: r.smtjOverrideParamsS3Uri.replace('v90.0.0', 'v90.0.1') }
             : r);
         const failing = async () => { throw new Error('S3 down'); };
         const res = await syncTuneDescriptors(bumped, { fetchOverrideParams: failing, tuneDir: tmp });
@@ -186,5 +192,35 @@ describe('sync-tune-descriptors (tune-descriptor synced layer)', () => {
         assert.ok('checkpoint_dir' in hp,
             'a new, non-denylisted plumbing key currently LEAKS as a knob — add it to ' +
             'MTRL_PLUMBING_DENYLIST in sync-model-families.js, then update this guard.');
+    });
+
+    // BL173 regression: AWS override-params use raw type strings (`float`, `array`,
+    // …) that are NOT in the descriptor schema's type enum (string|integer|number|
+    // boolean). The sync MUST normalize them, else it writes a schema-invalid
+    // descriptor — the exact failure that shipped empty-then-invalid before BL173.
+    // (The prior fixtures only used already-normalized types, which is why this
+    // slipped through; this fixture uses the raw AWS types on purpose.)
+    it('normalizes raw AWS knob types (float to number, array to string) to the schema enum', async () => {
+        const RAW_TYPES = {
+            lr: { category: 'hyperparameter', type: 'float', control_type: 'number_input', visibility_tier: 'primary', default: 1e-5, required: true },
+            epochs: { category: 'hyperparameter', type: 'integer', control_type: 'number_input', visibility_tier: 'primary', default: 3, required: false },
+            target_modules: { category: 'hyperparameter', type: 'array', control_type: 'text_input', visibility_tier: 'advanced', required: false },
+            use_flash: { category: 'hyperparameter', type: 'boolean', control_type: 'dropdown', visibility_tier: 'advanced', default: true, required: false }
+        };
+        // The shared RECIPES already use a synthetic v90 version that never collides
+        // with the shipped descriptor, so the sync always writes the fixture here.
+        await syncTuneDescriptors(RECIPES, {
+            fetchOverrideParams: makeFetcher({ rlaif: RAW_TYPES }),
+            tuneDir: tmp
+        });
+        const hp = readVariant('rlaif').hyperparameters;
+        assert.strictEqual(hp.lr.type, 'number', 'float must normalize to number');
+        assert.strictEqual(hp.target_modules.type, 'string', 'array must normalize to string');
+        assert.strictEqual(hp.epochs.type, 'integer', 'integer passes through');
+        assert.strictEqual(hp.use_flash.type, 'boolean', 'boolean passes through');
+        const allowed = new Set(['string', 'integer', 'number', 'boolean']);
+        for (const [kn, ke] of Object.entries(hp)) {
+            assert.ok(allowed.has(ke.type), `${kn}.type='${ke.type}' not in the schema enum`);
+        }
     });
 });

@@ -117,6 +117,22 @@ def test_read_hyperparameters_missing_technique_raises_not_found():
         tune_manifest.read_hyperparameters("nope")
 
 
+def test_training_type_alias_full_rank_resolves_full_variant():
+    # do/tune passes the --training-type CLI value verbatim as the descriptor variant.
+    # The CLI speaks `full-rank` but the descriptor key is `full`; the reader MUST
+    # normalize the alias, else full-rank silently resolves to {} (no hyperparameters,
+    # no interactive UX, --set rejects every knob). `full-rank` and `full` must resolve
+    # to the SAME variant object (the committed `full` block may be empty pre-sync —
+    # the point is they are the same object, not that it has knobs).
+    m = tune_manifest.read_manifest("sft")
+    assert tune_manifest._resolve_variant(m, "full-rank") == tune_manifest._resolve_variant(m, "full")
+    assert tune_manifest._resolve_variant(m, "full_rank") == tune_manifest._resolve_variant(m, "full")
+    # the alias reaches the real `full` variant, not an empty miss:
+    assert tune_manifest.dataset_contract("sft", "full-rank") == tune_manifest.dataset_contract("sft", "full")
+    # a genuinely-unknown variant still misses → {} (alias map is not a catch-all):
+    assert tune_manifest._resolve_variant(m, "nonsense") == {}
+
+
 def test_read_hyperparameters_reads_a_populated_block(tmp_path):
     # Point the reader at a temp tune.d with a populated hyperparameters block to prove
     # the accessor returns the synced knobs (the committed descriptors are pre-sync).

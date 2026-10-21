@@ -12,6 +12,11 @@ TAG_FAMILY = "mlcc.family"                # base model id — the family key
 TAG_ARTIFACT_TYPE = "mlcc.artifact_type"  # e.g. "base", "adapter", "draft", "dataset"
 TAG_MANAGED_BY = "mlcc.managed_by"        # constant marker: "mlcc"
 TAG_ARTIFACT_KIND = "mlcc.artifact_kind"  # BL164/ADR-013: "lora_adapter" | "full_model"
+TAG_DELETED = "mlcc.deleted"              # "true" on runs whose dataset was deregistered
+                                          # (do/register dataset --delete); the read/list
+                                          # paths skip these. Soft-delete marker because
+                                          # mlflow.delete_run is unreliable on SageMaker
+                                          # MLflow Serverless.
 
 # Param keys (lineage detail)
 PARAM_BASE_MODEL_ID = "mlcc.base_model_id"
@@ -818,19 +823,42 @@ def _mlflow_configured(config_path=None):
     Keeping the check to config/env inspection (never a server ping) makes the
     branch decision deterministic and independent of transient reachability;
     reachability failures are handled separately by the callers.
+
+    SIDE EFFECT (required for the local client to route): resolving a URI also
+    calls ``mlflow.set_tracking_uri(uri)``. Setting only ``MLFLOW_TRACKING_URI`` /
+    ``MLFLOW_TRACKING_SERVER_ARN`` in ``os.environ`` is NOT enough — if mlflow has
+    already computed its default tracking URI (the local ``mlflow.db`` sqlite
+    store), a later env mutation does not change the active client, so the
+    sagemaker-mlflow App route never engages and ``register_via_bridge`` would
+    write to a LOCAL registry and the bridge would never fire (BL164 live bug:
+    "MPG registration returned incomplete data"). ``set_tracking_uri`` is what
+    actually points the client at the ``arn:aws:sagemaker:...:mlflow-app/...``
+    App (sagemaker-mlflow registers that scheme), so we call it here.
     """
-    if os.environ.get("MLFLOW_TRACKING_URI") or os.environ.get("MLFLOW_TRACKING_SERVER_ARN"):
-        return True
-    uri = _config_tracking_uri(config_path)
+    uri = (
+        os.environ.get("MLFLOW_TRACKING_SERVER_ARN")
+        or os.environ.get("MLFLOW_TRACKING_URI")
+        or _config_tracking_uri(config_path)
+    )
     if not uri:
         return False
-    # Apply the resolved value to the environment so mlflow / sagemaker-mlflow
-    # picks it up on the first mlflow.* call. ARNs (mlflow-app / mlflow-tracking-server)
-    # go to MLFLOW_TRACKING_SERVER_ARN; HTTPS URLs go to MLFLOW_TRACKING_URI.
+    # Mirror the resolved value into the environment so remote tooling / the
+    # sagemaker-mlflow plugin still sees it. ARNs (mlflow-app / mlflow-tracking-
+    # server) go to MLFLOW_TRACKING_SERVER_ARN; HTTPS URLs go to MLFLOW_TRACKING_URI.
     if uri.startswith("arn:"):
         os.environ["MLFLOW_TRACKING_SERVER_ARN"] = uri
     else:
         os.environ["MLFLOW_TRACKING_URI"] = uri
+    # Point the ACTIVE client at the resolved URI. Without this the client keeps
+    # its default local sqlite store regardless of the env vars above.
+    try:
+        import mlflow
+        if mlflow.get_tracking_uri() != uri:
+            mlflow.set_tracking_uri(uri)
+    except ImportError:
+        # mlflow absent: the env vars are still set; callers that need mlflow
+        # raise MlflowUnavailableError on their own import.
+        pass
     return True
 
 

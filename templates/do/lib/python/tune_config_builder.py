@@ -211,8 +211,26 @@ def _questionary_prompter(name, knob, control, default):
     """Prompt for one knob via questionary, modeled on deploy_prompts.py. Returns the
     user's raw string (or None). A dropdown (enum) → questionary.select; numeric/text →
     questionary.text pre-filled with the default. Validation is re-done by the core, so
-    this layer only needs to collect input."""
+    this layer only needs to collect input.
+
+    BL178: the prompt UI is rendered to STDERR (not stdout). do/tune invokes
+    `build-config` inside a command substitution `bc_result=$(... build-config ...)`
+    that CAPTURES stdout — the final {resolved,errors} JSON. prompt_toolkit's default
+    output is stdout, so without this the prompt would draw into the captured pipe
+    (invisible → the CLI appears to hang) and corrupt the JSON. Routing the prompt
+    output to stderr keeps stdout clean (JSON only) and the prompt visible on the
+    terminal; input still comes from the controlling tty. Mirrors deploy_prompts.py's
+    stderr convention."""
+    import sys
     import questionary
+    # Render the prompt UI to stderr so it does not land in do/tune's captured stdout.
+    _out = None
+    try:
+        from prompt_toolkit.output.defaults import create_output
+        _out = create_output(stdout=sys.stderr)
+    except Exception:  # noqa: BLE001 — if unavailable, fall back to default (stdout)
+        _out = None
+    _kw = {"output": _out} if _out is not None else {}
     label = knob.get("display_name") or name
     desc = knob.get("description") or knob.get("hint")
     message = f"{label}:" if not desc else f"{label} ({desc}):"
@@ -222,10 +240,40 @@ def _questionary_prompter(name, knob, control, default):
         res = questionary.select(
             message, choices=choices,
             default=default_str if default_str in choices else None,
+            **_kw,
         ).ask()
         return res
+    # BL-UX: numeric (and any min/max-bounded) knob — SHOW the allowed range in the
+    # message AND validate INLINE so an out-of-range value is rejected AT the prompt
+    # (naming the range) instead of silently accepted and only caught by the core
+    # after all prompts finish. The inline check reuses the core _coerce/_validate so
+    # it agrees exactly with the authoritative validation.
+    lo, hi = knob.get("min"), knob.get("max")
+    if lo is not None or hi is not None:
+        if lo is not None and hi is not None:
+            message = f"{message[:-1]} [{lo}–{hi}]:" if message.endswith(":") else f"{message} [{lo}–{hi}]"
+        elif lo is not None:
+            message = f"{message[:-1]} [>= {lo}]:" if message.endswith(":") else f"{message} [>= {lo}]"
+        else:
+            message = f"{message[:-1]} [<= {hi}]:" if message.endswith(":") else f"{message} [<= {hi}]"
+
+        def _validate_input(text):
+            text = (text or "").strip()
+            if text == "":
+                return True  # empty → accept the default (handled by the caller)
+            coerced, cerr = _coerce(name, knob, text)
+            if cerr:
+                return cerr
+            verr = _validate(name, knob, coerced)
+            return verr if verr else True
+
+        return questionary.text(
+            message, default=str(default) if default is not None else "",
+            validate=_validate_input, **_kw,
+        ).ask()
     return questionary.text(
         message, default=str(default) if default is not None else "",
+        **_kw,
     ).ask()
 
 

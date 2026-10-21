@@ -52,6 +52,36 @@ const KNOWN_PREFIXES = [
 const HUB_NAME = 'SageMakerPublicHub';
 
 /**
+ * Known HuggingFace-id casing corrections for Hub documents whose `HuggingfaceId`
+ * field is mis-cased relative to the canonical (case-SENSITIVE) HF repo id.
+ *
+ * HF repo ids are case-sensitive: a wrong-cased id 307-redirects and staging fails
+ * with an opaque JSONDecodeError. AWS's JumpStart Hub document for the Gemma VLM
+ * records `google/gemma-4-e4b-it`, but the real repo is `google/gemma-4-E4B-it`
+ * (verified: HF API 200 for E4B, 307 for e4b). This map corrects such verified
+ * cases at sync time so the generator always yields a staffable id and a re-sync
+ * does NOT reintroduce the bad casing (the sync's discovered-wins merge would
+ * otherwise clobber a hand-fix). Keyed case-INSENSITIVELY on the Hub id; the value
+ * is the exact canonical HF id. Add an entry ONLY with a verified HF 200.
+ */
+const HF_ID_CASING_CORRECTIONS = {
+    'google/gemma-4-e4b-it': 'google/gemma-4-E4B-it'
+};
+
+/**
+ * Apply a known casing correction to an extracted HuggingFace id, or return it
+ * unchanged. Matches case-insensitively so a Hub doc in any casing resolves to the
+ * one canonical id.
+ * @param {string} hfId
+ * @returns {string}
+ */
+export function correctHuggingFaceIdCasing(hfId) {
+    if (!hfId) return hfId;
+    const corrected = HF_ID_CASING_CORRECTIONS[hfId.toLowerCase()];
+    return corrected || hfId;
+}
+
+/**
  * Derive the model family from a Hub content name prefix.
  * @param {string} hubContentName
  * @returns {string}
@@ -272,6 +302,9 @@ function buildCatalogEntry(model, detail, recipes) {
                 || doc.HuggingFaceId
                 || doc.ModelId
                 || '';
+            // Correct known mis-cased Hub ids to the canonical (case-sensitive) HF
+            // repo id so staging doesn't 307/fail and a re-sync won't reintroduce it.
+            huggingFaceId = correctHuggingFaceIdCasing(huggingFaceId);
             // The hub document carries the authoritative model MAKER in `Provider`
             // (e.g. "Qwen", "nvidia", "deepseek"). Prefer it over name-prefix inference
             // so the picker groups by the real provider instead of falling to "unknown"
@@ -443,10 +476,32 @@ function _versionFromOverrideParamsUri(uri) {
  * @param {object} knob - the override-param entry
  * @returns {object|null}
  */
+// AWS override-param `type` strings → the schema's allowed `type` enum
+// (templates/code/tune.d/manifest.schema.json $defs/hyperparameter: string |
+// integer | number | boolean). AWS uses `float` for reals and occasionally
+// `array` for multi-value knobs, neither of which the schema names — so normalize
+// here rather than write a schema-invalid descriptor. `float` → `number`;
+// `array` → `string` (a multi-value knob is surfaced as free text; its `enum`,
+// when present, is carried separately). Unknown types fall back to `string` with
+// a warning so a new AWS type never silently produces an invalid descriptor.
+const _OVERRIDE_PARAM_TYPE_MAP = {
+    string: 'string', integer: 'integer', number: 'number', boolean: 'boolean',
+    float: 'number', double: 'number', int: 'integer', bool: 'boolean',
+    array: 'string', list: 'string'
+};
+
+function _normalizeKnobType(rawType) {
+    if (typeof rawType !== 'string') return 'string';
+    const mapped = _OVERRIDE_PARAM_TYPE_MAP[rawType.toLowerCase()];
+    if (mapped) return mapped;
+    console.warn(`[sync-tune] unknown override-param type '${rawType}' → defaulting to 'string'; add it to _OVERRIDE_PARAM_TYPE_MAP if it should map elsewhere.`);
+    return 'string';
+}
+
 function _mapOverrideParamKnob(knob) {
     if (!knob || typeof knob !== 'object') return null;
     const entry = {
-        type: typeof knob.type === 'string' ? knob.type : 'string',
+        type: _normalizeKnobType(knob.type),
         required: knob.required === true
     };
     if ('default' in knob) entry.default = knob.default;

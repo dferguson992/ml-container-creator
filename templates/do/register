@@ -1948,12 +1948,18 @@ elif [ -n "${MODEL_PKG_ARN:-}" ] && [ -d "${SCRIPT_DIR}/adapters" ]; then
         # Read adapter config
         ADAPTER_WEIGHTS_URI=""
         ADAPTER_TECHNIQUE=""
+        ADAPTER_BASE_ID=""
         eval "$(grep '^export ADAPTER_WEIGHTS_URI=' "${conf}" 2>/dev/null)" 2>/dev/null || true
         eval "$(grep '^export ADAPTER_TECHNIQUE=' "${conf}" 2>/dev/null)" 2>/dev/null || true
         eval "$(grep '^export ADAPTER_TUNE_TECHNIQUE=' "${conf}" 2>/dev/null)" 2>/dev/null || true
+        eval "$(grep '^export ADAPTER_BASE_ID=' "${conf}" 2>/dev/null)" 2>/dev/null || true
 
         _ADAPTER_DATA_URL="${ADAPTER_WEIGHTS_URI:-}"
         _ADAPTER_TECHNIQUE="${ADAPTER_TECHNIQUE:-${ADAPTER_TUNE_TECHNIQUE:-${TUNE_TECHNIQUE:-}}}"
+        # BL176: the adapter's base model → --base-id → mlcc.family → base→adapter
+        # linkage in the console. Prefer the conf's ADAPTER_BASE_ID (do/tune records
+        # it); fall back to the project's tune model id for older confs.
+        _ADAPTER_BASE_ID="${ADAPTER_BASE_ID:-${TUNE_MODEL_ID:-}}"
 
         echo ""
         echo "📦 Registering adapter: ${_ADAPTER_NAME}"
@@ -1971,6 +1977,7 @@ elif [ -n "${MODEL_PKG_ARN:-}" ] && [ -d "${SCRIPT_DIR}/adapters" ]; then
         )
 
         [ -n "${_ADAPTER_TECHNIQUE}" ] && ADAPTER_REG_ARGS+=("--tune-technique" "${_ADAPTER_TECHNIQUE}")
+        [ -n "${_ADAPTER_BASE_ID}" ] && ADAPTER_REG_ARGS+=("--base-id" "${_ADAPTER_BASE_ID}")
         [ -n "${_ADAPTER_DATA_URL}" ] && ADAPTER_REG_ARGS+=("--model-data-url" "${_ADAPTER_DATA_URL}")
         [ -n "${MODEL_NAME:-}" ] && ADAPTER_REG_ARGS+=("--model-name" "${MODEL_NAME}")
         [ -n "${BASE_IMAGE:-}" ] && ADAPTER_REG_ARGS+=("--base-image" "${BASE_IMAGE}")

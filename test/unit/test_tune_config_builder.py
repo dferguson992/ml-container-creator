@@ -218,9 +218,71 @@ def test_adapter_reads_tune_d_and_runs_core(tmp_path):
     assert out["resolved"]["learning_rate"] == 1e-5
 
 
-def test_adapter_empty_presync_descriptor_is_valid_empty_config():
-    # A committed (pre-sync) descriptor has hyperparameters:{} → the adapter returns an
-    # empty resolved config, NOT a crash (R: no descriptor is a valid empty knob set).
-    out = builder.build_from_tune_descriptor("sft", "lora", {}, interactive=False)
+def test_empty_hyperparameters_block_is_valid_empty_config():
+    # An EMPTY hyperparameters block (e.g. a technique whose recipe exposes no
+    # override-params, or a pre-sync descriptor) → an empty resolved config, NOT a
+    # crash. Driven against the descriptor-AGNOSTIC core with an in-memory empty
+    # block so the test does NOT depend on any shipped descriptor being empty —
+    # after BL173 the real sft/dpo descriptors carry synced knobs, so asserting
+    # emptiness against a live technique would (and did) rot.
+    out = builder.build_config({}, {}, interactive=False)
     assert out["errors"] == []
     assert out["resolved"] == {}
+
+
+def test_numeric_prompt_shows_range_and_validates_inline(monkeypatch):
+    # BL-UX: a min/max-bounded knob's prompt must (a) show the allowed range in the
+    # message and (b) carry an inline validate= callback that rejects out-of-range
+    # input AT the prompt (not only via the core after all prompts). Enum knobs are
+    # already constrained via questionary.select (dropdown), so this covers the
+    # numeric free-text path that previously offered unbounded values.
+    import questionary
+    captured = {}
+
+    class _FakeText:
+        def __init__(self, message, **kw):
+            captured["message"] = message
+            captured["validate"] = kw.get("validate")
+
+        def ask(self):
+            return None
+
+    monkeypatch.setattr(questionary, "text", _FakeText)
+    knob = {"type": "number", "min": 5e-07, "max": 1e-04, "default": 1e-04, "tier": "primary"}
+    builder._questionary_prompter("learning_rate", knob, "number_input", 1e-04)
+
+    # (a) the range is visible in the prompt message
+    assert "5e-07" in captured["message"] and "0.0001" in captured["message"]
+    # (b) the inline validator accepts in-range, rejects out-of-range (string = error msg)
+    v = captured["validate"]
+    assert v is not None
+    assert v("1e-5") is True                 # in range
+    assert v("") is True                     # empty → default
+    err = v("5")                             # 5 >> max
+    assert isinstance(err, str) and "0.0001" in err
+
+
+def test_enum_prompt_uses_dropdown_not_free_text(monkeypatch):
+    # An enum knob must render as a constrained select (dropdown), never free text.
+    import questionary
+    seen = {"select": False, "text": False}
+
+    class _FakeSelect:
+        def __init__(self, *a, **k):
+            seen["select"] = True
+
+        def ask(self):
+            return "16"
+
+    class _FakeText:
+        def __init__(self, *a, **k):
+            seen["text"] = True
+
+        def ask(self):
+            return None
+
+    monkeypatch.setattr(questionary, "select", _FakeSelect)
+    monkeypatch.setattr(questionary, "text", _FakeText)
+    knob = {"type": "integer", "enum": [16, 32, 64], "default": 16, "tier": "primary"}
+    builder._questionary_prompter("global_batch_size", knob, "dropdown", 16)
+    assert seen["select"] and not seen["text"]
