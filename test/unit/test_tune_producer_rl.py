@@ -107,6 +107,87 @@ def test_plain_string_prompt_is_wrapped_into_a_single_user_turn():
     assert row["prompt"] == [{"role": "user", "content": "solve it"}]
 
 
+def test_messages_column_is_recognized_as_the_prompt():
+    # Regression: the common RLVR/RLAIF source shape (e.g. allenai/RLVR-MATH) puts the
+    # problem in a `messages` chat list, which was NOT a prompt alias — so every row
+    # got a BLANK prompt (training on empty problems). `messages` must be recognized,
+    # and a message-list passes through unflattened.
+    msgs = [{"role": "user", "content": "What is the domain of sqrt(x-2)?"}]
+    row = producer.to_verl_row(
+        {"messages": msgs, "ground_truth": "8"}, technique="rlvr", style="rule",
+    )
+    assert row["prompt"] == msgs
+    assert row["prompt"][0]["content"].strip()           # NON-empty
+    assert row["reward_model"]["ground_truth"] == "8"
+
+
+def test_conversations_column_is_recognized_as_the_prompt():
+    msgs = [{"role": "user", "content": "solve"}]
+    row = producer.to_verl_row(
+        {"conversations": msgs, "ground_truth": "x"}, technique="rlvr", style="rule",
+    )
+    assert row["prompt"] == msgs
+
+
+def test_missing_prompt_still_falls_back_to_empty_user_turn():
+    # Behavior pin: a source with NO recognizable prompt column still yields the
+    # documented single empty user turn from to_verl_row (so the row is structurally
+    # valid) — we did not change that fallback, only widened the aliases that avoid
+    # reaching it. The EMPTY-content guard lives in assert_verl_row (tested below), so
+    # the blank row is caught at the conformance gate, not silently shipped.
+    row = producer.to_verl_row(
+        {"ground_truth": "x"}, technique="rlvr", style="rule",
+    )
+    assert row["prompt"] == [{"role": "user", "content": ""}]
+
+
+def test_assert_rejects_empty_prompt_content(monkeypatch):
+    # The robustness fix: a structurally-valid prompt whose content is ALL EMPTY must
+    # fail the conformance gate (it means training on blank problems). This is what
+    # makes the prompt-alias list a convenience, not a correctness dependency — any
+    # dataset whose prompt column we don't recognize fails LOUD at stage time with a
+    # --column-map remedy, instead of silently producing blank prompts.
+    import common
+    calls = {}
+
+    def _fake_error_exit(msg, **kw):
+        calls["msg"] = msg
+        raise SystemExit(1)
+
+    monkeypatch.setattr(common, "_error_exit", _fake_error_exit, raising=False)
+    monkeypatch.setattr(producer, "_error_exit", _fake_error_exit, raising=False)
+
+    blank = {
+        "data_source": "d",
+        "prompt": [{"role": "user", "content": "   "}],  # whitespace-only = empty
+        "ability": "general",
+        "reward_model": {"style": "rule", "ground_truth": "8"},
+        "extra_info": {"index": 0},
+    }
+    with pytest.raises(SystemExit):
+        producer.assert_verl_row(blank, style="rule")
+    assert "no message content" in calls["msg"].lower()
+    assert "--column-map" in calls["msg"]
+
+
+def test_assert_accepts_real_prompt_content(monkeypatch):
+    import common
+
+    def _boom(msg, **kw):
+        raise AssertionError(f"should not have failed: {msg}")
+
+    monkeypatch.setattr(common, "_error_exit", _boom, raising=False)
+    monkeypatch.setattr(producer, "_error_exit", _boom, raising=False)
+    ok = {
+        "data_source": "d",
+        "prompt": [{"role": "user", "content": "What is 2+2?"}],
+        "ability": "general",
+        "reward_model": {"style": "rule", "ground_truth": "4"},
+        "extra_info": {"index": 0},
+    }
+    producer.assert_verl_row(ok, style="rule")  # must not raise
+
+
 def test_wellformed_nested_reward_model_is_preserved():
     row = producer.to_verl_row(
         {"prompt": "q", "reward_model": {"style": "model", "ground_truth": {"k": 1}}},

@@ -59,10 +59,14 @@ const LEANER_MTRL = {
     name: { type: 'string', default: '' }
 };
 
+// BL180: the fetcher now receives the RECIPE object ({technique, model, peft}) — the
+// default fetcher reads the SMTJ SDK's _specs for that (technique, model). The injected
+// test fetcher keys off recipe.technique (offline, no SDK/AWS) and returns a fixture
+// options-dict in the SAME shape the real _specs/override-params produce.
 function makeFetcher(overrides = {}) {
     const mtrl = overrides.mtrl || LEANER_MTRL;
     const rlaif = overrides.rlaif || TAGGED_RLAIF;
-    return async (uri) => (uri.includes('mtrl') ? mtrl : rlaif);
+    return async (recipe) => ((recipe && recipe.technique === 'mtrl') ? mtrl : rlaif);
 }
 
 // Fixture recipe versions use a synthetic, deliberately-high version (v9x) so the
@@ -72,8 +76,8 @@ function makeFetcher(overrides = {}) {
 // descriptor also carried v2.2.7, silently skipping the fixture write). A version no
 // real recipe will emit keeps these behavior tests independent of the committed data.
 const RECIPES = [
-    { technique: 'rlaif', peft: 'lora', smtjOverrideParamsS3Uri: 's3://b/verl-grpo-rlaif-qwen-3-8b-lora_override_params_sm_jobs_v90.0.0.json', hpEksOverrideParamsS3Uri: 's3://b/verl-grpo-rlaif-qwen-3-8b-lora_override_params_k8s_v90.0.0.json' },
-    { technique: 'mtrl', peft: 'lora', smtjOverrideParamsS3Uri: 's3://b/mtrl-gpt-oss-20b-lora_override_params_sm_jobs_v90.0.0.json', hpEksOverrideParamsS3Uri: null }
+    { technique: 'rlaif', peft: 'lora', model: 'test-model-rlaif', smtjOverrideParamsS3Uri: 's3://b/verl-grpo-rlaif-qwen-3-8b-lora_override_params_sm_jobs_v90.0.0.json', hpEksOverrideParamsS3Uri: 's3://b/verl-grpo-rlaif-qwen-3-8b-lora_override_params_k8s_v90.0.0.json' },
+    { technique: 'mtrl', peft: 'lora', model: 'test-model-mtrl', smtjOverrideParamsS3Uri: 's3://b/mtrl-gpt-oss-20b-lora_override_params_sm_jobs_v90.0.0.json', hpEksOverrideParamsS3Uri: null }
 ];
 
 describe('sync-tune-descriptors (tune-descriptor synced layer)', () => {
@@ -221,6 +225,26 @@ describe('sync-tune-descriptors (tune-descriptor synced layer)', () => {
         const allowed = new Set(['string', 'integer', 'number', 'boolean']);
         for (const [kn, ke] of Object.entries(hp)) {
             assert.ok(allowed.has(ke.type), `${kn}.type='${ke.type}' not in the schema enum`);
+        }
+    });
+
+    // BL180: the fetcher must receive the RECIPE object (technique + model), NOT the
+    // raw S3 uri — the authoritative source is the SMTJ SDK's _specs for that
+    // (technique, model), read by constructing the trainer. Guard the contract so a
+    // regression back to uri-based fetching (the stale-recipe source) is caught.
+    it('passes the recipe (technique + model) to the fetcher, not the raw uri', async () => {
+        const seen = [];
+        const fetcher = async (arg) => {
+            seen.push(arg);
+            return arg && arg.technique === 'mtrl' ? LEANER_MTRL : TAGGED_RLAIF;
+        };
+        await syncTuneDescriptors(RECIPES, { fetchOverrideParams: fetcher, tuneDir: tmp });
+        assert.ok(seen.length >= 1, 'fetcher was invoked');
+        for (const arg of seen) {
+            assert.strictEqual(typeof arg, 'object',
+                'fetcher received an object (the recipe), not a string uri');
+            assert.ok(arg.technique, 'recipe carries technique');
+            assert.ok(arg.model, 'recipe carries model (needed to construct the SDK trainer)');
         }
     });
 });

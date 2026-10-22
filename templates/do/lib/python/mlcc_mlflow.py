@@ -1046,6 +1046,14 @@ def resolve_dataset_by_name(name, client=None, experiment_ids=None,
     when no dataset with that name is recorded. Used by ``do/tune --dataset X``
     name resolution when MLflow is configured.
 
+    Re-registering a dataset whose CONTENT changed (e.g. the BL179
+    `.json` → `.from_array.jsonl` fix) produces a NEW digest, so MLflow holds
+    MULTIPLE ``(name, digest)`` inputs for the same name — the old one does not
+    get overwritten. ``list_dataset_inputs`` returns them newest-first, so we
+    must keep the FIRST match (the newest registration); taking the last would
+    resolve to the STALE URI (observed: do/tune resolving to a dead `.json` that
+    the trainer rejects with "S3 training dataset path does not exist").
+
     BL163 scope: resolves the read experiment id(s) the same way
     ``list_dataset_inputs`` does (active project + "0" by default, all when
     ``all_projects=True``) unless ``experiment_ids`` is given explicitly.
@@ -1053,14 +1061,13 @@ def resolve_dataset_by_name(name, client=None, experiment_ids=None,
     Raises MlflowUnavailableError when MLflow is not installed.
     """
     safe_name = sanitize_name(name)
-    match = None
     for entry in list_dataset_inputs(
         client=client, experiment_ids=experiment_ids,
         project_name=project_name, all_projects=all_projects,
     ):
         if entry.get("name") == safe_name:
-            match = entry  # later runs overwrite → most-recent wins
-    return match
+            return entry  # newest-first order → first match is the most recent
+    return None
 
 
 def _search_runs(client=None, experiment_ids=None):

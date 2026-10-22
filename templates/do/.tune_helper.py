@@ -200,6 +200,11 @@ def main():
                                      help="Customization technique")
     build_config_parser.add_argument("--variant", default=None,
                                      help="PEFT variant (lora|full); default resolves lora")
+    build_config_parser.add_argument("--model", default=None,
+                                     help="BL180: model id (TUNE_MODEL_ID). When set, the "
+                                          "AUTHORITATIVE per-model hyperparameter specs are read "
+                                          "live from the SMTJ SDK; falls back to the tune "
+                                          "descriptor when the SDK/model can't be resolved.")
     build_config_parser.add_argument("--supplied", default="{}",
                                      help="JSON object of already-resolved knob values "
                                           "(merged config file + --set, flag-wins)")
@@ -210,6 +215,13 @@ def main():
                                      help="Apply defaults without prompting (same validation)")
     build_config_parser.add_argument("--tune-dir", default=None, dest="tune_dir",
                                      help="Override the tune.d root (tests)")
+    build_config_parser.add_argument("--skip-knob", action="append", default=[],
+                                     dest="skip_knobs", metavar="KNOB",
+                                     help="Drop a knob from resolution/prompting "
+                                          "(repeatable). Used when the value is set "
+                                          "elsewhere, e.g. judge_prompt_template when "
+                                          "--reward-prompt was passed, so the user is "
+                                          "not asked for it twice.")
 
     # ── Parse and dispatch ────────────────────────────────────────────────────
     args = parser.parse_args()

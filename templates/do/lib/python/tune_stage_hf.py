@@ -337,6 +337,15 @@ def cmd_stage_hf(args):
             s3_prefix = f"{args.project_name}/datasets/{org}/{name}/{split}"
         num_records = 0
         empty_field_counts = {}
+        # The actual S3 key of the LAST file uploaded. The returned s3_uri MUST be
+        # derived from this — not re-computed from the original repo filename — so a
+        # file whose name changed during staging (BL179 `.json` → `.from_array.jsonl`
+        # normalization, or `.parquet` → `.jsonl` conversion) is registered at the key
+        # that actually exists. Deriving the URI from `data_files[0]` instead recorded
+        # a non-existent `.json`/`.parquet` key, which later 404'd the native AI
+        # Registry create (and the content-hash step), so the dataset never appeared
+        # in Studio Assets though the S3 sidecar made it look registered.
+        uploaded_s3_key = None
 
         # ── BL129: managed-RL (verl) Producer branch ────────────────────────────
         # For rlvr/rlaif the managed trainer runs verl's RLHFDataset, which reads the
@@ -447,6 +456,7 @@ def cmd_stage_hf(args):
                             )
                         s3_key = f"{s3_prefix}/{jsonl_filename}"
                         s3_client.upload_file(jsonl_path, args.output_bucket, s3_key)
+                        uploaded_s3_key = s3_key
 
                     except ImportError:
                         _error_exit(
@@ -551,13 +561,20 @@ def cmd_stage_hf(args):
 
                     s3_key = f"{s3_prefix}/{os.path.basename(data_file)}"
                     s3_client.upload_file(local_path, args.output_bucket, s3_key)
+                    uploaded_s3_key = s3_key
 
-        first_file = data_files[0]
-        if first_file.endswith(".parquet"):
-            output_filename = os.path.splitext(os.path.basename(first_file))[0] + ".jsonl"
+        # Derive the returned URI from the key actually uploaded (handles any
+        # name change during staging). Fall back to the original-filename logic
+        # only if, somehow, nothing was uploaded.
+        if uploaded_s3_key:
+            s3_uri = f"s3://{args.output_bucket}/{uploaded_s3_key}"
         else:
-            output_filename = os.path.basename(first_file)
-        s3_uri = f"s3://{args.output_bucket}/{s3_prefix}/{output_filename}"
+            first_file = data_files[0]
+            if first_file.endswith(".parquet"):
+                output_filename = os.path.splitext(os.path.basename(first_file))[0] + ".jsonl"
+            else:
+                output_filename = os.path.basename(first_file)
+            s3_uri = f"s3://{args.output_bucket}/{s3_prefix}/{output_filename}"
 
         if num_records > 0 and empty_field_counts:
             for field, count in empty_field_counts.items():

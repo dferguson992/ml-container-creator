@@ -1126,7 +1126,11 @@ if [ "${SUBCOMMAND}" = "evaluator" ]; then
     if [ "${EVALUATOR_FROM_SAMPLE}" = true ]; then
         # Editable-sample on-ramp (Req 1A). Without --finalize this materializes
         # an editable reward function and stops so the user edits it first.
-        echo "📋 ${EVALUATOR_FINALIZE:+Finalizing}${EVALUATOR_FINALIZE:-Materializing} reward-function sample: ${EVALUATOR_NAME}"
+        if [ "${EVALUATOR_FINALIZE}" = true ]; then
+            echo "📋 Finalizing reward-function sample: ${EVALUATOR_NAME}"
+        else
+            echo "📋 Materializing reward-function sample: ${EVALUATOR_NAME}"
+        fi
         EV_ARGS+=("--from-sample")
         [ -n "${EVALUATOR_SAMPLE_ID}" ] && EV_ARGS+=("--sample-id" "${EVALUATOR_SAMPLE_ID}")
         [ "${EVALUATOR_FINALIZE}" = true ] && EV_ARGS+=("--finalize")

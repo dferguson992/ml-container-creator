@@ -212,7 +212,7 @@ class TestRegisterDatasetNativeSuccess:
         try:
             with patch.object(arn, "check_ai_registry_available", return_value=True):
                 result = arn.register_dataset_native(
-                    name="calib", s3_uri="s3://b/datasets/calib/",
+                    name="calib", s3_uri="s3://b/datasets/calib/data.jsonl",
                     technique="sft", region="us-west-2",
                     description="hello", role="arn:aws:iam::1:role/r",
                     domain_id="d-abc123",
@@ -221,7 +221,8 @@ class TestRegisterDatasetNativeSuccess:
             cleanup()
 
         assert captured["name"] == "calib"
-        assert captured["source"] == "s3://b/datasets/calib/"
+        # An object source (no trailing slash) is passed to create unchanged.
+        assert captured["source"] == "s3://b/datasets/calib/data.jsonl"
         assert captured["customization_technique"] == "SFT-MEMBER"
         assert captured["role"] == "arn:aws:iam::1:role/r"
         assert captured["domain_id"] == "d-abc123"
@@ -240,7 +241,8 @@ class TestRegisterDatasetNativeSuccess:
         try:
             with patch.object(arn, "check_ai_registry_available", return_value=True):
                 arn.register_dataset_native(
-                    name="Intel_orca_dpo", s3_uri="s3://b/datasets/Intel_orca_dpo/",
+                    name="Intel_orca_dpo",
+                    s3_uri="s3://b/datasets/Intel_orca_dpo/orca.jsonl",
                     technique="dpo", region="us-west-2",
                     role="arn:aws:iam::1:role/r", domain_id="d-abc123",
                 )
@@ -255,7 +257,7 @@ class TestRegisterDatasetNativeSuccess:
         try:
             with patch.object(arn, "check_ai_registry_available", return_value=True):
                 result = arn.register_dataset_native(
-                    name="prompts", s3_uri="s3://b/datasets/prompts/",
+                    name="prompts", s3_uri="s3://b/datasets/prompts/prompts.jsonl",
                     technique="rlaif", region="us-west-2",
                 )
         finally:
@@ -270,7 +272,7 @@ class TestRegisterDatasetNativeSuccess:
         try:
             with patch.object(arn, "check_ai_registry_available", return_value=True):
                 result = arn.register_dataset_native(
-                    name="calib", s3_uri="s3://b/datasets/calib/",
+                    name="calib", s3_uri="s3://b/datasets/calib/data.jsonl",
                     technique="dpo", region="us-east-1",
                 )
         finally:
@@ -278,6 +280,49 @@ class TestRegisterDatasetNativeSuccess:
 
         assert "domain_id" not in captured
         assert result["domain_tagged"] is False
+
+
+# ── register_dataset_native: prefix source resolution (RLVR/RLAIF/MTRL) ─────────
+
+class TestRegisterDatasetNativePrefixSource:
+    """A prefix source (the managed-RL verl training channel 's3://.../data/') is
+    resolved to a single data object for the native asset, because DataSet.create
+    downloads one file. The training-channel URI itself stays the prefix in the
+    sidecar (asserted by the caller, not here)."""
+
+    def test_prefix_source_resolved_to_object_before_create(self):
+        captured = {}
+        cleanup = _install_fake_sdk(captured)
+        try:
+            with patch.object(arn, "check_ai_registry_available", return_value=True), \
+                 patch.object(arn, "_resolve_prefix_to_object",
+                              return_value="s3://b/datasets/rl/data/part-0.parquet") as res:
+                result = arn.register_dataset_native(
+                    name="rl", s3_uri="s3://b/datasets/rl/data/",
+                    technique="rlvr", region="us-west-2",
+                )
+        finally:
+            cleanup()
+        res.assert_called_once_with("s3://b/datasets/rl/data/", "us-west-2")
+        # create() received the RESOLVED object, not the prefix.
+        assert captured["source"] == "s3://b/datasets/rl/data/part-0.parquet"
+        assert result["member"] == "RLVR"
+
+    def test_prefix_with_no_data_object_skips_non_fatally(self):
+        captured = {}
+        cleanup = _install_fake_sdk(captured)
+        try:
+            with patch.object(arn, "check_ai_registry_available", return_value=True), \
+                 patch.object(arn, "_resolve_prefix_to_object", return_value=None):
+                with pytest.raises(arn.NativeRegistrySkipped):
+                    arn.register_dataset_native(
+                        name="rl", s3_uri="s3://b/datasets/rl/data/",
+                        technique="rlvr", region="us-west-2",
+                    )
+        finally:
+            cleanup()
+        # create() was never reached.
+        assert captured == {}
 
 
 # ── profile resolution helpers ─────────────────────────────────────────────────

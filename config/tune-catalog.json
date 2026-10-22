@@ -1,6 +1,6 @@
 {
   "version": "2026-05-27",
-  "lastSynced": "2026-10-21T18:19:06.294Z",
+  "lastSynced": "2026-10-21T20:59:21.975Z",
   "source": "https://docs.aws.amazon.com/sagemaker/latest/dg/model-customize-open-weight.html",
   "models": {
     "huggingface-llm-qwen2-5-7b-instruct": {

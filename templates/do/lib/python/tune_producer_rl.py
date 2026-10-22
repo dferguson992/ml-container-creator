@@ -38,7 +38,13 @@ VERL_FIELDS = ["data_source", "prompt", "ability", "reward_model", "extra_info"]
 # explicit — a Producer transform, not a free-form column-map (a flat column-map
 # cannot build the nested reward_model struct, which is the whole point).
 _GROUND_TRUTH_ALIASES = ("ground_truth", "answer", "solution", "label", "target")
-_PROMPT_ALIASES = ("prompt", "question", "instruction", "input", "query")
+# `messages`/`conversations` (a chat message LIST) come FIRST: the common RLVR/RLAIF
+# source shape (e.g. allenai/RLVR-MATH) puts the problem there, already in verl's
+# [{role,content}, ...] form. Omitting them meant _normalize_prompt(None) produced an
+# EMPTY prompt for every row — training on blank problems. _normalize_prompt passes a
+# list through unchanged, so a recognized `messages` column lands correctly.
+_PROMPT_ALIASES = ("messages", "conversations", "prompt", "question",
+                   "instruction", "input", "query")
 _DATA_SOURCE_ALIASES = ("data_source", "dataset", "source")
 _ABILITY_ALIASES = ("ability", "task", "category", "domain")
 
@@ -153,6 +159,23 @@ def assert_verl_row(row: dict, *, style: str) -> None:
             "Produced RL row 'prompt' must be a non-empty chat message LIST "
             "([{role, content}, ...]) for verl's RLHFDataset — got "
             f"{type(row['prompt']).__name__}."
+        )
+    # Structure alone is not enough: a message list whose content is all EMPTY passes
+    # the shape check but means the model trains on a BLANK problem (observed: a source
+    # whose prompt lived in a column not in _PROMPT_ALIASES produced 7500 empty-content
+    # rows that still "conformed"). Fail LOUD here so a mis-detected prompt column is
+    # caught at stage time, not after a GPU run on garbage. The remedy is explicit and
+    # dataset-agnostic: map the real column with --column-map.
+    if not any(
+        isinstance(m, dict) and str(m.get("content") or "").strip()
+        for m in row["prompt"]
+    ):
+        _error_exit(
+            "Produced RL row 'prompt' has NO message content — every message is empty. "
+            "The source record's prompt text was not found under any known column "
+            f"({', '.join(_PROMPT_ALIASES)}). Map the real prompt column explicitly, "
+            "e.g.  --column-map prompt=<your_prompt_column>  (the training problem text "
+            "must be present, or the model trains on blank prompts)."
         )
     rm = row["reward_model"]
     if not isinstance(rm, dict) or "style" not in rm or "ground_truth" not in rm:

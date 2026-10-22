@@ -122,6 +122,73 @@ def test_resolve_experiment_ids_no_client_degrades_to_zero():
     assert ids == ["0"]
 
 
+# ── resolve_dataset_by_name: newest registration wins ────────────────────────
+#
+# Re-registering a dataset whose CONTENT changed (the BL179 `.json` →
+# `.from_array.jsonl` fix) logs a NEW (name, digest) input WITHOUT overwriting the
+# old one, so MLflow holds several inputs for one name. list_dataset_inputs returns
+# them newest-first; resolve_dataset_by_name must keep the FIRST match. Taking the
+# last resolved the STALE URI and do/tune then failed with "S3 training dataset path
+# does not exist". This pins the newest-wins contract.
+
+
+class _FakeDataset:
+    def __init__(self, name, digest, uri):
+        self.name = name
+        self.digest = digest
+        # _source_uri_and_meta reads source.to_dict() → {"uri", "meta"}.
+        self.source = {"uri": uri, "meta": {"s3_uri": uri, "format": "jsonl"}}
+
+
+class _FakeDatasetInput:
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+
+class _FakeRunInputs:
+    def __init__(self, dataset_inputs):
+        self.dataset_inputs = dataset_inputs
+
+
+class _FakeRunInfo:
+    def __init__(self, run_id):
+        self.run_id = run_id
+
+
+class _FakeRun:
+    def __init__(self, run_id, dataset):
+        self.info = _FakeRunInfo(run_id)
+        self.inputs = _FakeRunInputs([_FakeDatasetInput(dataset)])
+
+
+class _FakeRunsClient:
+    """Returns runs in the ALREADY newest-first order (as the real path sorts)."""
+
+    def __init__(self, runs):
+        self._runs = runs
+
+    def search_runs(self, experiment_ids=None, page_token=None):
+        return list(self._runs)  # single page, no token
+
+
+def test_resolve_dataset_by_name_returns_newest_registration():
+    name = "openllm-sft-alpaca"
+    new_uri = "s3://b/datasets/openllm-sft-alpaca/ro_sft_alpaca.from_array.jsonl"
+    old_uri = "s3://b/datasets/openllm-sft-alpaca/ro_sft_alpaca.json"
+    # Newest-first: the fixed .jsonl registration precedes the stale .json one.
+    client = _FakeRunsClient([
+        _FakeRun("r-new", _FakeDataset(name, "digest-new", new_uri)),
+        _FakeRun("r-old", _FakeDataset(name, "digest-old", old_uri)),
+    ])
+    entry = mlcc_mlflow.resolve_dataset_by_name(
+        name, client=client, experiment_ids=["0"],
+    )
+    assert entry is not None
+    # The NEWEST URI wins — not the stale .json that 404s the trainer.
+    assert entry["s3_uri"] == new_uri
+    assert entry["digest"] == "digest-new"
+
+
 # ── 1. No local-file tracking anywhere in the runtime python ─────────────────
 
 # A LOCAL tracking TARGET is the harm (it bypasses the shared serverless store).

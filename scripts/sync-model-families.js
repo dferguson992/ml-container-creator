@@ -21,6 +21,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { KNOWN_TECHNIQUES } from '../src/lib/managed-techniques.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -180,7 +181,7 @@ async function describeHubContent(client, name) {
  * @param {string} hubContentDocument - JSON string from DescribeHubContent
  * @returns {Array<{technique: string, trainingTypes: string[], datasetFormat: string, datasetSchema: object}>}
  */
-function parseRecipes(hubContentDocument) {
+function parseRecipes(hubContentDocument, modelName) {
     if (!hubContentDocument) return [];
 
     let doc;
@@ -222,7 +223,10 @@ function parseRecipes(hubContentDocument) {
             // (incl. 'None'/full-rank)→'full' to key the descriptor variant.
             peft: String(recipe.Peft || recipe.peft || 'lora').toLowerCase() === 'lora' ? 'lora' : 'full',
             smtjOverrideParamsS3Uri: _normalizeS3Pointer(recipe.SmtjOverrideParamsS3Uri),
-            hpEksOverrideParamsS3Uri: _normalizeS3Pointer(recipe.HpEksOverrideParamsS3Uri)
+            hpEksOverrideParamsS3Uri: _normalizeS3Pointer(recipe.HpEksOverrideParamsS3Uri),
+            // BL180: the model this recipe belongs to — the SDK-specs fetcher needs it
+            // to construct the technique's trainer and read its authoritative _specs.
+            model: modelName || null
         });
     }
 
@@ -624,8 +628,15 @@ export async function syncTuneDescriptors(recipes, opts = {}) {
         if (!variant) continue; // descriptor doesn't declare this variant
 
         const version = _versionFromOverrideParamsUri(smtjUri);
-        // Idempotent: skip when the recorded smtj version is unchanged.
-        if (version
+        // Idempotent: skip when the recorded smtj version is unchanged — UNLESS forced.
+        // BL180 note: the version-skip keys off the recipe URI version, but the
+        // AUTHORITATIVE source is now the SMTJ SDK's _specs (which can change even when
+        // the recipe URI version does not — e.g. an SDK upgrade that fixes the valid-
+        // options set). `opts.force` (sync:models --force) bypasses the skip so a
+        // re-source / SDK-change can be pulled in. Without --force the skip still makes
+        // ordinary re-runs cheap no-ops.
+        if (!opts.force
+            && version
             && variant._synced && variant._synced.smtj
             && variant._synced.smtj.version === version) {
             skipped++;
@@ -634,7 +645,13 @@ export async function syncTuneDescriptors(recipes, opts = {}) {
 
         let overrideParams;
         try {
-            overrideParams = await fetchOverrideParams(smtjUri);
+            // BL180: the fetcher receives the RECIPE (technique + model + peft), not
+            // just the S3 uri — the authoritative source is the SMTJ SDK's resolved
+            // `_specs` (recipe + the trainer's per-technique mutations), which the
+            // default fetcher reads by constructing the trainer via the Python helper.
+            // The raw override-params file is version-skewed from the validator and is
+            // NO LONGER the source (it listed knobs the trainer rejects + a stale enum).
+            overrideParams = await fetchOverrideParams(recipe);
         } catch {
             overrideParams = null;
         }
@@ -663,25 +680,64 @@ export async function syncTuneDescriptors(recipes, opts = {}) {
 }
 
 /**
- * Default override-params fetcher: S3 GetObject → parsed JSON. Network-dependent; the
- * injectable seam (opts.fetchOverrideParams) keeps the unit tests offline.
+ * Default spec fetcher (BL180): read the SMTJ SDK's AUTHORITATIVE fine-tuning
+ * `_specs` for a recipe's (technique, model[, peft]) by invoking the Python helper
+ * `scripts/dump-tune-specs.py`, which constructs the trainer and dumps `_specs` as
+ * JSON. This REPLACES the old raw-S3-recipe fetch: the recipe override-params file
+ * was version-skewed from the trainer's own validator (listed knobs the SDK rejects,
+ * omitted ones it accepts, carried a stale global_batch_size enum). The `_specs` dict
+ * has the SAME entry shape as the override-params, so buildHyperparametersBlock /
+ * _mapOverrideParamKnob consume it unchanged. Network+SDK-dependent; the injectable
+ * seam (opts.fetchOverrideParams) keeps the unit tests offline.
+ *
+ * Returns null on any failure (missing model, helper error, non-JSON) so the caller
+ * leaves the existing synced layer intact (never regress).
  * @param {string} [region]
- * @returns {(uri: string) => Promise<object|null>}
+ * @param {string} [pythonBin] python interpreter (default: process.env.PYTHON or 'python3')
+ * @returns {(recipe: {technique: string, model: string, peft?: string}) => Promise<object|null>}
  */
-function _defaultFetchOverrideParams(region) {
-    return async function fetchFromS3(uri) {
-        const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
-        const m = /^s3:\/\/([^/]+)\/(.+)$/.exec(uri);
-        if (!m) return null;
-        const [, bucket, key] = m;
-        const client = new S3Client({ region: region || process.env.AWS_REGION || 'us-west-2' });
-        const resp = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-        const body = await resp.Body.transformToString();
+function _defaultFetchOverrideParams(region, pythonBin) {
+    // The helper needs the SMTJ SDK (sagemaker.train). Bare `python3` usually lacks it;
+    // prefer the repo venv's interpreter (.venv/bin/python) when present, then an
+    // explicit override, then fall back to python3. (BL180: the sync counted all
+    // techniques as "failed" when it shelled out to a bare python3 without the SDK.)
+    const _venvPy = path.resolve(__dirname, '..', '.venv', 'bin', 'python');
+    const py = pythonBin
+        || process.env.MLCC_SYNC_PYTHON
+        || process.env.PYTHON
+        || (existsSync(_venvPy) ? _venvPy : 'python3');
+    const helper = path.resolve(__dirname, 'dump-tune-specs.py');
+    return async function fetchFromSdk(recipe) {
+        if (!recipe || !recipe.technique || !recipe.model) return null;
+        const args = [
+            helper,
+            '--technique', recipe.technique,
+            '--model', recipe.model,
+            '--training-type', recipe.peft === 'full' ? 'full-rank' : 'lora'
+        ];
+        if (region || process.env.AWS_REGION) {
+            args.push('--region', region || process.env.AWS_REGION);
+        }
+        let out;
         try {
-            return JSON.parse(body);
+            // stdout is PURE JSON (the helper routes SDK noise to stderr). Inherit
+            // stderr so sync logs/errors remain visible; cap the buffer generously.
+            out = execFileSync(py, args, {
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'inherit'],
+                maxBuffer: 32 * 1024 * 1024
+            });
+        } catch {
+            return null; // helper exited non-zero (e.g. {"error": ...}) → treat as fetch failure
+        }
+        let parsed;
+        try {
+            parsed = JSON.parse(out);
         } catch {
             return null;
         }
+        if (!parsed || typeof parsed !== 'object' || parsed.error) return null;
+        return parsed;
     };
 }
 
@@ -717,7 +773,7 @@ export async function syncModelFamilies(options = {}) {
         for (const model of models) {
             console.log(`    Describing: ${model.HubContentName}`);
             const detail = await describeHubContent(client, model.HubContentName);
-            const recipes = parseRecipes(detail.HubContentDocument);
+            const recipes = parseRecipes(detail.HubContentDocument, model.HubContentName);
 
             if (recipes.length > 0) {
                 discovered[model.HubContentName] = buildCatalogEntry(model, detail, recipes);
@@ -784,6 +840,7 @@ export async function syncModelFamilies(options = {}) {
         descriptorResult = await syncTuneDescriptors(allRecipes, {
             fetchOverrideParams: options.fetchOverrideParams,
             tuneDir: options.tuneDir,
+            force: options.force,
             region
         });
     }
@@ -817,7 +874,10 @@ const isMainModule = process.argv[1] && (
 if (isMainModule) {
     console.log('\n📦 Sync Model Families — Discovering supported models from JumpStart Hub...\n');
 
-    syncModelFamilies()
+    // BL180: --force re-syncs the tune-descriptor synced layer even when the recipe
+    // URI version is unchanged (needed to pull an SDK-sourced _specs change).
+    const _force = process.argv.includes('--force');
+    syncModelFamilies({ force: _force })
         .then((result) => {
             console.log(`\n✅ Sync complete: ${result.added} new, ${result.updated} updated, ${result.total} total models\n`);
         })

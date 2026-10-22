@@ -83,6 +83,61 @@ def native_member_for(technique):
     return _TECHNIQUE_TO_MEMBER[key], True
 
 
+# Data-file extensions the native registry can download + validate as a single
+# object, in preference order (parquet first for managed-RL verl channels).
+_NATIVE_SOURCE_EXTS = (".parquet", ".jsonl", ".ndjson", ".json")
+
+
+def _is_prefix_uri(s3_uri):
+    """True when the S3 URI names a prefix (trailing '/') rather than an object."""
+    return isinstance(s3_uri, str) and s3_uri.startswith("s3://") and s3_uri.endswith("/")
+
+
+def _resolve_prefix_to_object(s3_uri, region):
+    """Resolve an s3:// PREFIX to a single representative data object URI.
+
+    Lists the prefix and returns the s3:// URI of one data file, preferring
+    parquet, then jsonl/ndjson/json. Ignores the `_dataset.json` sidecar and any
+    hidden/zero-byte keys. Returns None if the prefix holds no registrable data
+    object (caller then skips native registration with a clear reason). Best-effort:
+    any listing error returns None rather than raising (native path is non-fatal).
+    """
+    try:
+        import boto3
+        from urllib.parse import urlparse
+
+        parsed = urlparse(s3_uri)
+        bucket = parsed.netloc
+        prefix = parsed.path.lstrip("/")
+        s3 = boto3.client("s3", region_name=region)
+        candidates = []
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                base = key.rsplit("/", 1)[-1]
+                if not base or base.startswith(".") or base == "_dataset.json":
+                    continue
+                if obj.get("Size", 0) <= 0:
+                    continue
+                if base.lower().endswith(_NATIVE_SOURCE_EXTS):
+                    candidates.append(key)
+        if not candidates:
+            return None
+
+        def _rank(key):
+            low = key.lower()
+            for i, ext in enumerate(_NATIVE_SOURCE_EXTS):
+                if low.endswith(ext):
+                    return i
+            return len(_NATIVE_SOURCE_EXTS)
+
+        candidates.sort(key=lambda k: (_rank(k), k))
+        return f"s3://{bucket}/{candidates[0]}"
+    except Exception:  # noqa: BLE001 — prefix resolution is best-effort (non-fatal)
+        return None
+
+
 def check_ai_registry_available():
     """True when the installed sagemaker SDK exposes sagemaker.ai_registry.
 
@@ -257,9 +312,34 @@ def register_dataset_native(*, name, s3_uri, technique, region,
             file=sys.stderr,
         )
 
+    # The SDK's DataSet.create downloads the source as a SINGLE object
+    # (AIRHub.download_from_s3 → s3.download_file) and validates its format. A
+    # prefix source (e.g. the managed-RL verl training channel 's3://.../data/')
+    # therefore 404s — you cannot HeadObject/GetObject a prefix. The training
+    # channel legitimately IS a prefix (ODP-2), so we keep the sidecar/channel URI
+    # as the prefix but point the STUDIO-DISCOVERABLE native asset at a single
+    # representative data object inside it. This is why RLVR/RLAIF/MTRL datasets
+    # (parquet-dir sources) never appeared in Studio Assets while DPO (single-file
+    # source) did.
+    native_source = s3_uri
+    if _is_prefix_uri(s3_uri):
+        resolved = _resolve_prefix_to_object(s3_uri, region)
+        if resolved is None:
+            raise NativeRegistrySkipped(
+                f"source '{s3_uri}' is a prefix with no single registrable data "
+                "object; the training channel is registered in the S3 sidecar, but "
+                "the native AI Registry needs a single file"
+            )
+        native_source = resolved
+        print(
+            f"\u2139\ufe0f  AI Registry source '{s3_uri}' \u2192 '{native_source}' "
+            "(native registry needs a single file; training channel stays the prefix).",
+            file=sys.stderr,
+        )
+
     create_kwargs = {
         "name": hub_name,
-        "source": s3_uri,
+        "source": native_source,
         "customization_technique": technique_member,
     }
     if role:

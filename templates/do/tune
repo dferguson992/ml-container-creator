@@ -560,6 +560,13 @@ _update_config_var() {
         sed -i.bak "s|^export ${var_name}=.*|export ${var_name}=\"${var_value}\"|" "${config_file}"
         rm -f "${config_file}.bak"
     else
+        # Guard against a config whose last line has no trailing newline: appending
+        # directly would GLUE the new export onto the previous one (observed:
+        # `...SIZE="2"export TUNE_ADAPTER_PATH_DPO=...`, corrupting both vars). If the
+        # file is non-empty and does not already end in a newline, add one first.
+        if [ -s "${config_file}" ] && [ -n "$(tail -c 1 "${config_file}")" ]; then
+            echo "" >> "${config_file}"
+        fi
         echo "export ${var_name}=\"${var_value}\"" >> "${config_file}"
     fi
 }
@@ -895,6 +902,12 @@ _validate_dataset() {
     if [ -n "${ARG_DATASET_NAME}" ]; then
         echo "🔍 Resolving dataset '${ARG_DATASET_NAME}' from registry..."
         local resolve_args=("--name" "${ARG_DATASET_NAME}")
+        # Scope resolution to THIS project's MLflow experiment. Without it, name
+        # resolution reads a different experiment set and either misses the dataset
+        # or (with multiple content-versions logged) resolves to a stale URI — the
+        # cause of do/tune resolving a dead `.json` after a re-register. `--list`
+        # (via do/register) already scopes by project; mirror it here.
+        [ -n "${PROJECT_NAME:-}" ] && resolve_args+=("--project-name" "${PROJECT_NAME}")
         if [ -n "${ARG_DATASET_VERSION}" ]; then
             resolve_args+=("--version" "${ARG_DATASET_VERSION}")
             echo "   Version: v${ARG_DATASET_VERSION}"
@@ -937,6 +950,9 @@ _validate_dataset() {
             # Name-based resolution happens below via resolve-dataset
             echo "🔍 Resolving dataset '${ARG_DATASET_NAME}' from registry..."
             local resolve_args=("--name" "${ARG_DATASET_NAME}")
+            # Scope to this project's MLflow experiment (see note above) so a
+            # re-registered dataset resolves to its NEWEST URI, not a stale one.
+            [ -n "${PROJECT_NAME:-}" ] && resolve_args+=("--project-name" "${PROJECT_NAME}")
             if [ -n "${ARG_DATASET_VERSION}" ]; then
                 resolve_args+=("--version" "${ARG_DATASET_VERSION}")
                 echo "   Version: v${ARG_DATASET_VERSION}"
@@ -1427,8 +1443,21 @@ print(json.dumps(vals))
         --variant "${ARG_TRAINING_TYPE:-lora}"
         --supplied "${supplied_json}"
     )
+    # BL180 Option 1: pass the resolved model so build-config reads the AUTHORITATIVE
+    # per-model hyperparameter specs live from the SMTJ SDK (not the stale, per-technique
+    # synced descriptor). build-config falls back to the descriptor if the model/SDK
+    # can't be resolved.
+    [ -n "${RESOLVED_MODEL_ID:-}" ] && bc_args+=(--model "${RESOLVED_MODEL_ID}")
     [ "${ARG_ADVANCED}" = true ] && bc_args+=(--advanced)
     [ "${ARG_NON_INTERACTIVE}" = true ] && bc_args+=(--non-interactive)
+    # RLAIF: when the judge template was already chosen via --reward-prompt (resolved
+    # into ARG_REWARD_PROMPT by _preflight_rft_inputs), drop judge_prompt_template from
+    # the HP prompts so the user is not asked to pick the same template a second time.
+    # The SDK sets judge_prompt_template from reward_prompt, so this knob is redundant
+    # here. (Only meaningful for rlaif; harmless for other techniques that lack it.)
+    if [ "${ARG_TECHNIQUE}" = "rlaif" ] && [ -n "${ARG_REWARD_PROMPT}" ]; then
+        bc_args+=(--skip-knob judge_prompt_template)
+    fi
 
     # BL178: do NOT swallow build-config's stderr. The interactive questionary
     # prompt UI renders to stderr (so it stays out of the captured stdout JSON) —
@@ -1450,6 +1479,42 @@ print(json.dumps(vals))
         echo "${errors}" | sed 's/^/   • /' >&2
         return 1
     fi
+
+    # Surface informational notes (e.g. an auto-adjusted default length pair) so the
+    # user SEES what the builder changed on their behalf. Non-fatal; stderr only.
+    local notes
+    notes=$(echo "${bc_result}" | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin).get('notes',[])))" 2>/dev/null) || notes=""
+    if [ -n "${notes}" ]; then
+        echo "${notes}" | sed 's/^/ℹ  /' >&2
+    fi
+
+    # Option-A transparency: show EVERY knob the job will receive and where each
+    # value came from, so knobs that land in SageMaker at their SDK default (advanced/
+    # tertiary knobs the UX never prompts, e.g. lr_scheduler, weight_decay) are visible
+    # here — not a surprise in the console. Defaults carry a hint that --set overrides
+    # them. Rendered to STDERR so the captured stdout stays clean JSON (BL178).
+    echo "${bc_result}" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+resolved = data.get('resolved', {}) or {}
+sources = data.get('sources', {}) or {}
+if not resolved:
+    sys.exit(0)
+LABEL = {'supplied': 'set by you', 'prompt': 'entered', 'default': 'SDK default'}
+has_default = any(sources.get(k) == 'default' for k in resolved)
+print('', file=sys.stderr)
+print('\u2699\ufe0f  Hyperparameters this job will use:', file=sys.stderr)
+width = max((len(k) for k in resolved), default=0)
+for k in sorted(resolved):
+    src = sources.get(k, 'default')
+    print('   {name:<{w}}  {val:<16}  ({lbl})'.format(
+        name=k, w=width, val=str(resolved[k]), lbl=LABEL.get(src, src)), file=sys.stderr)
+if has_default:
+    print('', file=sys.stderr)
+    print('   \u2139\ufe0f  Values marked \"SDK default\" were not prompted. Override any with', file=sys.stderr)
+    print('      --set <knob>=<value> (or --advanced to be prompted for more).', file=sys.stderr)
+print('', file=sys.stderr)
+" 2>/dev/null || true
 
     # Echo the resolved {knob: value} JSON for the caller to pass to submit.
     echo "${bc_result}" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin).get('resolved',{})))" 2>/dev/null || echo "{}"
