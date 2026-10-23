@@ -265,6 +265,8 @@ def _native_hub_name(sm_client, region):
             token = resp.get("NextToken")
             if not token:
                 break
+    except (NameError, AttributeError):
+        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
     except Exception:  # noqa: BLE001 — fall through to the derived name
         pass
 
@@ -272,6 +274,8 @@ def _native_hub_name(sm_client, region):
         import boto3
         account = boto3.client("sts", region_name=region).get_caller_identity()["Account"]
         return f"AiRegistry-{region}-{account}"
+    except (NameError, AttributeError):
+        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
     except Exception:  # noqa: BLE001
         return None
 

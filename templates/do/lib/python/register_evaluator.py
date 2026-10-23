@@ -95,6 +95,8 @@ def _deploy_reward_lambda(*, name, local_py, role_arn, region):
     key = f"evaluators/{name}/lambda_function.py"
     try:
         boto3.client("s3", region_name=region).upload_file(local_py, bucket, key)
+    except (NameError, AttributeError):
+        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
     except Exception as e:  # noqa: BLE001 — backup is best-effort, not fatal
         _warn(f"Could not stage reward-code backup to s3://{bucket}/{key}: {e}")
 
@@ -419,6 +421,8 @@ def cmd_register_prompt(args):
                     mlflow_write=lambda: mlcc_mlflow.register_prompt_native(name, template),
                     name=name, kind="prompt",
                 )
+    except (NameError, AttributeError):
+        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
     except Exception as e:  # noqa: BLE001 — the AI Registry asset already stands
         import sys
         print(f"\u26a0\ufe0f  MLflow Prompt Registry copy skipped ({e}); the AI "
@@ -435,5 +439,7 @@ def _read_s3_text(s3_uri, region=None):
             Bucket=p.netloc, Key=p.path.lstrip("/"),
         )
         return obj["Body"].read().decode("utf-8")
+    except (NameError, AttributeError):
+        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
     except Exception:  # noqa: BLE001 — best-effort; no template → skip MLflow copy
         return ""

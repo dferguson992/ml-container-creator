@@ -99,6 +99,8 @@ def derive_serving_port(engine: str) -> int:
     """
     try:
         me = serve_manifest.metrics_endpoint(engine)
+    except (NameError, AttributeError):
+        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
     except Exception:
         me = None
     if isinstance(me, dict):
