@@ -228,6 +228,198 @@ def build_from_tune_descriptor(technique, variant, supplied, *, interactive,
                         include_advanced=include_advanced, prompter=prompter)
 
 
+# ── do/train adapter (BL154 — the ONLY train-manifest-aware entry) ────────────
+
+# Source labels the train adapter reports per knob (R4.4). The core's generic
+# "supplied" / "default" are relabeled to the precise tier the value came from.
+TRAIN_SOURCE_LABELS = ("manifest", "defaults.yaml", "config.yaml", "flag", "prompt")
+
+
+def _hp_str(value) -> str:
+    """Stringify a hyperparameter value for SageMaker's string-only HyperParameters,
+    exactly as do/train's legacy merge always has (str(v)) — so an unchanged value
+    keeps its original form (e.g. '2e-4' stays '2e-4', never '0.0002')."""
+    return str(value)
+
+
+def _unknown_knob_error(name, technique, declared):
+    import difflib
+    close = difflib.get_close_matches(name, declared, n=1)
+    hint = f" \u2014 did you mean '{close[0]}'?" if close else ""
+    listing = ", ".join(declared) or "(none)"
+    return (
+        f"unknown knob '{name}' for technique '{technique}'{hint} "
+        f"Declared: {listing} (use --allow-unknown to pass it to train.py anyway)"
+    )
+
+
+def build_from_train_descriptor(technique, supplied, *, interactive, include_advanced=False,
+                                prompter=None, training_dir, defaults=None, config_hp=None,
+                                allow_unknown=False):
+    """Thin train-manifest adapter (BL154) over the descriptor-agnostic core.
+
+    Loads + validates ``<training_dir>/<technique>/manifest.json`` via
+    ``train_manifest.load_train_manifest`` (raises ``TrainManifestError`` when invalid).
+    Returns None when the technique has NO manifest — the caller then uses the
+    descriptor-less legacy merge (R6).
+
+    The manifest carries knob METADATA; values come from the layers, overlaid onto each
+    knob's ``default`` before calling ``build_config`` (R4.1, lowest -> highest):
+    manifest ``default`` < ``defaults.yaml`` < ``config.yaml`` < flag/--set (supplied).
+    Interactive mode prompts only knobs NOT supplied, offering the overlaid value as the
+    prompt default (so config.yaml values are re-offered, R4.2).
+
+    Then: (a) relabels sources — core "default" -> manifest | defaults.yaml | config.yaml,
+    "supplied" -> flag, "prompt" stays; (b) passes through, stringified, keys from
+    defaults.yaml / config.yaml that the manifest does not declare (listed in
+    ``passthrough`` for the notice, R3.4); (c) rejects SUPPLIED keys the manifest does not
+    declare with a difflib suggestion + the declared-knob list, unless ``allow_unknown``
+    (then they pass through like (b)) (R3.6/R3.7).
+
+    Returns {"resolved": {knob: str}, "typed": {knob: coerced}, "sources": {knob: label},
+    "passthrough": [knob, ...], "prompted": {knob: str}, "errors": [...],
+    "notes": [...], "descriptor": True}. ``resolved`` values are the ORIGINAL value
+    forms stringified (not re-rendered from the coerced type) so unchanged values keep
+    the exact string train.py has always parsed.
+    """
+    import copy
+    import train_manifest
+
+    manifest = train_manifest.load_train_manifest(training_dir, technique)
+    if manifest is None:
+        return None
+
+    defaults = defaults or {}
+    config_hp = config_hp or {}
+    supplied = supplied or {}
+    declared_hp = manifest.get("hyperparameters") or {}
+    declared = sorted(declared_hp)
+
+    # Value-layer overlay onto knob defaults (manifest < defaults.yaml < config.yaml).
+    hp = copy.deepcopy(declared_hp)
+    layer_source = {}
+    for name, knob in hp.items():
+        if "default" in knob and knob["default"] is not None:
+            layer_source[name] = "manifest"
+        for label, layer in (("defaults.yaml", defaults), ("config.yaml", config_hp)):
+            if name in layer and layer[name] is not None:
+                knob["default"] = layer[name]
+                layer_source[name] = label
+
+    errors = []
+    notes = []
+    declared_supplied = {k: v for k, v in supplied.items() if k in declared_hp}
+    unknown_supplied = [k for k in supplied if k not in declared_hp]
+    if not allow_unknown:
+        for name in unknown_supplied:
+            errors.append(_unknown_knob_error(name, technique, declared))
+
+    # Capture the raw prompt answer so the original string form is preserved.
+    prompted_raw = {}
+    wrapped = None
+    if prompter is not None:
+        def wrapped(name, knob, control, default):
+            raw = prompter(name, knob, control, default)
+            if raw is not None and str(raw) != "":
+                prompted_raw[name] = raw
+            return raw
+
+    core = build_config(hp, declared_supplied, interactive=interactive,
+                        include_advanced=include_advanced, prompter=wrapped)
+    errors.extend(core["errors"])
+
+    resolved, sources, prompted = {}, {}, {}
+    for name in core["resolved"]:
+        src = core["sources"].get(name)
+        if src == "supplied":
+            raw, label = declared_supplied[name], "flag"
+        elif src == "prompt":
+            raw, label = prompted_raw.get(name, core["resolved"][name]), "prompt"
+            prompted[name] = _hp_str(raw)
+        else:
+            raw, label = hp[name].get("default"), layer_source.get(name, "manifest")
+        resolved[name] = _hp_str(raw)
+        sources[name] = label
+
+    # Pass-through: undeclared keys from defaults.yaml / config.yaml (deliberate edits
+    # to files train.py's author owns), plus undeclared supplied keys when allowed.
+    passthrough = []
+    layers = [("defaults.yaml", defaults), ("config.yaml", config_hp)]
+    if allow_unknown:
+        layers.append(("flag", {k: supplied[k] for k in unknown_supplied}))
+    for label, layer in layers:
+        for name, value in layer.items():
+            if name in declared_hp or value is None:
+                continue
+            resolved[str(name)] = _hp_str(value)
+            sources[str(name)] = label
+            if str(name) not in passthrough:
+                passthrough.append(str(name))
+
+    return {
+        "resolved": resolved,
+        "typed": core["resolved"],
+        "sources": sources,
+        "passthrough": passthrough,
+        "prompted": prompted,
+        "errors": errors,
+        "notes": notes,
+        "descriptor": True,
+    }
+
+
+def rewrite_hyperparameters_block(text: str, mapping: dict) -> str:
+    """TARGETED rewrite of a config.yaml's top-level ``hyperparameters:`` block (R4.5).
+
+    Replaces only the span from the top-level ``hyperparameters:`` line through its last
+    indented line with ``mapping`` (double-quoted string values, as the template uses);
+    every other line is left exactly as it was. Appends the block when the key is
+    absent. Handles the flow-style one-liner (``hyperparameters: {}``). Comments INSIDE
+    the replaced span are not preserved. Never a full YAML round-trip."""
+    def _q(value) -> str:
+        s = str(value).replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{s}"'
+
+    def _k(key) -> str:
+        key = str(key)
+        safe = key and all(c.isalnum() or c in "_-." for c in key)
+        return key if safe else _q(key)
+
+    lines = text.splitlines(keepends=True)
+    newline = "\n"
+    for ln in lines:
+        if ln.endswith("\r\n"):
+            newline = "\r\n"
+            break
+    if mapping:
+        block = [f"hyperparameters:{newline}"] + [
+            f"  {_k(k)}: {_q(v)}{newline}" for k, v in mapping.items()]
+    else:
+        block = [f"hyperparameters: {{}}{newline}"]
+
+    start = None
+    for i, ln in enumerate(lines):
+        stripped = ln.rstrip("\r\n")
+        if stripped.startswith("hyperparameters:") or stripped.startswith("hyperparameters :"):
+            start = i
+            break
+    if start is None:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] = lines[-1] + newline
+        return "".join(lines + block)
+
+    end = start + 1
+    for j in range(start + 1, len(lines)):
+        body = lines[j].rstrip("\r\n")
+        if body.strip() == "" or body.startswith("#"):
+            continue  # tentatively inside; only consumed if more indented lines follow
+        if body[0] in (" ", "\t"):
+            end = j + 1
+            continue
+        break
+    return "".join(lines[:start] + block + lines[end:])
+
+
 # MLCC technique label → SMTJ trainer (module, class). Mirrors scripts/dump-tune-specs.py.
 _TECHNIQUE_TO_TRAINER = {
     "sft": ("sagemaker.train.sft_trainer", "SFTTrainer"),
