@@ -189,14 +189,22 @@ Edit `training/custom/train.py` with your own logic. The skeleton demonstrates t
 ```
 
 Guides you through:
-1. **Technique selection** — SFT, DPO, or custom
+1. **Technique selection** — SFT, DPO, GRPO, or custom
 2. **Model ID** — base model for fine-tuning
 3. **Dataset** — from registry, HuggingFace, or S3
 4. **Instance type** — with optional instance-sizer recommendations
-5. **Technique-specific settings** — LoRA rank, beta, column mappings, etc.
-6. **Common hyperparameters** — epochs, learning rate, batch size
+5. **Hyperparameters** — for a technique with a `manifest.json` (`sft`, `dpo`, `grpo`), its
+   primary knobs as typed, validated prompts pre-filled from `defaults.yaml` /
+   `config.yaml`; add `--advanced` to also be asked the advanced knobs. For a technique
+   without a manifest (`custom`), the generic epochs / learning rate / LoRA rank
+   questions plus any `prompts.json` questions.
 
-On completion, writes `training/config.yaml`. Use `--interactive --run` to also submit immediately.
+On completion, writes `training/config.yaml` (knob answers go into its
+`hyperparameters:` block only) and asks whether to run the job now.
+
+Without `-i`, `do/train` never prompts. See
+[Authoring do/train Techniques](train-plugin-authoring.md) for manifests, tiers, and
+validation.
 
 ---
 
@@ -254,12 +262,20 @@ hyperparameters:
 ### Hyperparameter Precedence
 
 ```
-CLI flags (--learning-rate 1e-5)
+--set KNOB=VALUE / legacy flags (--learning-rate 1e-5) / interactive answers
     ↓ overrides
 training/config.yaml hyperparameters
     ↓ overrides
 training/<technique>/defaults.yaml
+    ↓ overrides
+training/<technique>/manifest.json default (if declared)
 ```
+
+For a technique with a `manifest.json`, every value is type- and range-checked before
+submission, and a `--set`/flag key the manifest doesn't declare is rejected (with a
+"did you mean" suggestion) unless you pass `--allow-unknown`. Keys in `defaults.yaml` /
+`config.yaml` that the manifest doesn't declare pass through to `train.py` with a
+notice. See [Authoring do/train Techniques](train-plugin-authoring.md).
 
 ---
 
@@ -350,8 +366,7 @@ project home. When MLflow is not configured, `do/train` submits exactly as befor
 |---|---|
 | `--technique <name>` | Training technique: `sft`, `dpo`, `custom` (default: from config.yaml) |
 | `--dataset <uri>` | Dataset: `hf://...`, `s3://...`, or registry name |
-| `--interactive` / `-i` | Guided config builder |
-| `--interactive --run` | Build config and submit immediately |
+| `--interactive` / `-i` | Guided config builder (job questions, then hyperparameter knobs; asks whether to run now) |
 | `--status` | Check status of tracked training job |
 | `--force` | Start a new job even if one is running |
 | `--dry-run` | Print job config without submitting |
@@ -359,10 +374,14 @@ project home. When MLflow is not configured, `do/train` submits exactly as befor
 | `--no-register` | Skip auto-registration on completion |
 | `--resume [job-name]` | Resume from a previous job's checkpoint |
 | `--list-datasets` | Show registered datasets |
-| `--learning-rate <val>` | Override learning rate |
-| `--epochs <n>` | Override epochs |
-| `--batch-size <n>` | Override batch size |
-| `--lora-r <n>` | Override LoRA rank |
+| `--set KNOB=VALUE` | Set any hyperparameter (repeatable) |
+| `--advanced` | With `-i`: also prompt advanced-tier knobs (no effect without `-i`) |
+| `--allow-unknown` | Pass a `--set`/flag key the technique's `manifest.json` doesn't declare through to `train.py` instead of rejecting it |
+| `--learning-rate <val>` | Same as `--set learning_rate=<val>` |
+| `--epochs <n>` | Same as `--set epochs=<n>` |
+| `--batch-size <n>` | Same as `--set batch_size=<n>` |
+| `--lora-r <n>` | Same as `--set lora_r=<n>` |
+| `--beta <val>` | Same as `--set beta=<val>` (DPO / GRPO) |
 
 ---
 
@@ -373,9 +392,12 @@ To add your own training technique:
 1. Create a directory: `training/my-technique/`
 2. Add `train.py` — your training script (see `training/custom/train.py` for the contract)
 3. Optionally add:
-   - `defaults.yaml` — default hyperparameters
+   - `manifest.json` — typed, tiered, validated hyperparameter knobs (see
+     [Authoring do/train Techniques](train-plugin-authoring.md))
+   - `defaults.yaml` — default hyperparameter values
    - `accelerate_config.yaml` — distributed training config
-   - `prompts.json` — interactive mode questions
+   - `prompts.json` — interactive questions for a technique *without* a manifest
+     (ignored once `manifest.json` exists)
 4. Run: `./do/train --technique my-technique`
 
 No changes to `do/train` are needed — it discovers techniques by scanning `training/*/train.py`.

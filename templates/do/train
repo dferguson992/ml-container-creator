@@ -52,6 +52,15 @@ ARG_EPOCHS=""
 ARG_BATCH_SIZE=""
 ARG_LORA_R=""
 ARG_BETA=""
+# BL154: hyperparameter knobs are collected into SET_KNOBS as plain "KNOB=VALUE"
+# strings (an INDEXED array — NOT `declare -A`, which needs bash 4+; do/train must run
+# under macOS's default bash 3.2). Both --set KNOB=VALUE and the five legacy flags
+# (--learning-rate/--epochs/--batch-size/--lora-r/--beta) append to it under the same
+# canonical keys; a later pair for the same knob wins. Resolution + validation happen
+# in .train_helper.py build-config (see _resolve_hyperparameters).
+SET_KNOBS=()
+ARG_ADVANCED=false
+ARG_ALLOW_UNKNOWN=false
 ARG_RESUME=false
 ARG_RESUME_JOB=""
 ARG_COLUMN_MAP=""
@@ -83,6 +92,7 @@ TRAIN_CHECKPOINT_PATH=""
 TRAIN_METRIC_DEFINITIONS=""
 TRAIN_ENVIRONMENT=""
 TRAIN_TAGS=""
+_HP_RESOLVED=false
 
 # ── SIGINT Trap ───────────────────────────────────────────────────────────────
 trap '_handle_interrupt' INT
@@ -127,21 +137,33 @@ _parse_args() {
             --list-datasets) ARG_LIST_DATASETS=true; shift ;;
             --no-register) ARG_NO_REGISTER=true; shift ;;
             --interactive|-i) ARG_INTERACTIVE=true; shift ;;
+            # BL154: generic per-knob setter, repeatable. Keyed by the knob name train.py
+            # reads. Validated against the technique's manifest.json when it has one.
+            --set)
+                if [ -z "${2:-}" ] || [[ "$2" != *=* ]] || [[ "$2" == =* ]]; then
+                    echo "❌ --set requires KNOB=VALUE (e.g., --set learning_rate=1e-4)"
+                    exit 1
+                fi
+                SET_KNOBS+=("$2"); shift 2 ;;
+            --advanced) ARG_ADVANCED=true; shift ;;
+            --allow-unknown) ARG_ALLOW_UNKNOWN=true; shift ;;
+            # Legacy hyperparameter flags: kept as aliases that populate the SAME
+            # SET_KNOBS map as --set <canonical_key>=VALUE (R5).
             --learning-rate)
                 if [ -z "${2:-}" ]; then echo "❌ --learning-rate requires a value"; exit 1; fi
-                ARG_LEARNING_RATE="$2"; shift 2 ;;
+                ARG_LEARNING_RATE="$2"; SET_KNOBS+=("learning_rate=$2"); shift 2 ;;
             --epochs)
                 if [ -z "${2:-}" ]; then echo "❌ --epochs requires a value"; exit 1; fi
-                ARG_EPOCHS="$2"; shift 2 ;;
+                ARG_EPOCHS="$2"; SET_KNOBS+=("epochs=$2"); shift 2 ;;
             --batch-size)
                 if [ -z "${2:-}" ]; then echo "❌ --batch-size requires a value"; exit 1; fi
-                ARG_BATCH_SIZE="$2"; shift 2 ;;
+                ARG_BATCH_SIZE="$2"; SET_KNOBS+=("batch_size=$2"); shift 2 ;;
             --lora-r)
                 if [ -z "${2:-}" ]; then echo "❌ --lora-r requires a value"; exit 1; fi
-                ARG_LORA_R="$2"; shift 2 ;;
+                ARG_LORA_R="$2"; SET_KNOBS+=("lora_r=$2"); shift 2 ;;
             --beta)
                 if [ -z "${2:-}" ]; then echo "❌ --beta requires a value"; exit 1; fi
-                ARG_BETA="$2"; shift 2 ;;
+                ARG_BETA="$2"; SET_KNOBS+=("beta=$2"); shift 2 ;;
             --resume)
                 ARG_RESUME=true
                 # Optional: next arg is a job name (not another flag)
@@ -177,12 +199,29 @@ _show_help() {
     echo "  --technique <name>  Select training technique (overrides config.yaml)"
     echo "  --dataset <source>  Dataset: s3://..., hf://org/name, or registry name"
     echo "  --column-map <map>  Rename columns (e.g., prompt=instruction,completion=output)"
-    echo "  --interactive, -i   Guided interactive configuration builder"
-    echo "  --learning-rate <v> Override learning rate"
-    echo "  --epochs <n>        Override number of epochs"
-    echo "  --batch-size <n>    Override per-device batch size"
-    echo "  --lora-r <n>        Override LoRA rank"
-    echo "  --beta <v>          Override DPO beta (KL penalty)"
+    echo "  --interactive, -i   Guided interactive configuration builder (job questions,"
+    echo "                      then the technique's hyperparameter knobs)"
+    echo ""
+    echo "Hyperparameters:"
+    echo "  --set KNOB=VALUE    Set any hyperparameter (repeatable), e.g. --set lora_alpha=64"
+    echo "  --advanced          With -i: also prompt advanced-tier knobs (no effect without -i)"
+    echo "  --allow-unknown     Pass a --set/flag knob the technique's manifest.json does not"
+    echo "                      declare through to train.py instead of rejecting it. Use it"
+    echo "                      when your train.py reads a key the manifest has not listed"
+    echo "                      yet; without it, undeclared keys fail fast (catches typos"
+    echo "                      like --set learnign_rate=...). No effect without a manifest."
+    echo "  --learning-rate <v> Same as --set learning_rate=<v>"
+    echo "  --epochs <n>        Same as --set epochs=<n>"
+    echo "  --batch-size <n>    Same as --set batch_size=<n>"
+    echo "  --lora-r <n>        Same as --set lora_r=<n>"
+    echo "  --beta <v>          Same as --set beta=<v> (KL coefficient, e.g. DPO)"
+    echo ""
+    echo "  Precedence (lowest -> highest): manifest default < <technique>/defaults.yaml"
+    echo "  < config.yaml hyperparameters < --set / flags = interactive answers."
+    echo "  A technique with do/training/<technique>/manifest.json gets typed, validated"
+    echo "  knobs; one without it passes values through unchanged (descriptor-less)."
+    echo ""
+    echo "Other options:"
     echo "  --resume [job-name] Resume from previous job's checkpoint"
     echo "  --list-datasets     Show registered datasets"
     echo "  --no-register       Skip auto-registration after completion"
@@ -198,6 +237,8 @@ _show_help() {
     echo "Examples:"
     echo "  ./do/train                      # Submit using config.yaml technique"
     echo "  ./do/train --technique sft      # Submit SFT training job"
+    echo "  ./do/train --technique sft --set learning_rate=1e-4 --set lora_r=32"
+    echo "  ./do/train -i --advanced        # Guided setup incl. advanced knobs"
     echo "  ./do/train --status             # Check status of current job"
     echo "  ./do/train --dry-run            # Validate and preview request"
     echo "  ./do/train --force              # Force a new job after failure"
@@ -299,42 +340,99 @@ print(json.dumps(data))
     fi
 }
 
-# ── _merge_hyperparameters() ──────────────────────────────────────────────────
-# Merge hyperparameters with precedence: CLI flags > config.yaml > technique defaults.
-# Modifies TRAIN_HYPERPARAMS (JSON string) in place.
-_merge_hyperparameters() {
-    # Merge: technique defaults as base, config.yaml on top, CLI flags on top of that
-    TRAIN_HYPERPARAMS=$(python3 -c "
+# ── _resolve_hyperparameters() (BL154) ────────────────────────────────────────
+# Resolve the technique's hyperparameters through .train_helper.py build-config:
+#   - technique WITH do/training/<technique>/manifest.json → the shared config-builder
+#     core (same as do/tune): typed + range/enum-validated, tiered prompts with -i;
+#   - technique WITHOUT a manifest (descriptor-less, e.g. custom) → the legacy merge,
+#     unchanged: defaults.yaml < config.yaml < flags/--set, stringified, unvalidated.
+# Precedence: manifest default < defaults.yaml < config.yaml < --set/flag = answer.
+# Sets TRAIN_HYPERPARAMS (JSON of string values). Exits 2 on an invalid manifest and 1
+# on knob errors — both before any AWS call.
+_resolve_hyperparameters() {
+    # SET_KNOBS ("KNOB=VALUE" strings) → JSON. Each pair is a positional arg (robust to
+    # '='/spaces in values); a later pair for the same knob wins. Empty-array-safe under
+    # `set -u` via ${SET_KNOBS[@]+"${SET_KNOBS[@]}"}.
+    local supplied_json
+    supplied_json=$(python3 -c "
 import json, sys
+vals = {}
+for pair in sys.argv[1:]:
+    if '=' in pair:
+        k, v = pair.split('=', 1)
+        vals[k] = v
+print(json.dumps(vals))
+" ${SET_KNOBS[@]+"${SET_KNOBS[@]}"}) || supplied_json="{}"
 
-defaults_json = '''${TECHNIQUE_DEFAULTS_JSON}'''
-config_json = '''${TRAIN_HYPERPARAMS}'''
+    local empty_obj='{}'
+    local bc_args=(
+        --technique "${TECHNIQUE}"
+        --training-dir "${SCRIPT_DIR}/training"
+        --supplied "${supplied_json}"
+        --defaults "${TECHNIQUE_DEFAULTS_JSON:-$empty_obj}"
+        --config-hp "${TRAIN_HYPERPARAMS:-$empty_obj}"
+    )
+    # Knob prompts ONLY with -i/--interactive (do/train is non-interactive by default).
+    if [ "${ARG_INTERACTIVE}" = true ]; then
+        bc_args+=(--interactive --write-config "${CONFIG_FILE}")
+    fi
+    [ "${ARG_ADVANCED}" = true ] && bc_args+=(--advanced)
+    [ "${ARG_ALLOW_UNKNOWN}" = true ] && bc_args+=(--allow-unknown)
 
-defaults = json.loads(defaults_json) if defaults_json and defaults_json != '{}' else {}
-config_hp = json.loads(config_json) if config_json and config_json != '{}' else {}
+    # BL178: do NOT 2>/dev/null this call — the interactive prompts and the structured
+    # manifest-error message render on stderr; stdout carries only the JSON result.
+    local bc_result bc_rc=0
+    bc_result=$(python3 "${SCRIPT_DIR}/.train_helper.py" build-config "${bc_args[@]}") || bc_rc=$?
+    if [ "${bc_rc}" -eq 2 ]; then
+        exit 2  # invalid manifest.json — the helper already printed what to fix
+    fi
+    if [ "${bc_rc}" -ne 0 ]; then
+        echo "❌ Failed to resolve hyperparameters for technique '${TECHNIQUE}'." >&2
+        exit 1
+    fi
+    bc_result=$(printf '%s\n' "${bc_result}" | grep -E '^\{' | tail -1) || bc_result=""
 
-# Layer 1: technique defaults as base
-merged = {str(k): str(v) for k, v in defaults.items()}
-
-# Layer 2: config.yaml hyperparameters override defaults
-merged.update({str(k): str(v) for k, v in config_hp.items()})
-
-# Layer 3: CLI flags override everything (highest priority)
-cli_overrides = {}
-if '${ARG_LEARNING_RATE}':
-    cli_overrides['learning_rate'] = '${ARG_LEARNING_RATE}'
-if '${ARG_EPOCHS}':
-    cli_overrides['epochs'] = '${ARG_EPOCHS}'
-if '${ARG_BATCH_SIZE}':
-    cli_overrides['batch_size'] = '${ARG_BATCH_SIZE}'
-if '${ARG_LORA_R}':
-    cli_overrides['lora_r'] = '${ARG_LORA_R}'
-if '${ARG_BETA}':
-    cli_overrides['beta'] = '${ARG_BETA}'
-
-merged.update(cli_overrides)
-print(json.dumps(merged))
-" 2>/dev/null) || true
+    # Print errors / notes / the source summary (stderr) and emit the resolved JSON.
+    local resolved_json fmt_rc=0
+    resolved_json=$(printf '%s' "${bc_result}" | python3 -c "
+import json, sys
+technique = sys.argv[1]
+err = sys.stderr
+try:
+    d = json.loads(sys.stdin.read() or '')
+except ValueError:
+    print('\u274c No usable response from the hyperparameter resolver.', file=err)
+    sys.exit(3)
+errors = d.get('errors') or []
+if errors:
+    print(\"\u274c Hyperparameter validation failed for technique '%s':\" % technique, file=err)
+    for e in errors:
+        print('   \u2022 ' + e, file=err)
+    sys.exit(3)
+for n in d.get('notes') or []:
+    print('\u2139\ufe0f  ' + n, file=err)
+resolved = d.get('resolved') or {}
+sources = d.get('sources') or {}
+passthrough = d.get('passthrough') or []
+if resolved:
+    mode = 'manifest.json' if d.get('descriptor') else 'descriptor-less: values are not validated'
+    print('', file=err)
+    print('\u2699\ufe0f  Hyperparameters this job will use (%s, %s):' % (technique, mode), file=err)
+    width = max(len(k) for k in resolved)
+    for k in sorted(resolved):
+        print('   {0:<{w}}  {1:<16}  ({2})'.format(k, resolved[k], sources.get(k, '?'), w=width), file=err)
+if passthrough:
+    print('\u2139\ufe0f  Not declared in %s/manifest.json, passed to train.py unchanged: %s'
+          % (technique, ', '.join(passthrough)), file=err)
+if resolved or passthrough:
+    print('', file=err)
+print(json.dumps(resolved))
+" "${TECHNIQUE}") || fmt_rc=$?
+    if [ "${fmt_rc}" -ne 0 ]; then
+        exit 1
+    fi
+    TRAIN_HYPERPARAMS="${resolved_json}"
+    _HP_RESOLVED=true
 }
 
 # ── _list_datasets_cmd() ─────────────────────────────────────────────────────
@@ -963,7 +1061,8 @@ print(json.dumps(base))
     fi
 }
 
-<% if (deploymentTarget === 'hyperpod-eks') { %>
+# EJS tags below sit in comments so the raw template still parses under bash -n.
+# <% if (deploymentTarget === 'hyperpod-eks') { %>
 # ── _submit_job() ─────────────────────────────────────────────────────────────
 # HyperPod EKS: Generate and apply a K8s Job manifest for single-pod training.
 # Multi-node (parallelism > 1) requires PyTorchJob CRD — see Epic 8.
@@ -1130,7 +1229,7 @@ _poll_job() {
         sleep "${POLL_INTERVAL}"
     done
 }
-<% } else { %>
+# <% } else { %>
 # ── _submit_job() ─────────────────────────────────────────────────────────────
 # Submit training job via .train_helper.py (SDK v3).
 # Handles --dry-run, error detection, and config persistence.
@@ -1268,7 +1367,7 @@ _poll_job() {
         sleep "${POLL_INTERVAL}"
     done
 }
-<% } %>
+# <% } %>
 
 # ── _handle_completion() ──────────────────────────────────────────────────────
 # Store output paths, write TRAIN_* lifecycle vars, and invoke feedback loop.
@@ -1397,6 +1496,12 @@ if [ "${ARG_HELP}" = true ]; then
     _show_help
 fi
 
+# --advanced only widens the interactive knob prompts (do/train is non-interactive
+# unless -i/--interactive is given).
+if [ "${ARG_ADVANCED}" = true ] && [ "${ARG_INTERACTIVE}" != true ]; then
+    echo "ℹ️  --advanced only affects interactive knob prompts (-i/--interactive); ignoring it."
+fi
+
 # Handle --list-datasets
 if [ "${ARG_LIST_DATASETS}" = true ]; then
     source "${SCRIPT_DIR}/config"
@@ -1496,6 +1601,23 @@ writeFileSync('${_RESULT_FILE}', JSON.stringify(result));
     # Check if user wants to run now
     RUN_NOW=$(echo "${INTERACTIVE_RESULT}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('run_now', False))" 2>/dev/null) || RUN_NOW="False"
 
+    # BL154: the technique just chosen in the Node step drives the knob prompts.
+    _CHOSEN_TECHNIQUE=$(echo "${INTERACTIVE_RESULT}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('technique', '') or '')" 2>/dev/null) || _CHOSEN_TECHNIQUE=""
+    if [ -n "${_CHOSEN_TECHNIQUE}" ]; then
+        ARG_TECHNIQUE="${_CHOSEN_TECHNIQUE}"
+    fi
+
+    # Python knob step (shared config-builder core): prompts the technique's manifest
+    # knobs (primary; + advanced with --advanced) and writes the answers into
+    # config.yaml's hyperparameters block. Runs whether or not the job runs now, so the
+    # answers are captured either way. Descriptor-less techniques: no prompts here (the
+    # Node step already asked their prompts.json questions).
+    _parse_config
+    _resolve_technique
+    _load_technique_defaults
+    _resolve_hyperparameters
+    _INTERACTIVE_HP_JSON="${TRAIN_HYPERPARAMS}"
+
     if [ "${RUN_NOW}" != "True" ]; then
         echo "   Run ./do/train to submit the configured job."
         exit 0
@@ -1523,9 +1645,15 @@ _resolve_technique
 # Persist technique to do/config
 _update_config_var "TRAIN_TECHNIQUE" "${TECHNIQUE}"
 
-# Load technique defaults and merge with config hyperparameters
-_load_technique_defaults
-_merge_hyperparameters
+# Resolve hyperparameters (manifest-aware; see _resolve_hyperparameters). With -i the
+# knob step already ran right after the interactive builder — reuse its result rather
+# than prompting twice.
+if [ "${_HP_RESOLVED}" = true ]; then
+    TRAIN_HYPERPARAMS="${_INTERACTIVE_HP_JSON}"
+else
+    _load_technique_defaults
+    _resolve_hyperparameters
+fi
 
 # Warn about multi-node on non-EFA instances
 if [ "${TRAIN_INSTANCE_COUNT:-1}" -gt 1 ]; then
