@@ -114,8 +114,8 @@ By default, `--from-tune` stages adapter weights via a **SageMaker Processing Jo
 # Use a specific technique's output
 ./do/adapter add tuned-sft --from-tune sft
 
-# Or pass the S3 path explicitly
-./do/adapter add tuned-sft --weights s3://mlcc-tune-123456789012-us-east-1/output/adapter.tar.gz
+# Or pass the S3 path explicitly (--weights still works as a deprecated alias)
+./do/adapter add tuned-sft --from-weights s3://mlcc-tune-123456789012-us-east-1/output/adapter.tar.gz
 
 # Stage locally instead of via Processing Job
 ./do/adapter add tuned-sft --from-tune --local
@@ -135,12 +135,52 @@ By default, `--from-tune` stages adapter weights via a **SageMaker Processing Jo
 # Deploy as a new inference component
 ./do/add-ic tuned-v1 --from-tune
 
-# Or pass the S3 path explicitly
-./do/add-ic tuned-v1 --model-data s3://mlcc-tune-123456789012-us-east-1/output/model.tar.gz
+# Or pass the S3 path explicitly (--model-data still works as a deprecated alias)
+./do/add-ic tuned-v1 --from-weights s3://mlcc-tune-123456789012-us-east-1/output/model.tar.gz
 
-# Replace the current base model
-./do/deploy --force-ic --model-data s3://mlcc-tune-123456789012-us-east-1/output/model.tar.gz
+# Or a registered full-model version
+./do/add-ic tuned-v1 --from-registry arn:aws:sagemaker:us-east-1:123456789012:model-package/my-project/3
+
+# Swap the current base IC's artifact in place
+./do/add-ic default --update --from-weights s3://mlcc-tune-123456789012-us-east-1/output/model.tar.gz
 ```
+
+### One `--from-*` family on every target
+
+Both additive verbs take the same source flags (`--from-weights <s3-uri>`,
+`--from-tune [technique]`, `--from-train [technique]`, `--from-registry <arn>`,
+and, for `do/adapter`, `--from-hub <repo>`) and resolve them the same way on
+every deployment target ([ADR-013](adr/ADR-013-additive-deploy-artifact-kind-contract.md)).
+The target only picks the load mechanism:
+
+| Target | `do/adapter` (LoRA adapter) | `do/add-ic` (full model) |
+|---|---|---|
+| `realtime-inference` | adapter Inference Component | Inference Component |
+| `hyperpod-eks` / `eks` | vLLM hot-load into the running pod | not supported yet (see below) |
+
+On a cluster, a tuned LoRA hot-loads straight from the tune output. There is no
+hand-copied S3 URI and no new pod:
+
+```bash
+./do/adapter add tuned-sft --from-tune        # hyperpod-eks / eks
+./do/adapter list
+./do/adapter remove tuned-sft
+```
+
+The artifact kind decides which verb is legal. `do/adapter` refuses a full
+fine-tuned model and `do/add-ic` refuses a LoRA adapter, each pointing at the
+other verb. A full model on `hyperpod-eks`/`eks` is refused honestly as "not
+servable on this target yet": the cluster full-model verb (`do/add-pod`) is
+deferred, so deploy full models on `realtime-inference` with `do/add-ic`. When a
+source has no recorded kind (a raw `--from-weights` URI, a Hub repo, or an older
+registry version), nothing is blocked; the verb runs an advisory
+`adapter_config.json` check and proceeds.
+
+!!! note "Deprecated flags"
+    `do/adapter --weights` and `do/add-ic --model-data` are deprecated aliases of
+    `--from-weights`. They keep working and print a one-line notice. Switch to
+    `--from-weights` at your convenience. `do/register --model-data-url` is a
+    different flag and is unchanged.
 
 ### Multiple techniques
 

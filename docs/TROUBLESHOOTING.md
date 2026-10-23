@@ -480,10 +480,26 @@ echo 'export HP_SHM_SIZE=64Gi' >> do/config
    sed -i '' 's|adapters/my-adapter"|adapters/my-adapter/"|' do/adapters/<name>.conf
    
    # Re-add
-   ./do/adapter add <name> --weights "s3://bucket/prefix/"
+   ./do/adapter add <name> --from-weights "s3://bucket/prefix/"
    ```
 
 2. For adapters from `--from-registry`: the template fix (2026-06-29) automatically re-adds the trailing slash for non-tar.gz adapter URIs. Regenerate the project or update the `do/adapter` script.
+
+### Additive deploy: "Contract violation: artifact-kind" or "has no load mechanism"
+
+**Symptoms:** `do/adapter add` or `do/add-ic` exits with code 3 and one of:
+
+- `Contract violation: artifact-kind`: "This source is a 'full_model', but this verb accepts 'lora_adapter'" (or the reverse).
+- `Contract violation: target`: "do/add-ic (accepts: full_model) has no load mechanism on hyperpod-eks … not servable on hyperpod-eks yet".
+
+**Root cause:** Additive deploy follows one contract ([ADR-013](adr/ADR-013-additive-deploy-artifact-kind-contract.md)). The source's artifact kind picks the verb, and the target picks the load mechanism. `do/adapter` hot-loads LoRA adapters only. `do/add-ic` deploys full models only, and only on `realtime-inference`. A full model on a cluster isn't supported yet (the cluster verb, `do/add-pod`, is deferred).
+
+**Fix:**
+
+- A LoRA adapter: `./do/adapter add <name> --from-tune` (or `--from-weights s3://...`, `--from-registry <arn>`) on `realtime-inference`, `hyperpod-eks`, or `eks`.
+- A full model: `./do/add-ic <name> --from-tune` (or `--from-weights`, `--from-registry`) on `realtime-inference`.
+- An "artifact_kind unknown … falling back to a content check" notice is informational. Raw S3 URIs, Hub repos, and older registry versions carry no recorded kind, so the verb proceeds after an advisory `adapter_config.json` check.
+- "--weights is deprecated" / "--model-data is deprecated" notices: switch to `--from-weights`. The old flags still work.
 
 ---
 

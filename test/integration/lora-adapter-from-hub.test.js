@@ -349,7 +349,7 @@ describe('Feature: lora-adapter-lifecycle — --from-hub and search integration 
         it('checks for mutual exclusivity in add subcommand', () => {
             const addSection = getAddSection();
             assert.ok(
-                addSection.includes('--weights, --from-hub, --from-tune, and --from-registry are mutually exclusive'),
+                addSection.includes('--from-weights, --from-hub, --from-tune, --from-train, and --from-registry are mutually exclusive'),
                 'Must show mutual exclusivity error in add'
             );
         });
@@ -358,7 +358,7 @@ describe('Feature: lora-adapter-lifecycle — --from-hub and search integration 
             const addSection = getAddSection();
             // Check that the mutual exclusivity check leads to exit 1
             const mutualCheck = addSection.substring(
-                addSection.indexOf('--weights and --from-hub are mutually exclusive')
+                addSection.indexOf('--from-weights, --from-hub, --from-tune, --from-train, and --from-registry are mutually exclusive')
             );
             assert.ok(
                 mutualCheck.includes('exit 1'),
@@ -369,16 +369,16 @@ describe('Feature: lora-adapter-lifecycle — --from-hub and search integration 
         it('shows correct usage for both options separately', () => {
             const addSection = getAddSection();
             assert.ok(
-                addSection.includes('--weights <s3-uri>') &&
+                addSection.includes('--from-weights <s3-uri>') &&
                 addSection.includes('--from-hub <hf-repo-id>'),
                 'Must show both options in usage hint'
             );
         });
 
-        it('requires at least one of --weights or --from-hub', () => {
+        it('requires at least one of --from-weights or --from-hub', () => {
             const addSection = getAddSection();
             assert.ok(
-                addSection.includes('One of --weights, --from-hub, --from-tune, or --from-registry is required'),
+                addSection.includes('One of --from-weights, --from-hub, --from-tune, --from-train, or --from-registry is required'),
                 'Must require at least one source option'
             );
         });
@@ -582,8 +582,9 @@ describe('Feature: lora-adapter-lifecycle — --from-hub and search integration 
         it('add calls _download_from_hub when --from-hub is provided', () => {
             const addSection = getAddSection();
             assert.ok(
-                addSection.includes('_download_from_hub "${from_hub}" "${adapter_name}"'),
-                'add must call _download_from_hub with repo ID and adapter name'
+                // Wave 6: routed through the shared resolver, which calls _download_from_hub.
+                addSection.includes('_resolve_additive_source from-hub "${from_hub}" "${adapter_name}"'),
+                'add must stage --from-hub via the shared resolver (→ _download_from_hub) with repo ID and adapter name'
             );
         });
 

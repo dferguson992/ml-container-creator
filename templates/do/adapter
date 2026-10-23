@@ -2,7 +2,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# do/adapter — Manage LoRA adapter inference components.
+# do/adapter — Manage LoRA adapters on a deployed endpoint or cluster.
 #
 # @mlcc-script
 # type: deployment-centric
@@ -10,12 +10,19 @@
 # lifecycle: post-deploy
 # targets: realtime-inference, hyperpod-eks, eks
 
-# Usage:
-#   ./do/adapter add <name> --weights <s3-uri>
+# Usage (identical on every target — ADR-013: the SOURCE resolves uniformly,
+# the TARGET only selects the load mechanism):
+#   ./do/adapter add <name> --from-weights <s3-uri>
+#   ./do/adapter add <name> --from-tune [technique]
+#   ./do/adapter add <name> --from-train [technique]
+#   ./do/adapter add <name> --from-registry <version-arn>
+#   ./do/adapter add <name> --from-hub <hf-repo-id>
 #   ./do/adapter list
 #   ./do/adapter remove <name>
-#   ./do/adapter update <name> --weights <new-s3-uri>
+#   ./do/adapter update <name> --from-weights <new-s3-uri>
 #   ./do/adapter --help
+#
+# Deprecated alias: --weights <s3-uri> == --from-weights <s3-uri> (prints a notice).
 
 set -e
 set -u
@@ -28,387 +35,32 @@ _require_python_env
 source "${SCRIPT_DIR}/config"
 source "${SCRIPT_DIR}/lib/profile.sh"
 
-# ── Target guard: adapters run on real-time (IC-based) or Kubernetes endpoints ──
-# LoRA hot-load works on: realtime-inference (via SageMaker Inference Components),
-# hyperpod-eks (vLLM behind the HyperPod Inference Operator), and eks (vLLM on a
-# plain EKS cluster without the operator — same vLLM hot-load mechanism). async /
-# batch are unsupported. _restrict_targets emits the standard contract violation
-# (exit 3); the Kubernetes targets fall through to the vLLM path below.
-_restrict_targets "realtime-inference,hyperpod-eks,eks" \
-    "LoRA adapters require a real-time (realtime-inference) endpoint with ICs, or a Kubernetes deployment (hyperpod-eks / eks)."
-
-# ── Kubernetes path (hyperpod-eks + plain eks) ────────────────────────────────
-# Both targets serve vLLM as k8s pods labelled app=${PROJECT_NAME} and support
-# the same vLLM LoRA hot-load over a direct-pod port-forward. hyperpod-eks runs
-# behind the HyperPod Inference Operator; eks (untested/unvalidated) runs the same
-# vLLM without the operator — the hot-load mechanism is identical.
-if [ "${DEPLOYMENT_TARGET:-}" = "hyperpod-eks" ] || [ "${DEPLOYMENT_TARGET:-}" = "eks" ]; then
-    _adapter_hyperpod() {
-        # Guard: HP_LORA_ENABLED must be true
-        if [ "${HP_LORA_ENABLED:-false}" != "true" ]; then
-            echo "❌ LoRA is not enabled for this ${DEPLOYMENT_TARGET} deployment."
-            echo "   Set HP_LORA_ENABLED=true in do/config and redeploy: do/deploy --target ${DEPLOYMENT_TARGET}"
-            exit 1
-        fi
-
-        # Parse subcommand
-        local CMD="${1:-}"
-        shift || true
-
-        # ── Legacy-flag deprecation shims (BL112) ────────────────────────────
-        # --load-lora / --unload-lora remain accepted for backward compatibility.
-        # Each emits a deprecation warning and rewrites the invocation into the
-        # unified verb before the router runs, so the downstream port-forward and
-        # dispatch are shared with the unified path.
-        case "${CMD}" in
-            --load-lora)
-                echo "⚠️  --load-lora is deprecated; use: do/adapter add <name> --weights s3://..." >&2
-                CMD="add"
-                ;;
-            --unload-lora)
-                echo "⚠️  --unload-lora is deprecated; use: do/adapter remove <name>" >&2
-                CMD="remove"
-                ;;
-        esac
-
-        # ── SMAI-only sourcing verbs (BL112) ─────────────────────────────────
-        # from-hub/from-tune/from-train/from-registry depend on SageMaker
-        # Inference Component plumbing and are not available on HyperPod. Emit a
-        # clear error directing the user to `add --weights s3://...`. No AWS,
-        # kubectl, or HTTP call is made.
-        case "${CMD}" in
-            from-hub|from-tune|from-train|from-registry)
-                _contract_violation "target" \
-                    "'do/adapter ${CMD}' sources adapters via SageMaker Inference Components and is not supported on Kubernetes targets (${DEPLOYMENT_TARGET})." \
-                    "On ${DEPLOYMENT_TARGET}, provide the adapter weights directly: do/adapter add <name> --weights s3://..."
-                ;;
-        esac
-
-        # Parse unified verbs into an internal (ACTION, LORA_NAME, WEIGHTS_URI) triple.
-        # ACTION ∈ load / unload / list / update.
-        local LORA_NAME=""
-        local WEIGHTS_URI=""
-        local ACTION=""
-
-        case "${CMD}" in
-            add|update)
-                # add    → load
-                # update → unload-then-load (remove-then-add)
-                if [ "${CMD}" = "add" ]; then
-                    ACTION="load"
-                else
-                    ACTION="update"
-                fi
-                LORA_NAME="${1:-}"
-                shift || true
-                if [ -z "${LORA_NAME}" ]; then
-                    echo "❌ 'do/adapter ${CMD}' requires a name argument"
-                    echo "   Usage: do/adapter ${CMD} <name> --weights s3://..."
-                    exit 1
-                fi
-                # Parse --weights
-                while [ $# -gt 0 ]; do
-                    case "$1" in
-                        --weights)
-                            shift
-                            WEIGHTS_URI="${1:-}"
-                            shift || true
-                            ;;
-                        *)
-                            echo "❌ Unknown option: $1"
-                            exit 1
-                            ;;
-                    esac
-                done
-                if [ -z "${WEIGHTS_URI}" ]; then
-                    echo "❌ 'do/adapter ${CMD}' requires --weights s3://..."
-                    echo "   Usage: do/adapter ${CMD} <name> --weights s3://..."
-                    exit 1
-                fi
-                ;;
-            remove)
-                ACTION="unload"
-                LORA_NAME="${1:-}"
-                shift || true
-                if [ -z "${LORA_NAME}" ]; then
-                    echo "❌ 'do/adapter remove' requires a name argument"
-                    echo "   Usage: do/adapter remove <name>"
-                    exit 1
-                fi
-                ;;
-            list)
-                ACTION="list"
-                ;;
-            --help|-h|"")
-                echo "Usage: ./do/adapter <command> [options]"
-                echo ""
-                echo "Kubernetes commands (DEPLOYMENT_TARGET=hyperpod-eks or eks):"
-                echo "  add <name> --weights s3://...      Hot-load a LoRA adapter into vLLM"
-                echo "  remove <name>                      Unload a LoRA adapter from vLLM"
-                echo "  list                               List loaded LoRA adapters"
-                echo "  update <name> --weights s3://...   Replace a LoRA adapter's weights in place"
-                echo ""
-                echo "Examples:"
-                echo "  ./do/adapter add ectsum --weights s3://my-bucket/adapters/ectsum/"
-                echo "  ./do/adapter list"
-                echo "  ./do/adapter update ectsum --weights s3://my-bucket/adapters/ectsum-v2/"
-                echo "  ./do/adapter remove ectsum"
-                echo ""
-                echo "Deprecated (use add/remove instead):"
-                echo "  --load-lora <name> --weights s3://...   → do/adapter add <name> --weights s3://..."
-                echo "  --unload-lora <name>                    → do/adapter remove <name>"
-                exit 0
-                ;;
-            *)
-                echo "❌ Unknown command: ${CMD}"
-                echo "   Run ./do/adapter --help for usage."
-                exit 1
-                ;;
-        esac
-
-        # ── Direct-pod port-forward setup (same pattern as do/test and do/benchmark) ──
-        # Resolve the Running serving pod by the app=${PROJECT_NAME} label and
-        # port-forward directly to it on port 8080 (NOT a svc/ resource). The
-        # routing Service exposes TLS/443 for production traffic, so the
-        # direct-pod hop is the correct dev-time connection.
-        echo "🔌 Port-forwarding pod for ${PROJECT_NAME} to localhost:${HP_LOCAL_PORT:-8080}..."
-
-        # Get kubeconfig for HyperPod cluster
-        KUBECONFIG_PATH="${HOME}/.kube/hyperpod-${HP_CLUSTER_NAME}"
-
-        local _profile_arg=""
-        [ -n "${_PROFILE_awsProfile:-}" ] && _profile_arg="--profile ${_PROFILE_awsProfile}"
-
-        EKS_CLUSTER_ARN=$(aws sagemaker describe-cluster \
-            --cluster-name "${HP_CLUSTER_NAME}" \
-            --region "${AWS_REGION}" \
-            ${_profile_arg} \
-            --query "Orchestrator.Eks.ClusterArn" \
-            --output text 2>&1) || {
-            echo "❌ Failed to describe HyperPod cluster: ${HP_CLUSTER_NAME}"
-            exit 4
-        }
-        EKS_CLUSTER_NAME=$(echo "${EKS_CLUSTER_ARN}" | awk -F'/' '{print $NF}')
-        if ! aws eks update-kubeconfig \
-            --name "${EKS_CLUSTER_NAME}" \
-            --region "${AWS_REGION}" \
-            ${_profile_arg} \
-            --kubeconfig "${KUBECONFIG_PATH}" &>/dev/null; then
-            echo "❌ Failed to configure kubectl for cluster: ${EKS_CLUSTER_NAME}"
-            exit 4
-        fi
-        export KUBECONFIG="${KUBECONFIG_PATH}"
-
-        # Resolve the Running serving pod by label (same --field-selector guard as do/benchmark).
-        local _POD
-        _POD=$(kubectl get pod -n "${HP_NAMESPACE:-default}" \
-            -l "app=${PROJECT_NAME}" \
-            --field-selector=status.phase=Running \
-            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || _POD=""
-        if [ -z "${_POD}" ]; then
-            echo "❌ No Running pod found for app=${PROJECT_NAME} in namespace ${HP_NAMESPACE:-default}"
-            echo "   Check: kubectl get pods -n ${HP_NAMESPACE:-default} -l app=${PROJECT_NAME}"
-            exit 1
-        fi
-
-        kubectl port-forward "pod/${_POD}" "${HP_LOCAL_PORT:-8080}:8080" \
-            -n "${HP_NAMESPACE:-default}" &
-        _PF_PID=$!
-        trap "kill ${_PF_PID} 2>/dev/null || true" EXIT
-        sleep 3
-
-        if ! kill -0 ${_PF_PID} 2>/dev/null; then
-            echo "❌ Port-forward failed to start"
-            echo "   Check: kubectl get pods -n ${HP_NAMESPACE:-default} -l app=${PROJECT_NAME}"
-            exit 1
-        fi
-        echo "✅ Port-forward established"
-        echo ""
-
-        local BASE_URL="http://localhost:${HP_LOCAL_PORT:-8080}"
-
-        # ── Dispatch to lora_vllm.py ─────────────────────────────────────────
-        # Reusable helpers so `update` can compose unload-then-load without
-        # duplicating the JSON inspection logic. Both load and unload are POST
-        # operations in vLLM (there is no DELETE).
-        _lora_do_load() {
-            local _name="$1"
-            local _uri="$2"
-            echo "📦 Loading LoRA adapter '${_name}' from ${_uri}..."
-            local RESULT
-            RESULT=$(python3 "${SCRIPT_DIR}/lib/python/lora_vllm.py" load "${_name}" "${_uri}" "${BASE_URL}")
-            if echo "${RESULT}" | python3 -c "import sys,json; r=json.load(sys.stdin); sys.exit(0 if r.get('success') else 1)" 2>/dev/null; then
-                echo "✓ LoRA adapter '${_name}' loaded from ${_uri}"
-                return 0
-            fi
-            local STATUS_CODE
-            STATUS_CODE=$(echo "${RESULT}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status_code',0))" 2>/dev/null || echo "0")
-            local ERROR_MSG
-            ERROR_MSG=$(echo "${RESULT}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','Unknown error'))" 2>/dev/null || echo "Unknown error")
-            if [ "${STATUS_CODE}" = "409" ]; then
-                echo "❌ LoRA adapter '${_name}' already exists."
-                echo "   Unload it first: do/adapter remove ${_name}"
-            else
-                echo "❌ Failed to load LoRA adapter '${_name}'"
-                echo "   Error: ${ERROR_MSG}"
-            fi
-            return 1
-        }
-
-        _lora_do_unload() {
-            local _name="$1"
-            echo "🗑️  Unloading LoRA adapter '${_name}'..."
-            local RESULT
-            RESULT=$(python3 "${SCRIPT_DIR}/lib/python/lora_vllm.py" unload "${_name}" "${BASE_URL}")
-            if echo "${RESULT}" | python3 -c "import sys,json; r=json.load(sys.stdin); sys.exit(0 if r.get('success') else 1)" 2>/dev/null; then
-                echo "✓ LoRA adapter '${_name}' unloaded"
-                return 0
-            fi
-            local ERROR_MSG
-            ERROR_MSG=$(echo "${RESULT}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','Unknown error'))" 2>/dev/null || echo "Unknown error")
-            echo "❌ Failed to unload LoRA adapter '${_name}'"
-            echo "   Error: ${ERROR_MSG}"
-            return 1
-        }
-
-        case "${ACTION}" in
-            load)
-                _lora_do_load "${LORA_NAME}" "${WEIGHTS_URI}" || exit 1
-                ;;
-            unload)
-                _lora_do_unload "${LORA_NAME}" || exit 1
-                ;;
-            update)
-                # remove-then-add: unload the existing adapter, then load the new
-                # weights. A failed unload aborts before the load so weights are
-                # not half-swapped.
-                _lora_do_unload "${LORA_NAME}" || exit 1
-                _lora_do_load "${LORA_NAME}" "${WEIGHTS_URI}" || exit 1
-                ;;
-            list)
-                echo "📋 Listing loaded LoRA adapters on ${PROJECT_NAME}..."
-                echo ""
-                local RESULT
-                RESULT=$(python3 "${SCRIPT_DIR}/lib/python/lora_vllm.py" list "${BASE_URL}")
-                local COUNT
-                COUNT=$(echo "${RESULT}" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
-                if [ "${COUNT}" = "0" ]; then
-                    echo "   No LoRA adapters loaded."
-                    echo ""
-                    echo "   Load one: do/adapter add <name> --weights s3://..."
-                else
-                    printf "   %-30s %s\n" "NAME" "PATH"
-                    printf "   %-30s %s\n" "----" "----"
-                    echo "${RESULT}" | python3 -c "
-import sys, json
-loras = json.load(sys.stdin)
-for l in loras:
-    print(f'   {l[\"name\"]:<30} {l.get(\"path\", \"\")}')
-"
-                fi
-                ;;
-        esac
-    }
-
-    _adapter_hyperpod "$@"
-    exit $?
-fi
+# ── Target guard: DERIVED from the additive-deploy contract (ADR-013) ─────────
+# do/adapter accepts lora_adapter artifacts and drives the vLLM hot-load (k8s:
+# hyperpod-eks / eks) or SMAI adapter-IC (realtime-inference) mechanism. Which
+# targets are legal is the intersection of those mechanisms with what each
+# target exposes (_ADDITIVE_* tables in script-contract.sh) — not a hand list.
+# An unsupported target (async / batch) gets the standard contract violation
+# (exit 3) naming the targets that DO work.
+_additive_verb_supported_on adapter "${DEPLOYMENT_TARGET:-}"
+_ADAPTER_MECHANISMS="$(_additive_mechanism_for adapter "${DEPLOYMENT_TARGET:-}")"
 
 # ── Profile-resolved variables (env var > profile > default) ──────────────────
 # ADAPTER_S3_BUCKET is provided by profile.sh from moduleOutputs.training.AdaptersBucket.
 # No invented fallback — a missing value means the training module isn't provisioned (guarded below).
 ADAPTER_S3_BUCKET="${ADAPTER_S3_BUCKET:-}"
 
-source "${SCRIPT_DIR}/lib/wait.sh"
-
-# ── Usage ─────────────────────────────────────────────────────────────────────
-_usage() {
-    echo "Usage: ./do/adapter <command> [options]"
-    echo ""
-    echo "Manage LoRA adapter inference components on endpoint: ${ENDPOINT_NAME:-<not deployed>}"
-    echo ""
-    echo "Commands:"
-    echo "  add <name> --weights <s3-uri>        Add a new LoRA adapter from S3"
-    echo "  add <name> --from-hub <hf-repo-id>   Add a new LoRA adapter from HuggingFace Hub"
-    echo "  add <name> --from-tune [technique]   Add adapter from do/tune output"
-    echo "  add <name> --from-train [technique]  Add adapter from do/train output"
-    echo "  add <name> --from-registry [arn]     Add adapter from model registry"
-    echo "  list                                  List all adapters on the endpoint"
-    echo "  remove <name>                         Remove an adapter"
-    echo "  update <name> --weights <new-s3-uri>  Update adapter weights from S3"
-    echo "  update <name> --from-hub <hf-repo-id> Update adapter weights from HuggingFace Hub"
-    echo "  search [--limit N]                    Search HuggingFace Hub for compatible adapters"
-    echo ""
-    echo "Options:"
-    echo "  --help, -h    Show this help message"
-    echo "  --force       Bypass adapter-model compatibility check (add command)"
-    echo "  --local       Use local aws s3 cp instead of Processing Job (--from-tune)"
-    echo "  --no-wait     Submit Processing Job and return immediately (--from-tune)"
-    echo ""
-    echo "Examples:"
-    echo "  ./do/adapter add ectsum --weights s3://my-bucket/adapters/ectsum/adapter.tar.gz"
-    echo "  ./do/adapter add ectsum --from-hub predibase/llama-3.1-8b-ectsum"
-    echo "  ./do/adapter add tuned-sft --from-tune"
-    echo "  ./do/adapter add tuned-sft --from-tune sft"
-    echo "  ./do/adapter add tuned-sft --from-tune --local"
-    echo "  ./do/adapter add tuned-sft --from-tune --no-wait"
-    echo "  ./do/adapter add my-adapter --from-registry"
-    echo "  ./do/adapter add my-adapter --from-registry arn:aws:sagemaker:...:model-package/proj/2"
-    echo "  ./do/adapter list"
-    echo "  ./do/adapter remove ectsum"
-    echo "  ./do/adapter update ectsum --weights s3://my-bucket/adapters/ectsum-v2/adapter.tar.gz"
-    echo "  ./do/adapter update ectsum --from-hub predibase/llama-3.1-8b-ectsum-v2"
-    echo ""
-    echo "Adapter metadata is stored in do/adapters/<name>.conf"
-    echo ""
-    echo "Note: --weights, --from-hub, --from-tune, and --from-registry are mutually exclusive."
-}
-
-# ── Validate LoRA is enabled ──────────────────────────────────────────────────
-_validate_lora_enabled() {
-    if [ "${ENABLE_LORA:-}" != "true" ]; then
-        echo "❌ LoRA adapter serving is not enabled for this project."
-        echo ""
-        echo "   ENABLE_LORA=true was not found in do/config."
-        echo ""
-        echo "   To enable LoRA adapters, regenerate your project with --enable-lora"
-        echo "   or add ENABLE_LORA=true to do/config and configure your model server"
-        echo "   environment (e.g., VLLM_ENABLE_LORA=true)."
-        exit 1
-    fi
-}
-
-# ── Resolve base IC name ──────────────────────────────────────────────────────
-_resolve_base_ic_name() {
-    local base_ic_name=""
-
-    # Try multi-IC path first: do/ic/default.conf
-    if [ -f "${SCRIPT_DIR}/ic/default.conf" ]; then
-        base_ic_name=$(grep "^export IC_DEPLOYED_NAME=" "${SCRIPT_DIR}/ic/default.conf" 2>/dev/null | sed 's/^export IC_DEPLOYED_NAME="//' | sed 's/"$//' || echo "")
-    fi
-
-    # Fallback to legacy config: INFERENCE_COMPONENT_NAME
-    if [ -z "${base_ic_name}" ]; then
-        base_ic_name="${INFERENCE_COMPONENT_NAME:-}"
-    fi
-
-    if [ -z "${base_ic_name}" ]; then
-        echo "❌ Cannot determine base inference component name."
-        echo ""
-        echo "   No IC_DEPLOYED_NAME found in do/ic/default.conf and no"
-        echo "   INFERENCE_COMPONENT_NAME in do/config."
-        echo ""
-        echo "   Deploy your base model first with: ./do/deploy"
-        exit 1
-    fi
-
-    echo "${base_ic_name}"
-}
+# ── Shared source helpers (both the SMAI and the Kubernetes paths) ────────────
+# Defined BEFORE the Kubernetes branch so _resolve_additive_source --from-hub can
+# reuse _download_from_hub on every target.
 
 # ── Best-effort adapter_config.json validation ────────────────────────────────
 # Downloads the adapter tar.gz, extracts adapter_config.json, and checks that
 # base_model_name_or_path matches MODEL_NAME from do/config.
 # Returns 0 always — failures are silently ignored (best-effort).
+# INTENTIONALLY non-fatal (BL165 sweep reviewed, R9.1): this is an advisory
+# base-model mismatch WARNING, not a gate — the real load (IC create / vLLM
+# hot-load) surfaces any genuine artifact problem with its own error.
 _validate_adapter_config() {
     local weights_uri="$1"
     local tmp_dir="/tmp/adapter_config_check_$$"
@@ -492,8 +144,10 @@ _download_from_hub() {
         if [ -n "${HF_TOKEN:-}" ]; then
             hf_args+=("--token" "${HF_TOKEN}")
         fi
-        if ! hf "${hf_args[@]}" 2>/dev/null; then
+        local _hf_err
+        if ! _hf_err=$(hf "${hf_args[@]}" 2>&1 >/dev/null); then
             echo "❌ Failed to download adapter from HuggingFace Hub: ${hf_repo_id}"
+            [ -n "${_hf_err}" ] && echo "${_hf_err}" | tail -5 | sed 's/^/   hf: /'
             echo ""
             echo "   Check that:"
             echo "   • The repository exists: https://huggingface.co/${hf_repo_id}"
@@ -508,8 +162,10 @@ _download_from_hub() {
         if [ -n "${HF_TOKEN:-}" ]; then
             hf_args+=("--token" "${HF_TOKEN}")
         fi
-        if ! huggingface-cli "${hf_args[@]}" 2>/dev/null; then
+        local _hf_err
+        if ! _hf_err=$(huggingface-cli "${hf_args[@]}" 2>&1 >/dev/null); then
             echo "❌ Failed to download adapter from HuggingFace Hub: ${hf_repo_id}"
+            [ -n "${_hf_err}" ] && echo "${_hf_err}" | tail -5 | sed 's/^/   huggingface-cli: /'
             echo ""
             echo "   Check that:"
             echo "   • The repository exists: https://huggingface.co/${hf_repo_id}"
@@ -658,6 +314,507 @@ _download_from_hub() {
     weights_uri="${s3_path}"
 }
 
+
+# ── Kubernetes path (vllm-hotload mechanism: hyperpod-eks + plain eks) ────────
+# Both targets serve vLLM as k8s pods labelled app=${PROJECT_NAME} and support
+# the same vLLM LoRA hot-load over a direct-pod port-forward. hyperpod-eks runs
+# behind the HyperPod Inference Operator; eks (untested/unvalidated) runs the same
+# vLLM without the operator — the hot-load mechanism is identical. The branch is
+# selected by the contract-derived mechanism, not by naming targets.
+case " ${_ADAPTER_MECHANISMS} " in
+    *" vllm-hotload "*) _ADAPTER_USE_VLLM_HOTLOAD="true" ;;
+    *) _ADAPTER_USE_VLLM_HOTLOAD="" ;;
+esac
+if [ -n "${_ADAPTER_USE_VLLM_HOTLOAD}" ]; then
+    _adapter_hyperpod() {
+        # Guard: HP_LORA_ENABLED must be true
+        if [ "${HP_LORA_ENABLED:-false}" != "true" ]; then
+            echo "❌ LoRA is not enabled for this ${DEPLOYMENT_TARGET} deployment."
+            echo "   Set HP_LORA_ENABLED=true in do/config and redeploy: do/deploy --target ${DEPLOYMENT_TARGET}"
+            exit 1
+        fi
+
+        # Parse subcommand
+        local CMD="${1:-}"
+        shift || true
+
+        # ── Legacy-flag deprecation shims (BL112) ────────────────────────────
+        # --load-lora / --unload-lora remain accepted for backward compatibility.
+        # Each emits a deprecation warning and rewrites the invocation into the
+        # unified verb before the router runs, so the downstream port-forward and
+        # dispatch are shared with the unified path.
+        case "${CMD}" in
+            --load-lora)
+                echo "⚠️  --load-lora is deprecated; use: do/adapter add <name> --from-weights s3://..." >&2
+                CMD="add"
+                ;;
+            --unload-lora)
+                echo "⚠️  --unload-lora is deprecated; use: do/adapter remove <name>" >&2
+                CMD="remove"
+                ;;
+        esac
+
+        # Parse unified verbs into an internal (ACTION, LORA_NAME, WEIGHTS_URI) triple.
+        # ACTION ∈ load / unload / list / update. add/update take the SAME --from-*
+        # source flags as the SMAI path (BL169 / ADR-013): every source resolves
+        # through the shared _resolve_additive_source, independent of the target.
+        local LORA_NAME=""
+        local WEIGHTS_URI=""
+        local ACTION=""
+        local _SRC_VERB=""
+        local _SRC_ARG=""
+        local _SRC_COUNT=0
+
+        case "${CMD}" in
+            add|update)
+                # add    → load
+                # update → unload-then-load (remove-then-add)
+                if [ "${CMD}" = "add" ]; then
+                    ACTION="load"
+                else
+                    ACTION="update"
+                fi
+                LORA_NAME="${1:-}"
+                shift || true
+                if [ -z "${LORA_NAME}" ] || [[ "${LORA_NAME}" == -* ]]; then
+                    echo "❌ 'do/adapter ${CMD}' requires a name argument"
+                    echo "   Usage: do/adapter ${CMD} <name> --from-weights s3://... | --from-tune [technique] | --from-registry <arn>"
+                    exit 1
+                fi
+                # Parse the --from-* source family (+ the deprecated --weights alias).
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        --from-weights|--weights)
+                            [ "$1" = "--weights" ] && _deprecated_flag_alias --weights --from-weights
+                            _SRC_VERB="from-weights"
+                            _SRC_ARG="${2:-}"
+                            _SRC_COUNT=$((_SRC_COUNT + 1))
+                            shift
+                            shift || true
+                            ;;
+                        --from-hub)
+                            _SRC_VERB="from-hub"
+                            _SRC_ARG="${2:-}"
+                            _SRC_COUNT=$((_SRC_COUNT + 1))
+                            shift
+                            shift || true
+                            ;;
+                        --from-registry)
+                            _SRC_VERB="from-registry"
+                            _SRC_ARG="${2:-}"
+                            _SRC_COUNT=$((_SRC_COUNT + 1))
+                            shift
+                            shift || true
+                            ;;
+                        --from-tune|--from-train)
+                            _SRC_VERB="${1#--}"
+                            _SRC_ARG=""
+                            _SRC_COUNT=$((_SRC_COUNT + 1))
+                            # Optional technique argument (anything not starting with -).
+                            if [ -n "${2:-}" ] && [[ "${2}" != -* ]]; then
+                                _SRC_ARG="$2"
+                                shift 2
+                            else
+                                shift
+                            fi
+                            ;;
+                        *)
+                            echo "❌ Unknown option: $1"
+                            echo "   Run ./do/adapter --help for usage."
+                            exit 1
+                            ;;
+                    esac
+                done
+                if [ "${_SRC_COUNT}" -gt 1 ]; then
+                    echo "❌ --from-weights, --from-hub, --from-tune, --from-train, and --from-registry are mutually exclusive"
+                    exit 1
+                fi
+                if [ "${_SRC_COUNT}" -eq 0 ]; then
+                    echo "❌ 'do/adapter ${CMD}' requires a source: --from-weights s3://... | --from-tune [technique] | --from-train [technique] | --from-registry <arn> | --from-hub <repo>"
+                    echo "   Usage: do/adapter ${CMD} <name> --from-weights s3://..."
+                    exit 1
+                fi
+
+                # ── Resolve the source (shared, target-uniform resolver) ─────
+                # --from-weights is the straight-through fast path (the URI is
+                # passed as-is); the rest call the existing helpers. A failed
+                # resolution prints the helper's real error and exits non-zero.
+                local _resolved
+                _resolved=$(_resolve_additive_source "${_SRC_VERB}" "${_SRC_ARG}" "${LORA_NAME}" \
+                    "$(_additive_accepts_kind adapter)") || exit 1
+                local RESOLVED_SOURCE="" RESOLVED_URI="" RESOLVED_KIND=""
+                eval "${_resolved}"
+                WEIGHTS_URI="${RESOLVED_URI}"
+
+                # ── ADR-013 kind gate (R5.3) — accepted kinds come from the table.
+                # A full_model from ANY source is refused (it is not hot-loadable
+                # as a LoRA); an UNKNOWN kind degrades to a content sniff.
+                _guard_artifact_kind "${RESOLVED_KIND}" "$(_additive_accepts_kind adapter)" \
+                    "A full fine-tuned model cannot be hot-loaded as a LoRA adapter. Full models aren't servable on ${DEPLOYMENT_TARGET} yet (do/add-pod, BL149, is deferred) — deploy it on realtime-inference with do/add-ic <name> --from-weights s3://..."
+                if [ -z "${RESOLVED_KIND}" ]; then
+                    # Best-effort (never blocks): adapter_config.json ⇒ lora_adapter.
+                    if [ "$(_additive_sniff_kind "${WEIGHTS_URI}")" = "lora_adapter" ]; then
+                        echo "   ✅ Content check: adapter_config.json found at ${WEIGHTS_URI}"
+                    else
+                        echo "   ⚠️  Content check: could not confirm adapter_config.json at ${WEIGHTS_URI}."
+                        echo "      Proceeding; vLLM will reject the load if this is not a LoRA adapter."
+                    fi
+                fi
+                echo "📦 Source: --${RESOLVED_SOURCE} → ${WEIGHTS_URI}"
+                ;;
+            remove)
+                ACTION="unload"
+                LORA_NAME="${1:-}"
+                shift || true
+                if [ -z "${LORA_NAME}" ]; then
+                    echo "❌ 'do/adapter remove' requires a name argument"
+                    echo "   Usage: do/adapter remove <name>"
+                    exit 1
+                fi
+                ;;
+            list)
+                ACTION="list"
+                ;;
+            --help|-h|"")
+                echo "Usage: ./do/adapter <command> [options]"
+                echo ""
+                echo "Kubernetes commands (DEPLOYMENT_TARGET=${DEPLOYMENT_TARGET}; vLLM hot-load):"
+                echo "  add <name> --from-weights s3://...      Hot-load a LoRA adapter from S3"
+                echo "  add <name> --from-tune [technique]      Hot-load the do/tune adapter output"
+                echo "  add <name> --from-train [technique]     Hot-load the do/train adapter output"
+                echo "  add <name> --from-registry <arn>        Hot-load a registered adapter version"
+                echo "  add <name> --from-hub <hf-repo-id>      Stage a HuggingFace adapter to S3, then hot-load"
+                echo "  remove <name>                           Unload a LoRA adapter from vLLM"
+                echo "  list                                    List loaded LoRA adapters"
+                echo "  update <name> --from-weights s3://...   Replace a LoRA adapter's weights in place"
+                echo "                                          (update accepts every --from-* source too)"
+                echo ""
+                echo "Examples:"
+                echo "  ./do/adapter add ectsum --from-weights s3://my-bucket/adapters/ectsum/"
+                echo "  ./do/adapter add tuned-sft --from-tune"
+                echo "  ./do/adapter add tuned-sft --from-tune sft"
+                echo "  ./do/adapter list"
+                echo "  ./do/adapter update ectsum --from-weights s3://my-bucket/adapters/ectsum-v2/"
+                echo "  ./do/adapter remove ectsum"
+                echo ""
+                echo "A full fine-tuned model is refused here (not a LoRA). Full models on a cluster"
+                echo "are not supported yet (do/add-pod is deferred); use realtime-inference + do/add-ic."
+                echo ""
+                echo "Deprecated (still accepted, prints a notice):"
+                echo "  --weights s3://...                      → --from-weights s3://..."
+                echo "  --load-lora <name> --weights s3://...   → do/adapter add <name> --from-weights s3://..."
+                echo "  --unload-lora <name>                    → do/adapter remove <name>"
+                exit 0
+                ;;
+            *)
+                echo "❌ Unknown command: ${CMD}"
+                echo "   Run ./do/adapter --help for usage."
+                exit 1
+                ;;
+        esac
+
+        # ── Direct-pod port-forward setup (same pattern as do/test and do/benchmark) ──
+        # Resolve the Running serving pod by the app=${PROJECT_NAME} label and
+        # port-forward directly to it on port 8080 (NOT a svc/ resource). The
+        # routing Service exposes TLS/443 for production traffic, so the
+        # direct-pod hop is the correct dev-time connection.
+        echo "🔌 Port-forwarding pod for ${PROJECT_NAME} to localhost:${HP_LOCAL_PORT:-8080}..."
+
+        # Get kubeconfig for HyperPod cluster
+        KUBECONFIG_PATH="${HOME}/.kube/hyperpod-${HP_CLUSTER_NAME}"
+
+        local _profile_arg=""
+        [ -n "${_PROFILE_awsProfile:-}" ] && _profile_arg="--profile ${_PROFILE_awsProfile}"
+
+        EKS_CLUSTER_ARN=$(aws sagemaker describe-cluster \
+            --cluster-name "${HP_CLUSTER_NAME}" \
+            --region "${AWS_REGION}" \
+            ${_profile_arg} \
+            --query "Orchestrator.Eks.ClusterArn" \
+            --output text 2>&1) || {
+            echo "❌ Failed to describe HyperPod cluster: ${HP_CLUSTER_NAME}"
+            echo "   ${EKS_CLUSTER_ARN}"
+            exit 4
+        }
+        EKS_CLUSTER_NAME=$(echo "${EKS_CLUSTER_ARN}" | awk -F'/' '{print $NF}')
+        local _kubecfg_err
+        if ! _kubecfg_err=$(aws eks update-kubeconfig \
+            --name "${EKS_CLUSTER_NAME}" \
+            --region "${AWS_REGION}" \
+            ${_profile_arg} \
+            --kubeconfig "${KUBECONFIG_PATH}" 2>&1 >/dev/null); then
+            echo "❌ Failed to configure kubectl for cluster: ${EKS_CLUSTER_NAME}"
+            [ -n "${_kubecfg_err}" ] && echo "   ${_kubecfg_err}"
+            exit 4
+        fi
+        export KUBECONFIG="${KUBECONFIG_PATH}"
+
+        # Resolve the Running serving pod by label (same --field-selector guard as do/benchmark).
+        local _POD _pod_err
+        _pod_err="$(mktemp)"
+        _POD=$(kubectl get pod -n "${HP_NAMESPACE:-default}" \
+            -l "app=${PROJECT_NAME}" \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}' 2>"${_pod_err}") || _POD=""
+        if [ -z "${_POD}" ]; then
+            echo "❌ No Running pod found for app=${PROJECT_NAME} in namespace ${HP_NAMESPACE:-default}"
+            if [ -s "${_pod_err}" ]; then
+                sed 's/^/   kubectl: /' "${_pod_err}"
+            fi
+            echo "   Check: kubectl get pods -n ${HP_NAMESPACE:-default} -l app=${PROJECT_NAME}"
+            rm -f "${_pod_err}"
+            exit 1
+        fi
+        rm -f "${_pod_err}"
+
+        kubectl port-forward "pod/${_POD}" "${HP_LOCAL_PORT:-8080}:8080" \
+            -n "${HP_NAMESPACE:-default}" &
+        _PF_PID=$!
+        trap "kill ${_PF_PID} 2>/dev/null || true" EXIT
+        sleep 3
+
+        if ! kill -0 ${_PF_PID} 2>/dev/null; then
+            echo "❌ Port-forward failed to start"
+            echo "   Check: kubectl get pods -n ${HP_NAMESPACE:-default} -l app=${PROJECT_NAME}"
+            exit 1
+        fi
+        echo "✅ Port-forward established"
+        echo ""
+
+        local BASE_URL="http://localhost:${HP_LOCAL_PORT:-8080}"
+
+        # ── Dispatch to lora_vllm.py ─────────────────────────────────────────
+        # Reusable helpers so `update` can compose unload-then-load without
+        # duplicating the JSON inspection logic. Both load and unload are POST
+        # operations in vLLM (there is no DELETE).
+        #
+        # BL165: lora_vllm.py exits 1 on a failed load/unload (with a JSON body
+        # on stdout) and may crash outright (traceback on stderr, no JSON). Both
+        # are captured and SURFACED — never a silent `set -e` exit or a generic
+        # "Unknown error" that hides the helper's own message.
+        _lora_helper_call() {
+            # Usage: _lora_helper_call <out-var> <args...> — runs lora_vllm.py,
+            # stores stdout in <out-var>, prints the helper's stderr on a crash.
+            local _var="$1"
+            shift
+            local _errf _out _rc=0
+            _errf="$(mktemp)"
+            _out=$(python3 "${SCRIPT_DIR}/lib/python/lora_vllm.py" "$@" 2>"${_errf}") || _rc=$?
+            if [ "${_rc}" -ne 0 ] && ! echo "${_out}" | grep -qE '^[[{]'; then
+                echo "❌ lora_vllm.py $1 failed (exit ${_rc}) without a result."
+                if [ -s "${_errf}" ]; then
+                    echo "   ── helper error output ──"
+                    sed 's/^/   /' "${_errf}"
+                fi
+                echo "   Check the venv has 'requests' installed and the port-forward to ${BASE_URL} is up."
+            fi
+            rm -f "${_errf}"
+            printf -v "${_var}" '%s' "${_out}"
+            return 0
+        }
+
+        _lora_json_field() {
+            # Usage: _lora_json_field <json> <field> <default> — tolerant only of a
+            # malformed/empty payload (ValueError), never of programming errors.
+            printf '%s' "$1" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except ValueError:
+    print(sys.argv[2]); sys.exit(0)
+v = d.get(sys.argv[1], sys.argv[2]) if isinstance(d, dict) else sys.argv[2]
+print(v)
+' "$2" "$3"
+        }
+
+        _lora_do_load() {
+            local _name="$1"
+            local _uri="$2"
+            echo "📦 Loading LoRA adapter '${_name}' from ${_uri}..."
+            local RESULT=""
+            _lora_helper_call RESULT load "${_name}" "${_uri}" "${BASE_URL}"
+            if [ "$(_lora_json_field "${RESULT}" success False)" = "True" ]; then
+                echo "✓ LoRA adapter '${_name}' loaded from ${_uri}"
+                return 0
+            fi
+            local STATUS_CODE
+            STATUS_CODE=$(_lora_json_field "${RESULT}" status_code 0)
+            local ERROR_MSG
+            ERROR_MSG=$(_lora_json_field "${RESULT}" error "${RESULT:-no output from lora_vllm.py}")
+            if [ "${STATUS_CODE}" = "409" ]; then
+                echo "❌ LoRA adapter '${_name}' already exists."
+                echo "   Unload it first: do/adapter remove ${_name}"
+            else
+                echo "❌ Failed to load LoRA adapter '${_name}'"
+                echo "   Error: ${ERROR_MSG}"
+            fi
+            return 1
+        }
+
+        _lora_do_unload() {
+            local _name="$1"
+            echo "🗑️  Unloading LoRA adapter '${_name}'..."
+            local RESULT=""
+            _lora_helper_call RESULT unload "${_name}" "${BASE_URL}"
+            if [ "$(_lora_json_field "${RESULT}" success False)" = "True" ]; then
+                echo "✓ LoRA adapter '${_name}' unloaded"
+                return 0
+            fi
+            local ERROR_MSG
+            ERROR_MSG=$(_lora_json_field "${RESULT}" error "${RESULT:-no output from lora_vllm.py}")
+            echo "❌ Failed to unload LoRA adapter '${_name}'"
+            echo "   Error: ${ERROR_MSG}"
+            return 1
+        }
+
+        case "${ACTION}" in
+            load)
+                _lora_do_load "${LORA_NAME}" "${WEIGHTS_URI}" || exit 1
+                ;;
+            unload)
+                _lora_do_unload "${LORA_NAME}" || exit 1
+                ;;
+            update)
+                # remove-then-add: unload the existing adapter, then load the new
+                # weights. A failed unload aborts before the load so weights are
+                # not half-swapped.
+                _lora_do_unload "${LORA_NAME}" || exit 1
+                _lora_do_load "${LORA_NAME}" "${WEIGHTS_URI}" || exit 1
+                ;;
+            list)
+                echo "📋 Listing loaded LoRA adapters on ${PROJECT_NAME}..."
+                echo ""
+                local RESULT=""
+                _lora_helper_call RESULT list "${BASE_URL}"
+                local COUNT
+                COUNT=$(printf '%s' "${RESULT}" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except ValueError:
+    print("ERR"); sys.exit(0)
+print(len(d) if isinstance(d, list) else "ERR")
+')
+                if [ "${COUNT}" = "ERR" ]; then
+                    echo "❌ Could not list LoRA adapters (unexpected helper output)."
+                    [ -n "${RESULT}" ] && echo "   Output: ${RESULT}"
+                    exit 1
+                elif [ "${COUNT}" = "0" ]; then
+                    echo "   No LoRA adapters loaded."
+                    echo ""
+                    echo "   Load one: do/adapter add <name> --from-weights s3://..."
+                else
+                    printf "   %-30s %s\n" "NAME" "PATH"
+                    printf "   %-30s %s\n" "----" "----"
+                    echo "${RESULT}" | python3 -c "
+import sys, json
+loras = json.load(sys.stdin)
+for l in loras:
+    print(f'   {l[\"name\"]:<30} {l.get(\"path\", \"\")}')
+"
+                fi
+                ;;
+        esac
+    }
+
+    _adapter_hyperpod "$@"
+    exit $?
+fi
+
+source "${SCRIPT_DIR}/lib/wait.sh"
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+_usage() {
+    echo "Usage: ./do/adapter <command> [options]"
+    echo ""
+    echo "Manage LoRA adapter inference components on endpoint: ${ENDPOINT_NAME:-<not deployed>}"
+    echo ""
+    echo "Commands:"
+    echo "  add <name> --from-weights <s3-uri> Add a new LoRA adapter from S3"
+    echo "  add <name> --from-hub <hf-repo-id>   Add a new LoRA adapter from HuggingFace Hub"
+    echo "  add <name> --from-tune [technique]   Add adapter from do/tune output"
+    echo "  add <name> --from-train [technique]  Add adapter from do/train output"
+    echo "  add <name> --from-registry [arn]     Add adapter from model registry"
+    echo "  list                                  List all adapters on the endpoint"
+    echo "  remove <name>                         Remove an adapter"
+    echo "  update <name> --from-weights <uri> Update adapter weights from S3"
+    echo "  update <name> --from-hub <hf-repo-id> Update adapter weights from HuggingFace Hub"
+    echo "  search [--limit N]                    Search HuggingFace Hub for compatible adapters"
+    echo ""
+    echo "Options:"
+    echo "  --help, -h    Show this help message"
+    echo "  --force       Bypass adapter-model compatibility check (add command)"
+    echo "  --local       Use local aws s3 cp instead of Processing Job (--from-tune)"
+    echo "  --no-wait     Submit Processing Job and return immediately (--from-tune)"
+    echo ""
+    echo "Examples:"
+    echo "  ./do/adapter add ectsum --from-weights s3://my-bucket/adapters/ectsum/adapter.tar.gz"
+    echo "  ./do/adapter add ectsum --from-hub predibase/llama-3.1-8b-ectsum"
+    echo "  ./do/adapter add tuned-sft --from-tune"
+    echo "  ./do/adapter add tuned-sft --from-tune sft"
+    echo "  ./do/adapter add tuned-sft --from-tune --local"
+    echo "  ./do/adapter add tuned-sft --from-tune --no-wait"
+    echo "  ./do/adapter add my-adapter --from-registry"
+    echo "  ./do/adapter add my-adapter --from-registry arn:aws:sagemaker:...:model-package/proj/2"
+    echo "  ./do/adapter list"
+    echo "  ./do/adapter remove ectsum"
+    echo "  ./do/adapter update ectsum --from-weights s3://my-bucket/adapters/ectsum-v2/adapter.tar.gz"
+    echo "  ./do/adapter update ectsum --from-hub predibase/llama-3.1-8b-ectsum-v2"
+    echo ""
+    echo "Adapter metadata is stored in do/adapters/<name>.conf"
+    echo ""
+    echo "Note: --from-weights, --from-hub, --from-tune, --from-train, and --from-registry are mutually exclusive."
+    echo ""
+    echo "Deprecated: --weights <s3-uri> is an alias of --from-weights (prints a notice)."
+    echo "The same --from-* sources work on hyperpod-eks / eks (vLLM hot-load); a full"
+    echo "fine-tuned model is refused by do/adapter — use do/add-ic on realtime-inference."
+}
+
+# ── Validate LoRA is enabled ──────────────────────────────────────────────────
+_validate_lora_enabled() {
+    if [ "${ENABLE_LORA:-}" != "true" ]; then
+        echo "❌ LoRA adapter serving is not enabled for this project."
+        echo ""
+        echo "   ENABLE_LORA=true was not found in do/config."
+        echo ""
+        echo "   To enable LoRA adapters, regenerate your project with --enable-lora"
+        echo "   or add ENABLE_LORA=true to do/config and configure your model server"
+        echo "   environment (e.g., VLLM_ENABLE_LORA=true)."
+        exit 1
+    fi
+}
+
+# ── Resolve base IC name ──────────────────────────────────────────────────────
+_resolve_base_ic_name() {
+    local base_ic_name=""
+
+    # Try multi-IC path first: do/ic/default.conf
+    if [ -f "${SCRIPT_DIR}/ic/default.conf" ]; then
+        base_ic_name=$(grep "^export IC_DEPLOYED_NAME=" "${SCRIPT_DIR}/ic/default.conf" 2>/dev/null | sed 's/^export IC_DEPLOYED_NAME="//' | sed 's/"$//' || echo "")
+    fi
+
+    # Fallback to legacy config: INFERENCE_COMPONENT_NAME
+    if [ -z "${base_ic_name}" ]; then
+        base_ic_name="${INFERENCE_COMPONENT_NAME:-}"
+    fi
+
+    if [ -z "${base_ic_name}" ]; then
+        # stderr: callers capture this function's stdout ($(...)), so an error on
+        # stdout would be swallowed along with the exit (BL165).
+        {
+            echo "❌ Cannot determine base inference component name."
+            echo ""
+            echo "   No IC_DEPLOYED_NAME found in do/ic/default.conf and no"
+            echo "   INFERENCE_COMPONENT_NAME in do/config."
+            echo ""
+            echo "   Deploy your base model first with: ./do/deploy"
+        } >&2
+        exit 1
+    fi
+
+    echo "${base_ic_name}"
+}
+
 # ── Subcommand implementations ────────────────────────────────────────────────
 
 _adapter_add() {
@@ -678,10 +835,12 @@ _adapter_add() {
     shift  # remove 'add' from args
     while [ $# -gt 0 ]; do
         case "$1" in
-            --weights)
+            --from-weights|--weights)
+                # --weights is the DEPRECATED alias of --from-weights (ADR-013 / R2).
+                [ "$1" = "--weights" ] && _deprecated_flag_alias --weights --from-weights
                 if [ -z "${2:-}" ]; then
-                    echo "❌ --weights requires an S3 URI argument"
-                    echo "   Usage: ./do/adapter add <name> --weights <s3-uri>"
+                    echo "❌ $1 requires an S3 URI argument"
+                    echo "   Usage: ./do/adapter add <name> --from-weights <s3-uri>"
                     exit 1
                 fi
                 weights_uri="$2"
@@ -739,7 +898,7 @@ _adapter_add() {
                 shift
                 ;;
             --help|-h)
-                echo "Usage: ./do/adapter add <name> --weights <s3-uri>"
+                echo "Usage: ./do/adapter add <name> --from-weights <s3-uri>"
                 echo "       ./do/adapter add <name> --from-hub <hf-repo-id>"
                 echo "       ./do/adapter add <name> --from-tune [technique]"
                 echo "       ./do/adapter add <name> --from-registry [version-arn]"
@@ -748,7 +907,7 @@ _adapter_add() {
                 echo ""
                 echo "Arguments:"
                 echo "  <name>                      Adapter name (lowercase alphanumeric + hyphens, 1-50 chars)"
-                echo "  --weights <s3-uri>          S3 URI to adapter weights (.tar.gz)"
+                echo "  --from-weights <s3-uri>          S3 URI to adapter weights (.tar.gz)"
                 echo "  --from-hub <hf-repo-id>     Download adapter from HuggingFace Hub"
                 echo "  --from-tune [technique]     Use adapter output from do/tune"
                 echo "                              Without technique: uses latest tune output"
@@ -760,10 +919,10 @@ _adapter_add() {
                 echo "  --no-wait                   Submit Processing Job and return immediately (--from-tune only)"
                 echo "  --force                     Bypass adapter-model compatibility check"
                 echo ""
-                echo "Note: --weights, --from-hub, --from-tune, and --from-registry are mutually exclusive."
+                echo "Note: --from-weights, --from-hub, --from-tune, --from-train, and --from-registry are mutually exclusive."
                 echo ""
                 echo "Examples:"
-                echo "  ./do/adapter add ectsum --weights s3://bucket/adapters/ectsum/adapter.tar.gz"
+                echo "  ./do/adapter add ectsum --from-weights s3://bucket/adapters/ectsum/adapter.tar.gz"
                 echo "  ./do/adapter add ectsum --from-hub predibase/llama-3.1-8b-ectsum"
                 echo "  ./do/adapter add tuned-sft --from-tune"
                 echo "  ./do/adapter add tuned-sft --from-tune sft"
@@ -775,7 +934,7 @@ _adapter_add() {
                 ;;
             -*)
                 echo "❌ Unknown option: $1"
-                echo "   Usage: ./do/adapter add <name> --weights <s3-uri>"
+                echo "   Usage: ./do/adapter add <name> --from-weights <s3-uri>"
                 echo "          ./do/adapter add <name> --from-hub <hf-repo-id>"
                 echo "          ./do/adapter add <name> --from-tune [technique]"
                 echo "          ./do/adapter add <name> --from-registry [version-arn]"
@@ -786,7 +945,7 @@ _adapter_add() {
                     adapter_name="$1"
                 else
                     echo "❌ Unexpected argument: $1"
-                    echo "   Usage: ./do/adapter add <name> --weights <s3-uri>"
+                    echo "   Usage: ./do/adapter add <name> --from-weights <s3-uri>"
                     echo "          ./do/adapter add <name> --from-hub <hf-repo-id>"
                     echo "          ./do/adapter add <name> --from-tune [technique]"
                     echo "          ./do/adapter add <name> --from-registry [version-arn]"
@@ -800,7 +959,7 @@ _adapter_add() {
     # Validate required arguments
     if [ -z "${adapter_name}" ]; then
         echo "❌ Adapter name is required"
-        echo "   Usage: ./do/adapter add <name> --weights <s3-uri>"
+        echo "   Usage: ./do/adapter add <name> --from-weights <s3-uri>"
         echo "          ./do/adapter add <name> --from-hub <hf-repo-id>"
         echo "          ./do/adapter add <name> --from-tune [technique]"
         exit 1
@@ -815,10 +974,10 @@ _adapter_add() {
     [ -n "${from_registry}" ] && source_count=$((source_count + 1))
 
     if [ "${source_count}" -gt 1 ]; then
-        echo "❌ --weights, --from-hub, --from-tune, and --from-registry are mutually exclusive"
+        echo "❌ --from-weights, --from-hub, --from-tune, --from-train, and --from-registry are mutually exclusive"
         echo ""
         echo "   Use one of:"
-        echo "   ./do/adapter add ${adapter_name} --weights <s3-uri>"
+        echo "   ./do/adapter add ${adapter_name} --from-weights <s3-uri>"
         echo "   ./do/adapter add ${adapter_name} --from-hub <hf-repo-id>"
         echo "   ./do/adapter add ${adapter_name} --from-tune [technique]"
         echo "   ./do/adapter add ${adapter_name} --from-registry [version-arn]"
@@ -826,110 +985,32 @@ _adapter_add() {
     fi
 
     if [ "${source_count}" -eq 0 ]; then
-        echo "❌ One of --weights, --from-hub, --from-tune, or --from-registry is required"
-        echo "   Usage: ./do/adapter add <name> --weights <s3-uri>"
+        echo "❌ One of --from-weights, --from-hub, --from-tune, --from-train, or --from-registry is required"
+        echo "   Usage: ./do/adapter add <name> --from-weights <s3-uri>"
         echo "          ./do/adapter add <name> --from-hub <hf-repo-id>"
         echo "          ./do/adapter add <name> --from-tune [technique]"
         echo "          ./do/adapter add <name> --from-registry [version-arn]"
         exit 1
     fi
 
-    # ── Resolve --from-tune to weights_uri ────────────────────────────────
+    # ── ADR-013 kind gate guidance (shared by every source below) ──────────
+    local _kind_guidance="A full fine-tuned model cannot be hot-loaded as a LoRA adapter — use do/add-ic <name> --from-tune (realtime) instead; full models on a cluster (do/add-pod) are not supported yet."
+    local _resolved_kind=""
+
+    # ── Resolve --from-tune to weights_uri (shared resolver) ──────────────
+    # _resolve_additive_source reads TUNE_ADAPTER_PATH_<T>[_<SLUG>] /
+    # TUNE_MODEL_PATH_<T> / TUNE_OUTPUT_PATH_LATEST and records the kind; the
+    # kind gate runs BEFORE any staging so a full model is refused up front.
     if [ -n "${from_tune}" ]; then
-        if [ -n "${from_tune_technique}" ]; then
-            # Check if technique contains a hyphen — may be technique-dataset compound
-            if [[ "${from_tune_technique}" == *-* ]]; then
-                # Try compound key: TUNE_ADAPTER_PATH_<TECHNIQUE>_<SLUG>
-                local compound_technique="${from_tune_technique%%-*}"
-                local compound_slug="${from_tune_technique#*-}"
-                local compound_technique_upper
-                compound_technique_upper=$(echo "${compound_technique}" | tr '[:lower:]' '[:upper:]')
-                local compound_slug_upper
-                compound_slug_upper=$(echo "${compound_slug}" | tr '[:lower:]' '[:upper:]' | sed 's/-/_/g')
-                local compound_var="TUNE_ADAPTER_PATH_${compound_technique_upper}_${compound_slug_upper}"
-                local compound_path="${!compound_var:-}"
-
-                if [ -n "${compound_path}" ]; then
-                    weights_uri="${compound_path}"
-                    echo "📦 Using tune adapter output for technique '${compound_technique}' dataset '${compound_slug}': ${weights_uri}"
-                else
-                    # Fallback: try as technique-only
-                    local technique_upper
-                    technique_upper=$(echo "${from_tune_technique}" | tr '[:lower:]' '[:upper:]' | sed 's/-/_/g')
-                    local tune_var="TUNE_ADAPTER_PATH_${technique_upper}"
-                    local tune_path="${!tune_var:-}"
-
-                    if [ -n "${tune_path}" ]; then
-                        echo "⚠️  ${compound_var} not found, falling back to ${tune_var}"
-                        weights_uri="${tune_path}"
-                        echo "📦 Using tune adapter output for technique '${from_tune_technique}': ${weights_uri}"
-                    else
-                        # Try the technique part alone as final fallback
-                        local fallback_var="TUNE_ADAPTER_PATH_${compound_technique_upper}"
-                        local fallback_path="${!fallback_var:-}"
-
-                        if [ -n "${fallback_path}" ]; then
-                            echo "⚠️  ${compound_var} not found, falling back to ${fallback_var}"
-                            weights_uri="${fallback_path}"
-                            echo "📦 Using tune adapter output for technique '${compound_technique}': ${weights_uri}"
-                        else
-                            echo "❌ No adapter output found for: ${from_tune_technique}"
-                            echo ""
-                            echo "   Tried: ${compound_var}, ${fallback_var}"
-                            echo ""
-                            echo "   Run a tune job first:"
-                            echo "   ./do/tune --technique ${compound_technique} --dataset <source>"
-                            exit 1
-                        fi
-                    fi
-                fi
-            else
-                # Technique-only: read TUNE_ADAPTER_PATH_<TECHNIQUE>
-                local technique_upper
-                technique_upper=$(echo "${from_tune_technique}" | tr '[:lower:]' '[:upper:]')
-                local tune_var="TUNE_ADAPTER_PATH_${technique_upper}"
-                local tune_path="${!tune_var:-}"
-
-                if [ -z "${tune_path}" ]; then
-                    echo "❌ No adapter output found for technique: ${from_tune_technique}"
-                    echo ""
-                    echo "   ${tune_var} is not set in do/config."
-                    echo ""
-                    echo "   Run a tune job first:"
-                    echo "   ./do/tune --technique ${from_tune_technique} --dataset <source>"
-                    exit 1
-                fi
-
-                weights_uri="${tune_path}"
-                echo "📦 Using tune adapter output for technique '${from_tune_technique}': ${weights_uri}"
-            fi
-        else
-            # No technique: read TUNE_OUTPUT_PATH_LATEST and verify type
-            if [ -z "${TUNE_OUTPUT_PATH_LATEST:-}" ]; then
-                echo "❌ No tune output found."
-                echo ""
-                echo "   TUNE_OUTPUT_PATH_LATEST is not set in do/config."
-                echo ""
-                echo "   Run a tune job first:"
-                echo "   ./do/tune --technique <technique> --dataset <source>"
-                exit 1
-            fi
-
-            # Verify output type is adapter (not full-model)
-            if [ "${TUNE_OUTPUT_TYPE_LATEST:-}" = "full-model" ]; then
-                echo "❌ Latest tune output is a full model, not an adapter."
-                echo ""
-                echo "   TUNE_OUTPUT_TYPE_LATEST=full-model"
-                echo ""
-                echo "   Full model outputs cannot be added as adapters."
-                echo "   Use do/add-ic instead:"
-                echo "   ./do/add-ic ${adapter_name} --from-tune"
-                exit 1
-            fi
-
-            weights_uri="${TUNE_OUTPUT_PATH_LATEST}"
-            echo "📦 Using latest tune adapter output: ${weights_uri}"
-        fi
+        local _tune_resolved
+        _tune_resolved=$(_resolve_additive_source from-tune "${from_tune_technique}" "${adapter_name}" \
+            "$(_additive_accepts_kind adapter)") || exit 1
+        local RESOLVED_SOURCE="" RESOLVED_URI="" RESOLVED_KIND="" RESOLVED_META_TECHNIQUE=""
+        eval "${_tune_resolved}"
+        weights_uri="${RESOLVED_URI}"
+        _resolved_kind="${RESOLVED_KIND}"
+        _guard_artifact_kind "${_resolved_kind}" "$(_additive_accepts_kind adapter)" "${_kind_guidance}"
+        echo "📦 Using tune adapter output (${RESOLVED_META_TECHNIQUE}): ${weights_uri}"
         echo ""
 
         # ── Route to Processing Job helper (default) or local path ────────
@@ -1174,41 +1255,17 @@ _adapter_add() {
         fi  # end --local else branch
     fi
 
-    # ── Resolve --from-train to weights_uri ───────────────────────────────
+    # ── Resolve --from-train to weights_uri (shared resolver) ─────────────
     if [ -n "${from_train}" ]; then
-        if [ -n "${from_train_technique}" ]; then
-            local technique_upper
-            technique_upper=$(echo "${from_train_technique}" | tr '[:lower:]' '[:upper:]')
-            local train_var="TRAIN_ADAPTER_PATH_${technique_upper}"
-            local train_path="${!train_var:-}"
-
-            if [ -z "${train_path}" ]; then
-                echo "❌ No training adapter output found for technique: ${from_train_technique}"
-                echo ""
-                echo "   ${train_var} is not set in do/config."
-                echo ""
-                echo "   Run a training job first:"
-                echo "   ./do/train --technique ${from_train_technique} --dataset <source>"
-                exit 1
-            fi
-
-            weights_uri="${train_path}"
-            echo "📦 Using train adapter output for technique '${from_train_technique}': ${weights_uri}"
-        else
-            # No technique: read TRAIN_OUTPUT_PATH_LATEST
-            if [ -z "${TRAIN_OUTPUT_PATH_LATEST:-}" ]; then
-                echo "❌ No training output found."
-                echo ""
-                echo "   TRAIN_OUTPUT_PATH_LATEST is not set in do/config."
-                echo ""
-                echo "   Run a training job first:"
-                echo "   ./do/train --technique <technique> --dataset <source>"
-                exit 1
-            fi
-
-            weights_uri="${TRAIN_OUTPUT_PATH_LATEST}"
-            echo "📦 Using latest train adapter output: ${weights_uri}"
-        fi
+        local _train_resolved
+        _train_resolved=$(_resolve_additive_source from-train "${from_train_technique}" "${adapter_name}" \
+            "$(_additive_accepts_kind adapter)") || exit 1
+        local RESOLVED_SOURCE="" RESOLVED_URI="" RESOLVED_KIND="" RESOLVED_META_TECHNIQUE=""
+        eval "${_train_resolved}"
+        weights_uri="${RESOLVED_URI}"
+        _resolved_kind="${RESOLVED_KIND}"
+        _guard_artifact_kind "${_resolved_kind}" "$(_additive_accepts_kind adapter)" "${_kind_guidance}"
+        echo "📦 Using train adapter output (${RESOLVED_META_TECHNIQUE}): ${weights_uri}"
         echo ""
 
         # Use same staging path as --from-tune (Processing Job or local)
@@ -1284,20 +1341,29 @@ _adapter_add() {
             echo "📦 Querying model registry for available adapters..."
             echo ""
 
-            local adapters_json
+            local adapters_json _list_err _list_rc=0
+            _list_err="$(mktemp)"
+            # BL165: capture the helper's stderr instead of discarding it, so a
+            # credentials/permission/import failure is shown, not a silent exit.
             adapters_json=$(python3 "${SCRIPT_DIR}/.register_helper.py" list-adapters \
                 --project-name "${PROJECT_NAME}" \
-                --region "${AWS_REGION}" 2>/dev/null)
+                --region "${AWS_REGION}" 2>"${_list_err}") || _list_rc=$?
 
             # Extract JSON line (filter out any non-JSON noise)
             local json_line
-            json_line=$(echo "${adapters_json}" | grep -E '^\{' | tail -1)
+            json_line=$(echo "${adapters_json}" | grep -E '^\{' | tail -1 || true)
 
-            if [ -z "${json_line}" ]; then
-                echo "❌ Failed to query model registry."
+            if [ -z "${json_line}" ] || [ "${_list_rc}" -ne 0 ]; then
+                echo "❌ Failed to query model registry (.register_helper.py list-adapters exit ${_list_rc})."
+                if [ -s "${_list_err}" ]; then
+                    echo "   ── helper error output ──"
+                    sed 's/^/   /' "${_list_err}"
+                fi
+                rm -f "${_list_err}"
                 echo "   Check that your AWS credentials are configured and the project has registered adapters."
                 exit 1
             fi
+            rm -f "${_list_err}"
 
             # Parse adapter count
             local adapter_count
@@ -1307,7 +1373,7 @@ _adapter_add() {
                 echo "❌ No adapters found in the model registry for project: ${PROJECT_NAME}"
                 echo ""
                 echo "   Register an adapter first with: ./do/register (after do/tune)"
-                echo "   Or use --weights or --from-hub to add an adapter manually."
+                echo "   Or use --from-weights or --from-hub to add an adapter manually."
                 exit 1
             fi
 
@@ -1357,51 +1423,26 @@ _adapter_add() {
             echo ""
         fi
 
-        # Direct mode (AC-4.3): use the provided or selected ARN to get version details
+        # Direct mode (AC-4.3): resolve the provided or selected ARN through the
+        # shared resolver (it calls .register_helper.py get-version and surfaces
+        # the helper's real error on failure).
         echo "📦 Retrieving adapter details from registry: ${registry_arn}"
         echo ""
 
-        local version_json
-        version_json=$(python3 "${SCRIPT_DIR}/.register_helper.py" get-version \
-            --arn "${registry_arn}" \
-            --region "${AWS_REGION}" 2>/dev/null)
-
-        local version_line
-        version_line=$(echo "${version_json}" | grep -E '^\{' | tail -1)
-
-        if [ -z "${version_line}" ]; then
-            echo "❌ Failed to get version details for: ${registry_arn}"
-            echo ""
-            echo "   Check that the ARN is correct and you have sagemaker:DescribeModelPackage permission."
+        local _reg_resolved
+        _reg_resolved=$(_resolve_additive_source from-registry "${registry_arn}" "${adapter_name}" \
+            "$(_additive_accepts_kind adapter)") || {
             echo "   Run ./do/adapter list to see available registry adapters."
             exit 1
-        fi
-
-        # Check for error in response
-        local version_error
-        version_error=$(echo "${version_line}" | python3 -c "import sys,json; data=json.loads(sys.stdin.read()); print(data.get('error',''))" 2>/dev/null || echo "")
-        if [ -n "${version_error}" ]; then
-            echo "❌ Registry error: ${version_error}"
-            exit 1
-        fi
-
-        # Extract model data URL (weights path)
-        weights_uri=$(echo "${version_line}" | python3 -c "import sys,json; data=json.loads(sys.stdin.read()); print(data.get('modelDataUrl',''))" 2>/dev/null || echo "")
-
-        # Ensure adapter weights URI ends with / (S3 prefix for directory-style adapters).
-        # Registry metadata may have the slash stripped (Bug 52 rstrip), but SageMaker IC
-        # ModelDataUrl requires it to download all objects under the prefix.
-        if [ -n "${weights_uri}" ] && ! echo "${weights_uri}" | grep -q '\.tar\.gz$'; then
-            weights_uri="${weights_uri%/}/"
-        fi
-
-        if [ -z "${weights_uri}" ]; then
-            echo "❌ No model data URL found for registry version: ${registry_arn}"
-            echo ""
-            echo "   The registered adapter does not have a model data URL."
-            echo "   Use --weights with an explicit S3 URI instead."
-            exit 1
-        fi
+        }
+        local RESOLVED_SOURCE="" RESOLVED_URI="" RESOLVED_KIND=""
+        local RESOLVED_META_VERSION_ARN="" RESOLVED_META_VERSION="" RESOLVED_META_PARENT_ARN="" RESOLVED_META_MODEL_NAME=""
+        eval "${_reg_resolved}"
+        weights_uri="${RESOLVED_URI}"
+        _resolved_kind="${RESOLVED_KIND}"
+        # Registry provenance for the compat check + conf metadata below.
+        local version_line="registry:${RESOLVED_META_VERSION_ARN}"
+        _guard_artifact_kind "${_resolved_kind}" "$(_additive_accepts_kind adapter)" "${_kind_guidance}"
 
         echo "✅ Resolved adapter weights from registry: ${weights_uri}"
         echo ""
@@ -1432,8 +1473,8 @@ _adapter_add() {
         exit 1
     fi
 
-    # ── Validate S3 URI format (only when --weights is explicitly used) ──
-    if [ -n "${weights_uri}" ] && [ -z "${from_hub}" ] && [ -z "${from_tune}" ] && [ -z "${from_registry}" ]; then
+    # ── Validate S3 URI format (only when --from-weights is explicitly used) ──
+    if [ -n "${weights_uri}" ] && [ -z "${from_hub}" ] && [ -z "${from_tune}" ] && [ -z "${from_train}" ] && [ -z "${from_registry}" ]; then
         if ! echo "${weights_uri}" | grep -qE '^s3://.*\.tar\.gz$'; then
             echo "❌ Invalid S3 URI: ${weights_uri}"
             echo ""
@@ -1479,43 +1520,20 @@ _adapter_add() {
             echo "❌ Adapter already exists: ${adapter_name}"
             echo ""
             echo "   An adapter with this name is already registered."
-            echo "   To update its weights, use: ./do/adapter update ${adapter_name} --weights <new-uri>"
+            echo "   To update its weights, use: ./do/adapter update ${adapter_name} --from-weights <new-uri>"
             echo "   To remove it first: ./do/adapter remove ${adapter_name}"
             exit 1
         fi
     fi
 
-    # ── ADR-013 artifact-kind gate (BL164 R4): do/adapter accepts lora_adapter.
-    # Resolve the source's artifact_kind, then run the REUSABLE guard
-    # (_guard_artifact_kind in script-contract.sh). A full_model is refused with
-    # a pointer to do/add-ic; an UNKNOWN kind (legacy) falls through to the
-    # content check (adapter_config.json) rather than hard-blocking.
-    _resolved_kind=""
-    if [ -n "${from_tune}" ]; then
-        if [ -n "${from_tune_technique}" ]; then
-            # Descriptor is the source of truth for a technique's artifact_kind.
-            _tech="${from_tune_technique%%-*}"
-            _resolved_kind=$(python3 "${SCRIPT_DIR}/lib/python/tune_manifest.py" \
-                artifact_kind "${_tech}" 2>/dev/null || echo "")
-        elif [ "${TUNE_OUTPUT_TYPE_LATEST:-}" = "full-model" ]; then
-            _resolved_kind="full_model"
-        elif [ "${TUNE_OUTPUT_TYPE_LATEST:-}" = "adapter" ]; then
-            _resolved_kind="lora_adapter"
-        fi
-    elif [ -n "${from_registry}" ] && [ -n "${version_line:-}" ]; then
-        # The registered version carries mlcc.artifact_kind (BL164); read it back.
-        _resolved_kind=$(echo "${version_line}" | python3 -c "
-import sys, json
-try:
-    d = json.loads(sys.stdin.read())
-    md = d.get('customer_metadata_properties') or d.get('metadata') or {}
-    print(md.get('mlcc.artifact_kind', '') or md.get('artifact_kind', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
+    # ── ADR-013 artifact-kind gate (BL164 R4) for the remaining sources ────
+    # --from-tune/--from-train/--from-registry were already gated right after
+    # they resolved (before any staging). --from-weights and --from-hub carry no
+    # recorded kind → the gate degrades (unknown) and the adapter_config.json
+    # content check below (_validate_adapter_config / _download_from_hub) applies.
+    if [ -z "${from_tune}" ] && [ -z "${from_train}" ] && [ -z "${from_registry}" ]; then
+        _guard_artifact_kind "" "$(_additive_accepts_kind adapter)" "${_kind_guidance}"
     fi
-    _guard_artifact_kind "${_resolved_kind}" "lora_adapter" \
-        "A full fine-tuned model cannot be hot-loaded as a LoRA adapter — use do/add-ic (realtime) or do/add-pod (cluster)."
 
     echo "🔌 Adding adapter: ${adapter_name}"
     if [ -n "${from_hub}" ]; then
@@ -1533,8 +1551,12 @@ except Exception:
 
     # ── If --from-hub: download, tar, upload to S3 ────────────────────────
     if [ -n "${from_hub}" ]; then
-        _download_from_hub "${from_hub}" "${adapter_name}"
-        # weights_uri is now set by _download_from_hub
+        # Shared resolver → the existing _download_from_hub (stage to S3).
+        local _hub_resolved
+        _hub_resolved=$(_resolve_additive_source from-hub "${from_hub}" "${adapter_name}") || exit 1
+        local RESOLVED_SOURCE="" RESOLVED_URI="" RESOLVED_KIND=""
+        eval "${_hub_resolved}"
+        weights_uri="${RESOLVED_URI}"
         echo ""
     fi
 
@@ -1556,7 +1578,7 @@ except Exception:
     fi
     echo "✅ Base IC is InService: ${base_ic_name}"
 
-    # ── Validate S3 object exists (best-effort, only for --weights) ──────
+    # ── Validate S3 object exists (best-effort, only for --from-weights) ──────
     if [ -z "${from_hub}" ]; then
         echo "🔍 Checking S3 object exists..."
         if ! aws s3 ls "${weights_uri}" --region "${AWS_REGION}" &>/dev/null; then
@@ -1586,18 +1608,9 @@ except Exception:
             _compat_parent_arn="${MODEL_PKG_ARN}"
         fi
     elif [ -n "${from_registry}" ] && [ -n "${version_line:-}" ]; then
-        _compat_parent_arn=$(echo "${version_line}" | python3 -c "
-import sys, json
-data = json.loads(sys.stdin.read())
-metadata = data.get('metadata', {})
-print(metadata.get('parentModelVersionArn', ''))
-" 2>/dev/null || echo "")
-        _compat_parent_slug=$(echo "${version_line}" | python3 -c "
-import sys, json
-data = json.loads(sys.stdin.read())
-metadata = data.get('metadata', {})
-print(metadata.get('modelName', ''))
-" 2>/dev/null || echo "")
+        # Parent metadata was parsed once by the shared resolver (RESOLVED_META_*).
+        _compat_parent_arn="${RESOLVED_META_PARENT_ARN:-}"
+        _compat_parent_slug="${RESOLVED_META_MODEL_NAME:-}"
     fi
 
     if [ -z "${_compat_parent_arn}" ] && [ -z "${_compat_parent_slug}" ]; then
@@ -1770,18 +1783,9 @@ EOF
         local parent_model_arn=""
         local parent_model_slug=""
         if [ -n "${version_line:-}" ]; then
-            parent_model_arn=$(echo "${version_line}" | python3 -c "
-import sys, json
-data = json.loads(sys.stdin.read())
-metadata = data.get('metadata', {})
-print(metadata.get('parentModelVersionArn', ''))
-" 2>/dev/null || echo "")
-            parent_model_slug=$(echo "${version_line}" | python3 -c "
-import sys, json
-data = json.loads(sys.stdin.read())
-metadata = data.get('metadata', {})
-print(metadata.get('modelName', ''))
-" 2>/dev/null || echo "")
+            # Parsed once by the shared resolver (RESOLVED_META_*).
+            parent_model_arn="${RESOLVED_META_PARENT_ARN:-}"
+            parent_model_slug="${RESOLVED_META_MODEL_NAME:-}"
         fi
 
         if [ -n "${parent_model_arn}" ] || [ -n "${parent_model_slug}" ]; then
@@ -1929,7 +1933,7 @@ if os.path.exists(helper_path):
 if not adapters:
     print("No adapters found.")
     print("")
-    print("Add one with: ./do/adapter add <name> --weights <s3-uri>")
+    print("Add one with: ./do/adapter add <name> --from-weights <s3-uri>")
     print("              ./do/adapter add <name> --from-hub <hf-repo-id>")
     print("              ./do/adapter add <name> --from-registry")
     sys.exit(0)
@@ -1952,7 +1956,7 @@ for name in sorted(adapters):
     print(fmt.format(name, a["source"], a["status"], tune_info))
 
 print("")
-print("Add adapter:      ./do/adapter add <name> --weights <s3-uri>")
+print("Add adapter:      ./do/adapter add <name> --from-weights <s3-uri>")
 print("From registry:    ./do/adapter add <name> --from-registry [version-arn]")
 ADAPTER_LIST_PY
 }
@@ -2096,10 +2100,12 @@ _adapter_update() {
     shift  # remove 'update' from args
     while [ $# -gt 0 ]; do
         case "$1" in
-            --weights)
+            --from-weights|--weights)
+                # --weights is the DEPRECATED alias of --from-weights (ADR-013 / R2).
+                [ "$1" = "--weights" ] && _deprecated_flag_alias --weights --from-weights
                 if [ -z "${2:-}" ]; then
-                    echo "❌ --weights requires an S3 URI argument"
-                    echo "   Usage: ./do/adapter update <name> --weights <new-s3-uri>"
+                    echo "❌ $1 requires an S3 URI argument"
+                    echo "   Usage: ./do/adapter update <name> --from-weights <new-s3-uri>"
                     exit 1
                 fi
                 weights_uri="$2"
@@ -2115,26 +2121,27 @@ _adapter_update() {
                 shift 2
                 ;;
             --help|-h)
-                echo "Usage: ./do/adapter update <name> --weights <new-s3-uri>"
+                echo "Usage: ./do/adapter update <name> --from-weights <new-s3-uri>"
                 echo "       ./do/adapter update <name> --from-hub <hf-repo-id>"
                 echo ""
                 echo "Update the weights of an existing LoRA adapter."
                 echo ""
                 echo "Arguments:"
                 echo "  <name>                    Adapter name to update"
-                echo "  --weights <new-s3-uri>    New S3 URI to adapter weights (.tar.gz)"
+                echo "  --from-weights <new-s3-uri>  New S3 URI to adapter weights (.tar.gz)"
+                echo "                            (--weights is a deprecated alias)"
                 echo "  --from-hub <hf-repo-id>   Download new weights from HuggingFace Hub"
                 echo ""
-                echo "Note: --weights and --from-hub are mutually exclusive."
+                echo "Note: --from-weights and --from-hub are mutually exclusive."
                 echo ""
                 echo "Examples:"
-                echo "  ./do/adapter update ectsum --weights s3://bucket/adapters/ectsum-v2/adapter.tar.gz"
+                echo "  ./do/adapter update ectsum --from-weights s3://bucket/adapters/ectsum-v2/adapter.tar.gz"
                 echo "  ./do/adapter update ectsum --from-hub predibase/llama-3.1-8b-ectsum-v2"
                 exit 0
                 ;;
             -*)
                 echo "❌ Unknown option: $1"
-                echo "   Usage: ./do/adapter update <name> --weights <new-s3-uri>"
+                echo "   Usage: ./do/adapter update <name> --from-weights <new-s3-uri>"
                 echo "          ./do/adapter update <name> --from-hub <hf-repo-id>"
                 exit 1
                 ;;
@@ -2143,7 +2150,7 @@ _adapter_update() {
                     adapter_name="$1"
                 else
                     echo "❌ Unexpected argument: $1"
-                    echo "   Usage: ./do/adapter update <name> --weights <new-s3-uri>"
+                    echo "   Usage: ./do/adapter update <name> --from-weights <new-s3-uri>"
                     echo "          ./do/adapter update <name> --from-hub <hf-repo-id>"
                     exit 1
                 fi
@@ -2155,24 +2162,24 @@ _adapter_update() {
     # Validate required arguments
     if [ -z "${adapter_name}" ]; then
         echo "❌ Adapter name is required"
-        echo "   Usage: ./do/adapter update <name> --weights <new-s3-uri>"
+        echo "   Usage: ./do/adapter update <name> --from-weights <new-s3-uri>"
         echo "          ./do/adapter update <name> --from-hub <hf-repo-id>"
         exit 1
     fi
 
     # ── Mutual exclusivity check ─────────────────────────────────────────
     if [ -n "${weights_uri}" ] && [ -n "${from_hub}" ]; then
-        echo "❌ --weights and --from-hub are mutually exclusive"
+        echo "❌ --from-weights and --from-hub are mutually exclusive"
         echo ""
         echo "   Use one or the other:"
-        echo "   ./do/adapter update ${adapter_name} --weights <s3-uri>"
+        echo "   ./do/adapter update ${adapter_name} --from-weights <s3-uri>"
         echo "   ./do/adapter update ${adapter_name} --from-hub <hf-repo-id>"
         exit 1
     fi
 
     if [ -z "${weights_uri}" ] && [ -z "${from_hub}" ]; then
-        echo "❌ Either --weights or --from-hub is required"
-        echo "   Usage: ./do/adapter update <name> --weights <new-s3-uri>"
+        echo "❌ Either --from-weights or --from-hub is required"
+        echo "   Usage: ./do/adapter update <name> --from-weights <new-s3-uri>"
         echo "          ./do/adapter update <name> --from-hub <hf-repo-id>"
         exit 1
     fi
@@ -2188,7 +2195,7 @@ _adapter_update() {
         fi
     fi
 
-    # ── Validate S3 URI format (only when --weights is used) ─────────────
+    # ── Validate S3 URI format (only when --from-weights is used) ─────────────
     if [ -n "${weights_uri}" ]; then
         if ! echo "${weights_uri}" | grep -qE '^s3://.*\.tar\.gz$'; then
             echo "❌ Invalid S3 URI: ${weights_uri}"
@@ -2242,8 +2249,12 @@ _adapter_update() {
 
     # ── If --from-hub: download, tar, upload to S3 ────────────────────────
     if [ -n "${from_hub}" ]; then
-        _download_from_hub "${from_hub}" "${adapter_name}"
-        # weights_uri is now set by _download_from_hub
+        # Shared resolver → the existing _download_from_hub (stage to S3).
+        local _hub_resolved
+        _hub_resolved=$(_resolve_additive_source from-hub "${from_hub}" "${adapter_name}") || exit 1
+        local RESOLVED_SOURCE="" RESOLVED_URI="" RESOLVED_KIND=""
+        eval "${_hub_resolved}"
+        weights_uri="${RESOLVED_URI}"
         echo ""
     fi
 

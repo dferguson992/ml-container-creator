@@ -78,6 +78,9 @@ function dispatchBlock(body) {
     return body.slice(start);
 }
 
+// Wave 6 / BL165: every lora_vllm.py call goes through _lora_helper_call, which
+// forwards its args verbatim ("$@") and surfaces the helper's stderr on a crash.
+const LORA_HELPER_CALL_RE = /python3 "\$\{SCRIPT_DIR\}\/lib\/python\/lora_vllm\.py" "\$@"/;
 // Generators for adapter names and S3 weights URIs.
 const adapterNameArb = fc.stringMatching(/^[a-z][a-z0-9-]{1,30}$/);
 const s3UriArb = fc
@@ -112,7 +115,8 @@ describe('Feature: v18-w4-01-bl112 — do/adapter hyperpod-eks verb routing', ()
                     'ACTION=load must invoke the load helper with name + weights'
                 );
                 assert.ok(
-                    /lora_vllm\.py" load "\$\{_name\}" "\$\{_uri\}" "\$\{BASE_URL\}"/.test(dispatch),
+                    /_lora_helper_call RESULT load "\$\{_name\}" "\$\{_uri\}" "\$\{BASE_URL\}"/.test(dispatch) &&
+                        LORA_HELPER_CALL_RE.test(dispatch),
                     'load helper must call lora_vllm.py load <name> <uri> <base_url>'
                 );
 
@@ -146,7 +150,8 @@ describe('Feature: v18-w4-01-bl112 — do/adapter hyperpod-eks verb routing', ()
                     'ACTION=unload must invoke the unload helper'
                 );
                 assert.ok(
-                    /lora_vllm\.py" unload "\$\{_name\}" "\$\{BASE_URL\}"/.test(dispatch),
+                    /_lora_helper_call RESULT unload "\$\{_name\}" "\$\{BASE_URL\}"/.test(dispatch) &&
+                        LORA_HELPER_CALL_RE.test(dispatch),
                     'unload helper must call lora_vllm.py unload <name> <base_url>'
                 );
 
@@ -172,7 +177,8 @@ describe('Feature: v18-w4-01-bl112 — do/adapter hyperpod-eks verb routing', ()
 
                 assert.ok(/list\)\s*\n\s*ACTION="list"/.test(router), 'list must map to ACTION=list');
                 assert.ok(
-                    /lora_vllm\.py" list "\$\{BASE_URL\}"/.test(dispatch),
+                    /_lora_helper_call RESULT list "\$\{BASE_URL\}"/.test(dispatch) &&
+                        LORA_HELPER_CALL_RE.test(dispatch),
                     'ACTION=list must call lora_vllm.py list <base_url>'
                 );
                 // Client GETs /v1/models and filters out the base model.

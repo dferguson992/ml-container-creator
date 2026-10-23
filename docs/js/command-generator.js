@@ -195,7 +195,9 @@
             if (!ic.model) return;
             lines.push(`# === Additional IC ${i + 1}: ${ic.model} ===`);
             let icCmd = `./do/add-ic ic-${i + 2}`;
-            if (ic.modelData) icCmd += ` --model-data=${ic.modelData}`;
+            // ADR-013 uniform --from-* surface (--model-data is a deprecated alias,
+            // and do/add-ic never accepted the --flag=value form).
+            if (ic.modelData) icCmd += ` --from-weights ${ic.modelData}`;
             lines.push(icCmd);
             lines.push('');
             // IC config overrides
