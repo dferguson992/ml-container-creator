@@ -6,11 +6,34 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Status
 
-Proposed (v2.0). States the contract the additive-deploy verbs (`do/adapter`, `do/add-ic`, and the
-future `do/add-pod`) SHALL converge on. Implemented incrementally by the framing epic (a separate
-v2.0 release candidate, NOT Wave 5) over BL164, BL169, BL149; depends on BL164's `artifact_kind`
-recording. This ADR is the source of truth those items derive from; it is NOT itself a Wave-5
-deliverable.
+Accepted (v2.0, Wave 6). States the contract the additive-deploy verbs (`do/adapter`, `do/add-ic`, and the
+future `do/add-pod`) SHALL converge on. Implemented incrementally by the framing epic (BL170) over BL164,
+BL169, BL149; depends on BL164's `artifact_kind` recording. This ADR is the source of truth those items
+derive from.
+
+**Wave 6 implementation (accepted).** Axes 1–3 are implemented for `do/adapter` (SMAI and Kubernetes
+paths) and `do/add-ic`, all in `templates/do/lib/script-contract.sh`:
+
+- **Axis 1 (source):** one shared resolver, `_resolve_additive_source`, for `--from-weights` /
+  `--from-tune` / `--from-train` / `--from-registry` / `--from-hub`, target-uniform. It shells out to the
+  existing helpers (`.register_helper.py get-version`, `_download_from_hub`) rather than reimplementing
+  them. `--weights` (`do/adapter`) and `--model-data` (`do/add-ic`, `ic_update.py`) remain as deprecated
+  aliases of `--from-weights`; `do/register --model-data-url` is unrelated and unchanged.
+- **Axis 2 (kind):** `_guard_artifact_kind` reads each verb's accepted kinds from the declared contract
+  (`_additive_verb_kinds`); unknown kinds degrade to an advisory content check.
+- **Axis 3 (target → mechanism):** `_additive_verb_mechanisms` ∩ `_additive_target_mechanisms`; the legal
+  verb×target matrix is derived by `_additive_verb_supported_on`, never hand-listed. `do/adapter
+  --from-tune` (and every other source) now hot-loads onto `hyperpod-eks`/`eks` (BL169).
+- The contract is expressed as bash-3.2-safe `case` lookup functions (no `declare -A`), because every
+  do/ script sources `script-contract.sh` under macOS's stock `/bin/bash` 3.2. Drift is guarded by
+  `test/unit/additive-deploy-contract.test.js` (derivation ↔ target descriptors ↔ script headers ↔ the
+  real scripts' behavior).
+
+**Deferred:** the axis-3 `pod-apply` mechanism — `do/add-pod` (BL149), `full_model` on
+`{hyperpod-eks, eks}` — is deferred to the cluster cohort. Its contract arms are present but commented;
+until it lands, a full model on a cluster is refused honestly ("not servable on this target yet") with a
+pointer to `realtime-inference` + `do/add-ic`. `do/add-ic --from-registry` landed as part of Wave 6
+(it was a stretch item).
 
 ## Context
 

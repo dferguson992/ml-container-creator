@@ -233,6 +233,11 @@ describe('target-descriptor conformance (ADR-008 T3 — safety net)', () => {
         };
 
         for (const [verb, script] of Object.entries(verbScript)) {
+            // Additive-deploy verbs (do/adapter, do/add-ic) gate through the DERIVED
+            // ADR-013 contract (_additive_verb_supported_on), not a _restrict_targets
+            // literal. Their agreement with descriptor.verbs is asserted behaviorally
+            // — every verb × every descriptor target — in additive-deploy-contract.test.js.
+            if (new RegExp(`_additive_verb_supported_on ${verb} `).test(script)) continue;
             // Extract the _restrict_targets allow-list (first occurrence).
             const m = script.match(/_restrict_targets\s+"([^"]+)"/);
             const allow = m ? m[1].split(',').map(s => s.trim()) : [];

@@ -2065,15 +2065,15 @@ ADAPTER_CONF
         if [ -n "${dataset_slug}" ]; then
             echo "     ./do/adapter add tuned-${ARG_TECHNIQUE}-${dataset_slug} --from-tune ${ARG_TECHNIQUE}-${dataset_slug}"
         fi
-        echo "     ./do/adapter add tuned-${ARG_TECHNIQUE} --weights ${artifact_path}"
+        echo "     ./do/adapter add tuned-${ARG_TECHNIQUE} --from-weights ${artifact_path}"
         echo ""
     else
         echo "📋 Next steps:"
         echo ""
         echo "   Deploy as new inference component:"
         echo "     ./do/add-ic tuned-v1 --from-tune"
-        echo "     ./do/add-ic tuned-v1 --model-data ${artifact_path}"
-        echo "     ./do/deploy --force-ic --model-data ${artifact_path}"
+        echo "     ./do/add-ic tuned-v1 --from-weights ${artifact_path}"
+        echo "     ./do/add-ic default --update --from-weights ${artifact_path}   # swap the base IC in place"
         echo ""
     fi
 }

@@ -481,7 +481,7 @@ cells.append(make_markdown_cell([
     "To add another adapter, duplicate this section with a different `ADAPTER_NAME` and\n",
     "`ADAPTER_WEIGHTS_URI`. Each adapter shares the base IC's GPU resources.\n",
     "\n",
-    "The CLI equivalent is: `./do/adapter add <name> --weights <s3-uri>`\n"
+    "The CLI equivalent is: `./do/adapter add <name> --from-weights <s3-uri>`\n"
 ]))
 <% } %>
 <% if (tuneSupported) { %>

@@ -1050,7 +1050,7 @@ echo "   • Test your endpoint:         ./do/test"
 echo "   • Benchmark performance:      ./do/benchmark"
 <% } %>
 <% if (typeof enableLora !== 'undefined' && enableLora) { %>
-echo "   • Add a LoRA adapter:         ./do/adapter add <name> --weights s3://..."
+echo "   • Add a LoRA adapter:         ./do/adapter add <name> --from-weights s3://..."
 <% } %>
 echo "   • View endpoint status:       ./do/status"
 echo "   • Register this deployment:   ./do/register"
