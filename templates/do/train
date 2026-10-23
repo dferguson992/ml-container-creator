@@ -509,8 +509,12 @@ _resolve_dataset() {
 
     # Persist resolved URI
     if [ -n "${RESOLVED_DATASET_S3_URI}" ]; then
+        # Same key form the readers use (_additive_upper in script-contract.sh:
+        # uppercase, hyphens -> underscores). A raw uppercase would write e.g.
+        # TRAIN_DATASET_S3_URI_SFT-NEFTUNE, which is not a valid shell name and makes
+        # do/config unsourceable for every do/ script.
         local technique_upper
-        technique_upper=$(echo "${TECHNIQUE}" | tr '[:lower:]' '[:upper:]')
+        technique_upper=$(_additive_upper "${TECHNIQUE}")
         _update_config_var "TRAIN_DATASET_S3_URI_${technique_upper}" "${RESOLVED_DATASET_S3_URI}"
     fi
 }
@@ -1408,8 +1412,9 @@ print(artifacts.get('S3ModelArtifacts', ''))
     _update_config_var "TRAIN_JOB_NAME" "${job_name}"
 
     # Write technique-specific adapter path
+    # Key form shared with the --from-train reader (_additive_upper, script-contract.sh).
     local technique_upper
-    technique_upper=$(echo "${TECHNIQUE:-custom}" | tr '[:lower:]' '[:upper:]')
+    technique_upper=$(_additive_upper "${TECHNIQUE:-custom}")
     _update_config_var "TRAIN_ADAPTER_PATH_${technique_upper}" "${output_path}"
     _update_config_var "TRAIN_TECHNIQUE" "${TECHNIQUE:-custom}"
 

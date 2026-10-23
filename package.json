@@ -87,6 +87,8 @@
     "NOTICE",
     "requirements.txt",
     "pyproject.toml",
+    "examples/train-plugins/",
+    "!examples/**/__pycache__/",
     "docs/**/*.md",
     "!docs/dev/*-pr-summary.md",
     "!docs/dev/*-pr-description.md",

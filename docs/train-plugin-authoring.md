@@ -6,7 +6,9 @@ the technique also gets a typed, tiered, validated hyperparameter UI built on th
 config-builder core that powers `do/tune`.
 
 See [Custom Training](custom-training.md) for the job-level workflow (datasets,
-instances, lifecycle). This page covers the technique plugin surface.
+instances, lifecycle). This page is the reference for the technique plugin surface.
+New to it? Start with the [walkthrough](train-plugin-walkthrough.md), which adds the
+`sft-neftune` sample (`examples/train-plugins/sft-neftune/`) to a project step by step.
 
 ---
 

@@ -44,6 +44,16 @@ def _bash():
     return "/bin/bash" if os.path.exists("/bin/bash") else shutil.which("bash")
 
 
+def _real_contract_function(name):
+    """The real definition of a small helper from script-contract.sh (not a copy), so
+    the sandbox stub uses the same config-var key form as a generated project."""
+    import re
+    text = open(os.path.join(_DO, "lib", "script-contract.sh")).read()
+    m = re.search(r"^" + re.escape(name) + r"\(\) \{\n.*?^\}\n", text, re.M | re.S)
+    assert m, f"{name} not found in script-contract.sh"
+    return m.group(0)
+
+
 @pytest.fixture
 def sandbox(tmp_path):
     do = tmp_path / "do"
@@ -55,7 +65,8 @@ def sandbox(tmp_path):
     for m in _LIB_MODULES:
         shutil.copy2(os.path.join(_DO, "lib", "python", m), lib / "python" / m)
     shutil.copytree(os.path.join(_DO, "training"), do / "training")
-    (lib / "script-contract.sh").write_text("_require_python_env(){ :; }\n_require_guard(){ :; }\n")
+    (lib / "script-contract.sh").write_text("_require_python_env(){ :; }\n_require_guard(){ :; }\n"
+                                            + _real_contract_function("_additive_upper"))
     (lib / "profile.sh").write_text(":\n")
     (lib / "resolve-instance.sh").write_text(":\n")
     (do / "config").write_text('PROJECT_NAME="p"\nAWS_REGION="us-west-2"\n'
@@ -217,3 +228,26 @@ def test_plain_run_on_a_tty_never_prompts(sandbox):
     assert r.returncode == 0, r.stderr
     assert "(prompt)" not in r.stderr
     assert "no TTY" not in r.stderr
+
+
+def test_hyphenated_technique_keeps_do_config_sourceable(sandbox):
+    """A technique named with a hyphen (allowed by the manifest schema) must not write an
+    invalid shell identifier into do/config. Regression: TRAIN_DATASET_S3_URI_SFT-NEFTUNE
+    made do/config unsourceable, so the NEXT do/ command failed."""
+    shutil.copytree(sandbox.root / "training" / "sft", sandbox.root / "training" / "my-tech")
+    manifest = sandbox.root / "training" / "my-tech" / "manifest.json"
+    data = json.loads(manifest.read_text())
+    data["technique"] = "my-tech"
+    manifest.write_text(json.dumps(data))
+    sandbox.config("my-tech")
+    first = sandbox.run("--dry-run")
+    assert first.returncode == 0, first.stdout + first.stderr
+    second = sandbox.run("--dry-run")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "not a valid identifier" not in first.stderr + second.stderr
+    config = (sandbox.root / "config").read_text()
+    assert "TRAIN_DATASET_S3_URI_MY_TECH=" in config
+    assert "MY-TECH" not in config
+    r = subprocess.run([_bash(), "-c", f'set -e; source "{sandbox.root / "config"}"; echo ok'],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and "ok" in r.stdout, r.stderr

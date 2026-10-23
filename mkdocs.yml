@@ -64,6 +64,7 @@ nav:
       - Fine-Tuning: fine-tuning.md
       - Custom Training: custom-training.md
       - Authoring do/train Techniques: train-plugin-authoring.md
+      - "Walkthrough: Add Your Own Technique": train-plugin-walkthrough.md
       - Agent UX: agent.md
       - Examples: EXAMPLES.md
       - Troubleshooting: TROUBLESHOOTING.md
