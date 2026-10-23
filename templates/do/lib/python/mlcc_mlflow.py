@@ -1000,6 +1000,8 @@ def list_dataset_inputs(client=None, experiment_ids=None, project_name=None,
                         if tag_dict.get(TAG_DELETED) == "true":
                             continue
                         full_runs.append(full)
+                    except (NameError, AttributeError):
+                        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
                     except Exception:
                         full_runs.append(run)  # fallback to summary on error
                 else:
@@ -1150,6 +1152,8 @@ def tag_dataset_runs_deleted(name, client=None, project_name=None, all_projects=
                 ds = getattr(di, 'dataset', None)
                 if ds and getattr(ds, 'name', '') == name:
                     _client.set_tag(run_id, TAG_DELETED, "true")
+    except (NameError, AttributeError):
+        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
     except Exception:  # noqa: BLE001 — best-effort
         pass
 

@@ -208,6 +208,8 @@ def _get_account_id():
         import boto3
         sts = boto3.client("sts")
         return sts.get_caller_identity()["Account"]
+    except (NameError, AttributeError):
+        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
     except Exception:
         return "unknown"
 
@@ -264,6 +266,8 @@ def cmd_create_mpg(args):
                 mpg = ModelPackageGroup.get(model_package_group_name=project_name)
                 mpg_arn = mpg.model_package_group_arn
                 _output({"mpg_arn": mpg_arn, "created": False})
+            except (NameError, AttributeError):
+                raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
             except Exception:
                 account_id = _get_account_id()
                 mpg_arn = f"arn:aws:sagemaker:{region}:{account_id}:model-package-group/{project_name}"
@@ -305,6 +309,8 @@ def cmd_register_model(args):
             try:
                 mpg = ModelPackageGroup.get(model_package_group_name=project_name)
                 mpg_arn = mpg.model_package_group_arn
+            except (NameError, AttributeError):
+                raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
             except Exception:
                 account_id = _get_account_id()
                 mpg_arn = f"arn:aws:sagemaker:{region}:{account_id}:model-package-group/{project_name}"
@@ -492,6 +498,8 @@ def cmd_register_adapter(args):
             try:
                 mpg = ModelPackageGroup.get(model_package_group_name=project_name)
                 mpg_arn = mpg.model_package_group_arn
+            except (NameError, AttributeError):
+                raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
             except Exception:
                 account_id = _get_account_id()
                 mpg_arn = f"arn:aws:sagemaker:{region}:{account_id}:model-package-group/{project_name}"
@@ -550,6 +558,8 @@ def cmd_register_adapter(args):
                                     dataset_s3_uri=_dataset_s3_uri,
                                     dataset_name=adapter_name,
                                 )
+                except (NameError, AttributeError):
+                    raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
                 except Exception as lineage_err:  # noqa: BLE001 — lineage is best-effort
                     print(f"\u26a0\ufe0f  dataset\u2192model lineage edge skipped (non-fatal: "
                           f"{lineage_err}).", file=sys.stderr)
@@ -587,6 +597,8 @@ def cmd_register_adapter(args):
                     "parent_version_arn": parent_version_arn,
                     "deduplicated": True,
                 })
+    except (NameError, AttributeError):
+        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
     except Exception as dedup_err:
         print(f"Dedup check failed (non-fatal): {dedup_err}", file=sys.stderr)
 
@@ -651,6 +663,8 @@ def cmd_register_adapter(args):
                     derivative_source_uri=model_package_arn,
                     region=region,
                 )
+            except (NameError, AttributeError):
+                raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
             except Exception as lineage_err:  # noqa: BLE001 — lineage is best-effort
                 print(f"\u26a0\ufe0f  base\u2192derivative lineage edge skipped (non-fatal: "
                       f"{lineage_err}).", file=sys.stderr)

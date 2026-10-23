@@ -134,6 +134,8 @@ def _resolve_prefix_to_object(s3_uri, region):
 
         candidates.sort(key=lambda k: (_rank(k), k))
         return f"s3://{bucket}/{candidates[0]}"
+    except (NameError, AttributeError):
+        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
     except Exception:  # noqa: BLE001 — prefix resolution is best-effort (non-fatal)
         return None
 

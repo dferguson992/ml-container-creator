@@ -52,6 +52,29 @@ fi
 source "${SCRIPT_DIR}/lib/profile.sh"
 source "${SCRIPT_DIR}/lib/resolve-instance.sh"
 
+# ── BL165: capture-and-surface for PRIMARY operation failures ─────────────────
+# A `2>/dev/null` on a primary operation (describe the endpoint / benchmark job,
+# download results, resolve the dataset, query benchmark history) turned real
+# failures — AWS AccessDenied, expired credentials, a helper traceback — into a
+# generic message, a misleading "not found", or a silent exit under `set -e`.
+# Primary calls now capture stderr to a temp file and pass it here on failure.
+# `2>/dev/null` remains only on genuinely optional probes (existence checks,
+# process-liveness `kill -0`, pretty-print / parse-only fallbacks, the opt-in
+# Phase 2 poller), each commented with why it is safe.
+#   _bm_surface_stderr <stderr-file> [label]   (prints to stderr, removes file)
+_bm_surface_stderr() {
+    local _f="${1:-}" _label="${2:-error output}"
+    if [ -n "${_f}" ] && [ -s "${_f}" ]; then
+        echo "   ── ${_label} ──────────────────────────────────────" >&2
+        sed 's/^/   /' "${_f}" >&2
+        echo "   ─────────────────────────────────────────────────────" >&2
+    fi
+    if [ -n "${_f}" ]; then
+        rm -f "${_f}"
+    fi
+    return 0
+}
+
 # ── Phase 2 engine /metrics scrape (BL086, HyperPod EKS opt-in) ───────────────
 # BL108 upgrades the BL086 point-in-time /metrics scrape into a background
 # poller. When HP_BENCHMARK_METRICS_ENABLED=true, DEPLOYMENT_TARGET is
@@ -73,6 +96,11 @@ _PHASE2_ACTIVE=false     # true once a poller has been spawned
 # Resolves the metrics_endpoint from the engine manifest and, only if declared,
 # starts the port-forward and spawns the background poller. Always non-fatal:
 # any failure degrades to "no Phase 2 file" and returns 0.
+# BL165 (kept swallows): every `2>/dev/null` / `|| return 0` in this function and
+# in _phase2_stop_poller is intentional — Phase 2 is an OPT-IN enrichment
+# (HP_BENCHMARK_METRICS_ENABLED) whose documented contract (BL086/BL108 Req 4.1,
+# 7.x) is "silently skip, never fail the benchmark". `kill -0` calls are
+# process-liveness probes, not operations.
 _phase2_start_poller() {
     # Outer opt-in guards (subsume the BL086 gates). Silent skip if not opted in.
     if [ "${HP_BENCHMARK_METRICS_ENABLED:-false}" != "true" ]; then
@@ -297,6 +325,9 @@ _run_eks_aiperf_benchmark() {
         local KUBECONFIG_PATH="${HOME}/.kube/eks-${HP_CLUSTER_NAME}"
         local _eks_name="${HP_CLUSTER_NAME}"
         local _eks_arn
+        # Probe (kept): a plain EKS cluster is NOT a HyperPod cluster, so this
+        # describe-cluster legitimately fails; the fallback (HP_CLUSTER_NAME as the
+        # EKS name) is the expected path, and update-kubeconfig below fails loudly.
         _eks_arn=$(aws sagemaker describe-cluster \
             --cluster-name "${HP_CLUSTER_NAME}" \
             --region "${AWS_REGION}" \
@@ -319,23 +350,36 @@ _run_eks_aiperf_benchmark() {
     fi
 
     # Resolve the running serving pod by label.
-    local _EKS_POD
+    local _EKS_POD _eks_pod_err
+    # BL165: capture kubectl's stderr so an auth/connectivity error is shown
+    # instead of being reported as "no running pod".
+    _eks_pod_err="$(mktemp)"
     _EKS_POD=$(kubectl get pods -n "${HP_NAMESPACE}" \
         -l "app=${PROJECT_NAME}" \
         --field-selector=status.phase=Running \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || _EKS_POD=""
+        -o jsonpath='{.items[0].metadata.name}' 2>"${_eks_pod_err}") || _EKS_POD=""
     if [ -z "${_EKS_POD}" ]; then
         echo "❌ do/benchmark: no running pod found for app=${PROJECT_NAME} in namespace ${HP_NAMESPACE}."
         echo "   Port-forward to the serving pod cannot be established."
         echo "   Check: kubectl get pods -n ${HP_NAMESPACE} -l app=${PROJECT_NAME}"
+        _bm_surface_stderr "${_eks_pod_err}" "kubectl output"
         exit 1
     fi
+    rm -f "${_eks_pod_err}"
 
     # Derive the pod's serving port from the engine manifest (R4, ADR-008),
     # replacing the stub's hardcoded :8080. Falls back to 8080 only when the
     # manifest declares no port.
-    local _EKS_REMOTE_PORT
-    _EKS_REMOTE_PORT=$(python3 "${_sd}/lib/python/eks_aiperf.py" serving-port "${MODEL_SERVER}" 2>/dev/null) || _EKS_REMOTE_PORT=8080
+    local _EKS_REMOTE_PORT _eks_port_err
+    # BL165: eks_aiperf.py serving-port already returns the 8080 default when the
+    # manifest declares no port, so a NON-ZERO exit here is a real helper error —
+    # surface it (still falling back to 8080 so the run can proceed).
+    _eks_port_err="$(mktemp)"
+    if ! _EKS_REMOTE_PORT=$(python3 "${_sd}/lib/python/eks_aiperf.py" serving-port "${MODEL_SERVER}" 2>"${_eks_port_err}"); then
+        echo "⚠️  Could not derive the serving port from the ${MODEL_SERVER} manifest — falling back to 8080" >&2
+        _EKS_REMOTE_PORT=8080
+    fi
+    _bm_surface_stderr "${_eks_port_err}" "eks_aiperf.py serving-port output"
     [ -z "${_EKS_REMOTE_PORT}" ] && _EKS_REMOTE_PORT=8080
 
     local _EKS_LOCAL_PORT="${HP_BENCHMARK_PORT:-18080}"
@@ -344,6 +388,8 @@ _run_eks_aiperf_benchmark() {
         -n "${HP_NAMESPACE}" >/dev/null 2>&1 &
     local _EKS_PF_PID=$!
     sleep 3
+    # `kill`/`kill -0` on the port-forward PID below are liveness probes and
+    # idempotent teardown — the process may already be gone (swallow is safe).
     trap "kill ${_EKS_PF_PID} 2>/dev/null || true" EXIT
 
     # Fail fast on port-forward failure (Requirement 6.2, BL103 edge 6.1/6.2).
@@ -413,6 +459,7 @@ _run_eks_aiperf_benchmark() {
     echo "✅ AIPerf run complete — results at ${_EKS_OUTPUT_JSONL}"
 
     # Marker for the multi-level parent to find this results dir (findings §2).
+    # Best-effort hint only — the parent falls back to `ls -td` (safe swallow).
     echo "${_EKS_JOB_DIR}" > "/tmp/.mlcc-benchmark-latest-${PROJECT_NAME}" 2>/dev/null || true
 
     # ── Persist to Athena via the SHARED writer (R2, R7) ──────────────────────
@@ -655,16 +702,21 @@ if [ "${ARG_STATUS}" = true ]; then
     echo ""
     echo "   Job: ${JOB_NAME}"
 
+    # BL165: capture the describe error so "not found" vs "expired credentials"
+    # vs "AccessDenied" is visible rather than guessed.
+    _st_err="$(mktemp)"
     STATUS=$(aws sagemaker describe-ai-benchmark-job \
         --ai-benchmark-job-name "${JOB_NAME}" \
         --region "${AWS_REGION}" \
         --query 'AIBenchmarkJobStatus' \
-        --output text 2>/dev/null) || STATUS=""
+        --output text 2>"${_st_err}") || STATUS=""
 
     if [ -z "${STATUS}" ]; then
         echo "   Status: Unknown (job not found or credentials expired)"
+        _bm_surface_stderr "${_st_err}" "describe-ai-benchmark-job output"
         exit 1
     fi
+    rm -f "${_st_err}"
 
     echo "   Status: ${STATUS}"
 
@@ -673,16 +725,26 @@ if [ "${ARG_STATUS}" = true ]; then
             # Check if results already exist locally
             PROJECT_ROOT="${SCRIPT_DIR}/.."
             LOCAL_RESULTS_DIR="${PROJECT_ROOT}/benchmarks/${JOB_NAME}"
+            # `find` existence probes (here and below): a missing dir just means
+            # "not downloaded yet" — swallowing find's "No such file" is safe.
             RESULTS_JSONL=$(find "${LOCAL_RESULTS_DIR}" -name "profile_export.jsonl" -type f 2>/dev/null | head -1 || true)
 
             if [ -z "${RESULTS_JSONL}" ]; then
                 echo ""
                 echo "   📥 Downloading results..."
-                RESULTS_S3_PATH=$(aws sagemaker describe-ai-benchmark-job \
+                # BL165: this used to be `2>/dev/null` with no `||`, so a failure
+                # exited silently under `set -e`. Surface it.
+                _st_err="$(mktemp)"
+                if ! RESULTS_S3_PATH=$(aws sagemaker describe-ai-benchmark-job \
                     --ai-benchmark-job-name "${JOB_NAME}" \
                     --region "${AWS_REGION}" \
                     --query 'OutputConfig.S3OutputLocation' \
-                    --output text 2>/dev/null)
+                    --output text 2>"${_st_err}"); then
+                    echo "❌ Could not read the benchmark job's S3 output location"
+                    _bm_surface_stderr "${_st_err}" "describe-ai-benchmark-job output"
+                    exit 1
+                fi
+                rm -f "${_st_err}"
 
                 if [ -n "${RESULTS_S3_PATH}" ]; then
                     mkdir -p "${LOCAL_RESULTS_DIR}/output"
@@ -693,15 +755,23 @@ if [ "${ARG_STATUS}" = true ]; then
                     tar_file=$(find "${LOCAL_RESULTS_DIR}" -name "output.tar.gz" -type f 2>/dev/null | head -1 || true)
                     if [ -n "${tar_file}" ]; then
                         # Detect whether ALL entries share a common leading directory prefix
+                        # `tar -tzf` layout probes: only decide strip-vs-flat; a bad
+                        # archive is reported by the extraction below (safe swallow).
                         _tar_prefix_count=""
                         _tar_prefix_count=$(tar -tzf "${tar_file}" 2>/dev/null | sed 's|/.*||' | sort -u | wc -l | tr -d ' ')
                         _tar_first_dir=""
                         _tar_first_dir=$(tar -tzf "${tar_file}" 2>/dev/null | head -1)
+                        # BL165: extraction is the primary operation — surface a
+                        # failure (non-fatal, as before) instead of discarding it.
+                        _tar_err="$(mktemp)"
                         if [ "${_tar_prefix_count}" = "1" ] && echo "${_tar_first_dir}" | grep -qE '^[^/]+/$'; then
-                            tar -xzf "${tar_file}" --strip-components=1 -C "${LOCAL_RESULTS_DIR}/output/" 2>/dev/null || true
+                            tar -xzf "${tar_file}" --strip-components=1 -C "${LOCAL_RESULTS_DIR}/output/" 2>"${_tar_err}" \
+                                || echo "   ⚠️  Could not extract ${tar_file} (non-fatal)" >&2
                         else
-                            tar -xzf "${tar_file}" -C "${LOCAL_RESULTS_DIR}/output/" 2>/dev/null || true
+                            tar -xzf "${tar_file}" -C "${LOCAL_RESULTS_DIR}/output/" 2>"${_tar_err}" \
+                                || echo "   ⚠️  Could not extract ${tar_file} (non-fatal)" >&2
                         fi
+                        _bm_surface_stderr "${_tar_err}" "tar output"
                     fi
                     # Re-search after extraction
                     RESULTS_JSONL=$(find "${LOCAL_RESULTS_DIR}" -name "profile_export.jsonl" -type f 2>/dev/null | head -1 || true)
@@ -752,6 +822,8 @@ if [ "${ARG_STATUS}" = true ]; then
             echo "   Job is still running. Check again with: ./do/benchmark --status"
             ;;
         Failed)
+            # Secondary detail read (kept): the job status (primary) was already
+            # read successfully above; "unknown" is an honest fallback (safe).
             FAILURE_REASON=$(aws sagemaker describe-ai-benchmark-job \
                 --ai-benchmark-job-name "${JOB_NAME}" \
                 --region "${AWS_REGION}" \
@@ -773,6 +845,7 @@ if [ "${ARG_COMPARE_BASELINE}" = true ]; then
     # (BENCHMARK_INSTANCE_TYPE-first for HyperPod) is the authoritative source.
     source "${SCRIPT_DIR}/lib/resolve-serving-config.sh"
 
+    # Existence probes: no local results is handled explicitly below (safe).
     _LATEST_RESULTS_DIR=$(ls -td "${SCRIPT_DIR}/../benchmarks/${PROJECT_NAME}-benchmark-"* 2>/dev/null | head -1) || _LATEST_RESULTS_DIR=""
     _LATEST_JSONL=""
 
@@ -785,7 +858,9 @@ if [ "${ARG_COMPARE_BASELINE}" = true ]; then
         exit 1
     fi
 
-    # Resolve benchmark bucket from profile
+    # Resolve benchmark bucket from profile. BL165: python's stderr is NOT
+    # discarded — a corrupt profile file surfaces its parse error instead of
+    # reading as "No benchmark results bucket configured".
     _CB_BUCKET=$(python3 -c "
 import json, os
 cfg = os.path.expanduser('~/.ml-container-creator/config.json')
@@ -796,7 +871,7 @@ if os.path.exists(cfg):
     print(profiles.get(active, {}).get('ciBenchmarkResultsBucket', ''))
 else:
     print('')
-" 2>/dev/null) || _CB_BUCKET=""
+") || _CB_BUCKET=""
 
     if [ -z "${_CB_BUCKET}" ]; then
         echo "❌ No benchmark results bucket configured."
@@ -852,7 +927,8 @@ fi
 
 # ── BL101 analytics helpers ───────────────────────────────────────────────────
 # Resolve the benchmark results bucket from the active profile (shared by --peak
-# and --list). Echoes the bucket name or empty string.
+# and --list). Echoes the bucket name or empty string. BL165: stderr flows
+# through so a corrupt profile file is visible (stdout stays the bare bucket).
 _bl101_resolve_bucket() {
     python3 -c "
 import json, os
@@ -864,10 +940,12 @@ if os.path.exists(cfg):
     print(profiles.get(active, {}).get('ciBenchmarkResultsBucket', ''))
 else:
     print('')
-" 2>/dev/null || true
+" || true
 }
 
 # Echo the most-recent local profile_export.jsonl path, or empty.
+# (ls/find here and in _bl101_latest_job_name are existence probes — "no local
+# results" is an expected state handled by every caller; safe swallows.)
 _bl101_latest_jsonl() {
     local _dir
     _dir=$(ls -td "${SCRIPT_DIR}/../benchmarks/${PROJECT_NAME}-benchmark-"* 2>/dev/null | head -1) || _dir=""
@@ -910,6 +988,7 @@ fi
 if [ "${ARG_SET_BASELINE}" = true ]; then
     if [ "${ARG_SET_BASELINE_CLEAR}" = true ]; then
         _config_file="${SCRIPT_DIR}/config"
+        # grep -q key-presence probes (here and below): absent key is normal.
         if grep -q "^export BENCHMARK_PINNED_BASELINE=" "${_config_file}" 2>/dev/null; then
             sed -i.bak "/^export BENCHMARK_PINNED_BASELINE=/d" "${_config_file}"
             rm -f "${_config_file}.bak"
@@ -942,6 +1021,8 @@ if [ "${ARG_SET_BASELINE}" = true ]; then
     # user can confirm they pinned the right run — from the local jsonl.
     _SB_JSONL=$(_bl101_latest_jsonl)
     if [ -n "${_SB_JSONL}" ]; then
+        # Optional confirmation display only — the pin itself was already
+        # written above, so a summary failure cannot hide a failed operation.
         python3 "${SCRIPT_DIR}/lib/python/benchmark_gpu_metrics.py" "${_SB_JSONL}" --summary-only 2>/dev/null || true
     fi
     echo "   Use ./do/benchmark --compare-baseline to compare against it (shown as [pinned])."
@@ -1060,7 +1141,7 @@ _run_athena_recommendations() {
         return 1
     fi
 
-    # Resolve benchmark bucket from profile
+    # Resolve benchmark bucket from profile (stderr not discarded — BL165).
     local bucket
     bucket=$(python3 -c "
 import json, os
@@ -1072,7 +1153,7 @@ if os.path.exists(cfg):
     print(profiles.get(active, {}).get('ciBenchmarkResultsBucket', ''))
 else:
     print('')
-" 2>/dev/null) || bucket=""
+") || bucket=""
 
     if [ -z "$bucket" ]; then
         echo "⚠️  No benchmark results bucket configured — run 'mcc bootstrap add-module benchmark'" >&2
@@ -1101,6 +1182,7 @@ _display_recommendations() {
     local json_data="$1"
 
     local status
+    # Parse-only reads; they fail CLOSED (status "" → reported as failed below).
     status=$(echo "$json_data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null) || status=""
 
     if [ "$status" != "ok" ]; then
@@ -1184,7 +1266,12 @@ print('  Apply these changes:     ./do/benchmark --recommend --apply')
 print('  See raw recommendation:  ./do/benchmark --recommend --json')
 print('  Apply and deploy:        ./do/deploy')
 print()
-" 2>/dev/null
+" || {
+        # BL165: the renderer's stderr used to be discarded, so a render bug
+        # printed NOTHING. Its traceback now shows above; fall back to raw JSON.
+        echo "⚠️  Could not render recommendations — raw result:" >&2
+        echo "$json_data"
+    }
 }
 
 _apply_recommendations() {
@@ -1215,7 +1302,7 @@ for r in recs:
     value = r.get('recommended_value', '')
     if key and value != '':
         print(f'{key}={value}')
-" 2>/dev/null | while IFS='=' read -r key value; do
+" | while IFS='=' read -r key value; do
         if [ -n "$key" ] && [ -n "$value" ]; then
             _recommend_apply_config_change "$key" "$value"
             echo "   ✅ ${key}=${value}"
@@ -1224,6 +1311,7 @@ for r in recs:
     _APPLIED_COUNT=$?
 
     # Check if python found any recs (it exits 0 with output, or exits 0 with no-change message)
+    # Parse-only probe on JSON already validated by _display_recommendations (safe).
     if echo "$json_data" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('recommendations') else 1)" 2>/dev/null; then
         echo ""
         echo "✅ Recommendations applied to do/config"
@@ -1232,7 +1320,7 @@ for r in recs:
     else
         echo ""
         echo "ℹ️  No changes applied — current config is already optimal."
-        rm -f "${config_file}.bak" "${ic_conf}.bak" 2>/dev/null || true
+        rm -f "${config_file}.bak" "${ic_conf}.bak" 2>/dev/null || true  # cleanup; may not exist
     fi
 }
 
@@ -1267,6 +1355,7 @@ _recommend_update_or_append() {
     if [ ! -f "$file" ]; then
         return
     fi
+    # Key-presence probes (absent key → append below; safe swallow).
     if grep -q "^export ${key}=" "${file}" 2>/dev/null || grep -q "^${key}=" "${file}" 2>/dev/null; then
         sed -i.tmp "s|^export ${key}=.*|export ${key}=\"${value}\"|" "${file}"
         sed -i.tmp "s|^${key}=.*|${key}=\"${value}\"|" "${file}"
@@ -1276,9 +1365,31 @@ _recommend_update_or_append() {
     fi
 }
 
-    # Run the Athena recommendation query
+    # Run the Athena recommendation query.
+    # BL165: this was `2>/dev/null || _RECOMMEND_RESULT=""`, so EVERY failure —
+    # missing bucket/model config, Athena AccessDenied, an optimize-engine
+    # traceback — read as "No benchmark history available" with exit 0. Now a
+    # failed query surfaces its structured error + stderr and exits non-zero; a
+    # successful query still surfaces any warnings (e.g. Athena/Bedrock) it hit.
     _RECOMMEND_RESULT=""
-    _RECOMMEND_RESULT=$(_run_athena_recommendations 2>/dev/null) || _RECOMMEND_RESULT=""
+    _RECOMMEND_RC=0
+    _RECOMMEND_STDERR="$(mktemp)"
+    _RECOMMEND_RESULT=$(_run_athena_recommendations 2>"${_RECOMMEND_STDERR}") || _RECOMMEND_RC=$?
+
+    if [ "${_RECOMMEND_RC}" -ne 0 ]; then
+        _REC_ERR_JSON=$(printf '%s\n' "${_RECOMMEND_RESULT}" | grep -E '^\{' | tail -1 || true)
+        _REC_ERR_MSG=""
+        if [ -n "${_REC_ERR_JSON}" ]; then
+            # Parse-only: the raw stderr below still carries the cause (safe).
+            _REC_ERR_MSG=$(printf '%s' "${_REC_ERR_JSON}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null) || _REC_ERR_MSG=""
+        fi
+        echo "❌ Benchmark-history recommendation query failed${_REC_ERR_MSG:+: ${_REC_ERR_MSG}}" >&2
+        _bm_surface_stderr "${_RECOMMEND_STDERR}"
+        echo "   Check the benchmark results bucket (mcc bootstrap add-module benchmark)," >&2
+        echo "   Athena permissions, and MODEL_NAME / INSTANCE_TYPE in do/config." >&2
+        exit 1
+    fi
+    _bm_surface_stderr "${_RECOMMEND_STDERR}" "warnings"
 
     if [ -z "${_RECOMMEND_RESULT}" ]; then
         echo "ℹ️  No benchmark history available for recommendations."
@@ -1290,10 +1401,12 @@ _recommend_update_or_append() {
     fi
 
     # Check if it's valid JSON with status=ok
+    # Parse-only; fails CLOSED (non-JSON → status "" → reported below).
     _RECOMMEND_STATUS=$(echo "${_RECOMMEND_RESULT}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null) || _RECOMMEND_STATUS=""
 
     if [ "${_RECOMMEND_STATUS}" != "ok" ]; then
         echo "⚠️  Optimization query returned non-ok status"
+        echo "   Result: ${_RECOMMEND_RESULT}"
         echo "   Run benchmarks first: ./do/benchmark --workload <name>"
         exit 1
     fi
@@ -1327,7 +1440,9 @@ _recommend_update_or_append() {
     # Default: display recommendations
     _display_recommendations "${_RECOMMEND_RESULT}"
 
-    # AI Interpretation via Reasoning MCP server (non-blocking — skipped if unavailable)
+    # AI Interpretation via Reasoning MCP server (non-blocking — skipped if unavailable).
+    # Kept swallows: the MCP reasoning server is an OPTIONAL enrichment that is
+    # commonly not installed; its absence must not add noise or fail --recommend.
     if [ "${ARG_NO_BEDROCK}" = "false" ] && [ "${MCC_NO_BEDROCK:-0}" != "1" ] && [ -n "${_RECOMMEND_RESULT}" ]; then
         _REASONING_OUT=$(python3 "$(dirname "${BASH_SOURCE[0]}")/lib/python/mcp_client.py" \
             --server reasoning \
@@ -1358,6 +1473,8 @@ if [ -z "${ARG_WORKLOAD}" ] && [ -z "${ARG_DATASET}" ]; then
     echo ""
     # List available workloads from the MCP catalog
     _CATALOG_FOR_HELP=""
+    # Optional probes: npm / the workload catalog may legitimately be absent;
+    # this only enriches the usage error we are already exiting with.
     if command -v npm &>/dev/null; then
         _NPM_ROOT=$(npm root -g 2>/dev/null) || _NPM_ROOT=""
         if [ -n "${_NPM_ROOT}" ] && [ -f "${_NPM_ROOT}/@aws/ml-container-creator/servers/workload-picker/catalogs/workload-profiles.json" ]; then
@@ -1394,6 +1511,7 @@ if [ "${BENCHMARK_WORKLOAD}" != "manual" ]; then
     if [ -f "$(dirname "${BASH_SOURCE[0]}")/../node_modules/@aws/ml-container-creator/servers/workload-picker/catalogs/workload-profiles.json" ]; then
         _WORKLOAD_CATALOG="$(dirname "${BASH_SOURCE[0]}")/../node_modules/@aws/ml-container-creator/servers/workload-picker/catalogs/workload-profiles.json"
     elif command -v npm &>/dev/null; then
+        # Probe: npm may be absent / have no global root (catalog-not-found below).
         _NPM_ROOT=$(npm root -g 2>/dev/null) || _NPM_ROOT=""
         if [ -n "${_NPM_ROOT}" ] && [ -f "${_NPM_ROOT}/@aws/ml-container-creator/servers/workload-picker/catalogs/workload-profiles.json" ]; then
             _WORKLOAD_CATALOG="${_NPM_ROOT}/@aws/ml-container-creator/servers/workload-picker/catalogs/workload-profiles.json"
@@ -1401,6 +1519,9 @@ if [ "${BENCHMARK_WORKLOAD}" != "manual" ]; then
     fi
 
     if [ -n "${_WORKLOAD_CATALOG}" ]; then
+        # BL165: a corrupt catalog used to read as "Unknown workload" (stderr
+        # discarded). Capture and surface the parse error; fallback unchanged.
+        _WL_ERR="$(mktemp)"
         _WL_PARAMS=$(python3 -c "
 import json, sys
 with open('${_WORKLOAD_CATALOG}') as f:
@@ -1410,7 +1531,11 @@ if wl:
     print(json.dumps(wl))
 else:
     print('null')
-" 2>/dev/null) || _WL_PARAMS="null"
+" 2>"${_WL_ERR}") || {
+            echo "⚠️  Could not read workload catalog ${_WORKLOAD_CATALOG}" >&2
+            _WL_PARAMS="null"
+        }
+        _bm_surface_stderr "${_WL_ERR}" "workload catalog error"
 
         if [ "${_WL_PARAMS}" != "null" ] && [ -n "${_WL_PARAMS}" ]; then
             echo "📋 Workload profile: ${BENCHMARK_WORKLOAD}"
@@ -1439,22 +1564,28 @@ fi
 _PROFILE_JSON=""
 if command -v python3 &>/dev/null; then
     _PROFILE_JSON=$(python3 -c "
-import json, os
+import json, os, sys
 config_path = os.path.expanduser('~/.ml-container-creator/config.json')
 try:
     with open(config_path) as f:
         config = json.load(f)
     profile = config['profiles'][config['activeProfile']]
     print(json.dumps(profile))
-except:
+# BL165/R9.2: was a bare except (also swallowed NameError); narrowed to the
+# expected missing/corrupt-profile errors, and the reason is now reported.
+except (OSError, ValueError, KeyError, TypeError) as e:
+    print(f'⚠️  Could not read active profile from {config_path}: {e!r}', file=sys.stderr)
     print('{}')
-" 2>/dev/null) || _PROFILE_JSON="{}"
+") || _PROFILE_JSON="{}"
 fi
 
 # Extract benchmark-relevant profile values
 # The profile is the SOLE source of truth for bucket names — bootstrap writes
 # benchmarkS3Bucket from the CDK stack output. Do NOT reconstruct a name from a
 # convention: an empty value means bootstrap has not provisioned it (guarded below).
+# The field reads below are parse-only on _PROFILE_JSON, which is always valid
+# JSON (the profile or the "{}" fallback above, whose failure is now reported) —
+# an empty result is handled explicitly, so these swallows are safe.
 BENCHMARK_S3_OUTPUT_PATH=$(echo "${_PROFILE_JSON}" | python3 -c "
 import sys, json
 p = json.load(sys.stdin)
@@ -1479,6 +1610,7 @@ ROLE_ARN=$(echo "${_PROFILE_JSON}" | python3 -c "import sys,json; print(json.loa
 # CORE_BUCKET (mlcc-core) backs the sidecar registry — resolve it from the profile.
 CORE_BUCKET="${CORE_BUCKET:-${CODEBUILD_SOURCE_S3_BUCKET:-}}"
 if [ -z "${CORE_BUCKET}" ]; then
+    # Parse-only read on the always-valid _PROFILE_JSON (see above) — safe.
     CORE_BUCKET=$(echo "${_PROFILE_JSON}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('codebuildSourceS3Bucket', ''))" 2>/dev/null) || CORE_BUCKET=""
 fi
 
@@ -1508,15 +1640,26 @@ if [ -n "${ARG_DATASET}" ]; then
     [ -n "${CORE_BUCKET}" ] && _ds_resolve_args+=("--core-bucket" "${CORE_BUCKET}")
     [ -n "${AWS_REGION}" ] && _ds_resolve_args+=("--region" "${AWS_REGION}")
 
+    # BL165: capture the resolver's stderr (was discarded) — it distinguishes
+    # "not registered" from MLflow/S3 transport errors and helper crashes.
+    _ds_resolve_err="$(mktemp)"
+    _ds_resolve_rc=0
     _ds_resolve_result=$(python3 "${SCRIPT_DIR}/.register_helper.py" resolve-dataset \
-        "${_ds_resolve_args[@]}" 2>/dev/null) || _ds_resolve_result=""
+        "${_ds_resolve_args[@]}" 2>"${_ds_resolve_err}") || _ds_resolve_rc=$?
+    if [ "${_ds_resolve_rc}" -ne 0 ]; then
+        # Keep the structured {"error","code"} JSON line for the message below,
+        # but never treat a failed resolve's output as a resolved URI.
+        _ds_resolve_json=$(printf '%s\n' "${_ds_resolve_result}" | grep -E '^\{' | tail -1 || true)
+        _ds_resolve_result=""
+    fi
 
     if [ -n "${_ds_resolve_result}" ]; then
         # Parse s3_uri + format from the resolver JSON. custom_dataset_type comes
         # from the dataset's stored format (e.g. "jsonl"). input_file points at the
         # file within the DatasetConfig mount (/opt/ml/input/data/<channel>/<file>)
         # when the S3 URI names a specific file; a prefix URI leaves it unset so the
-        # benchmark tool discovers the file under the mount.
+        # benchmark tool discovers the file under the mount. Parse-only reads;
+        # an empty URI is reported explicitly just below (safe).
         BENCHMARK_DATASET_S3URI=$(echo "${_ds_resolve_result}" | grep -E '^\{' | tail -1 | python3 -c "import sys,json; print(json.load(sys.stdin).get('s3_uri',''))" 2>/dev/null) || BENCHMARK_DATASET_S3URI=""
         BENCHMARK_DATASET_FORMAT=$(echo "${_ds_resolve_result}" | grep -E '^\{' | tail -1 | python3 -c "import sys,json; print(json.load(sys.stdin).get('format','') or '')" 2>/dev/null) || BENCHMARK_DATASET_FORMAT=""
     fi
@@ -1524,6 +1667,10 @@ if [ -n "${ARG_DATASET}" ]; then
     if [ -z "${BENCHMARK_DATASET_S3URI}" ]; then
         echo "❌ Could not resolve dataset '${_DATASET_NAME}' from the registry."
         echo "   The dataset may not exist, or the registry helper is unavailable."
+        if [ -n "${_ds_resolve_json:-}" ]; then
+            echo "   Resolver error: ${_ds_resolve_json}"
+        fi
+        _bm_surface_stderr "${_ds_resolve_err}" "resolve-dataset output"
         echo "   Register one first: ./do/register dataset <name> ..."
         echo "   List datasets:      ./do/optimize --list-datasets"
         exit 1
@@ -1537,6 +1684,7 @@ if [ -n "${ARG_DATASET}" ]; then
         BENCHMARK_DATASET_INPUT_FILE="/opt/ml/input/data/${BENCHMARK_DATASET_CHANNEL}/${_DS_BASENAME}"
     fi
 
+    rm -f "${_ds_resolve_err}"
     echo "   Resolved to: ${BENCHMARK_DATASET_S3URI}"
     echo "   Format (custom_dataset_type): ${BENCHMARK_DATASET_FORMAT:-jsonl}"
     [ -n "${BENCHMARK_DATASET_INPUT_FILE}" ] && echo "   input_file: ${BENCHMARK_DATASET_INPUT_FILE}"
@@ -1641,6 +1789,8 @@ if [ -n "${BENCHMARK_CONCURRENCY_LEVELS:-}" ] && [ -z "${_BENCHMARK_SINGLE_LEVEL
                 # Copy results to aggregation directory — find the child's results
                 # Try the marker file first (set by child), then fall back to ls -td
                 _LATEST_JOB_DIR=""
+                # Marker / `ls -td` existence probes; a miss is handled by the
+                # -d / -f checks below (safe swallows).
                 if [ -f "/tmp/.mlcc-benchmark-latest-${PROJECT_NAME}" ]; then
                     _LATEST_JOB_DIR=$(cat "/tmp/.mlcc-benchmark-latest-${PROJECT_NAME}" 2>/dev/null)
                 fi
@@ -1849,6 +1999,7 @@ print(f'Combined {n_metrics} concurrency level results')
                 # Persist GPU metrics into the per-run output dir for traceability
                 # (the fixed sidecar is already the poller's own output — leave it).
                 if [ -n "${_ML_GPU_METRICS_FILE:-}" ] && [ -f "${_ML_GPU_METRICS_FILE}" ]; then
+                    # Optional traceability copy — the Athena write already succeeded.
                     _latest_bm_dir=$(ls -td "${SCRIPT_DIR}/../benchmarks/${BENCHMARK_JOB_NAME}" 2>/dev/null | head -1)
                     [ -n "${_latest_bm_dir}" ] && cp "${_ML_GPU_METRICS_FILE}" "${_latest_bm_dir}/output/gpu_metrics.json" 2>/dev/null || true
                 fi
@@ -1924,6 +2075,7 @@ _check_schema_registry_staleness() {
         return 0
     fi
     local last_synced
+    # Optional advisory probe (kept swallow): staleness is a hint, never a gate.
     last_synced=$(python3 -c "
 import json, sys
 from datetime import datetime, timezone
@@ -1937,7 +2089,9 @@ try:
     days = (datetime.now(timezone.utc) - synced).days
     if days > int('${threshold}'):
         print(days)
-except:
+# R9.2: narrowed from a bare except (which also hid NameError). This is an
+# OPTIONAL advisory warning, so a missing/corrupt manifest stays silent.
+except (OSError, ValueError, TypeError, AttributeError):
     pass
 " 2>/dev/null)
     if [ -n "${last_synced}" ]; then
@@ -2027,6 +2181,7 @@ _update_benchmark_var() {
     local var_value="$2"
     local config_file="${SCRIPT_DIR}/config"
 
+    # Key-presence probe: absent key → append (safe swallow).
     if grep -q "^export ${var_name}=" "${config_file}" 2>/dev/null; then
         sed -i.bak "s|^export ${var_name}=.*|export ${var_name}=\"${var_value}\"|" "${config_file}"
         rm -f "${config_file}.bak"
@@ -2041,6 +2196,9 @@ _update_benchmark_var() {
 RESUME_EXISTING=false
 
 if [ "${FORCE}" = false ] && [ -n "${BENCHMARK_JOB_NAME:-}" ]; then
+    # Existence probe (kept): a missing/undescribable prior job means "start a
+    # new one" (the `*)` arm). The NEW job's create/poll calls below surface
+    # their own errors, so nothing is hidden by swallowing here.
     EXISTING_STATUS=$(aws sagemaker describe-ai-benchmark-job \
         --ai-benchmark-job-name "${BENCHMARK_JOB_NAME}" \
         --region "${AWS_REGION}" \
@@ -2063,6 +2221,8 @@ if [ "${FORCE}" = false ] && [ -n "${BENCHMARK_JOB_NAME:-}" ]; then
             JOB_STATUS="Completed"
             ;;
         Failed|Stopped)
+            # Secondary detail read (kept): status was already read; "unknown"
+            # is an honest fallback and a new job is started regardless (safe).
             FAILURE_REASON=$(aws sagemaker describe-ai-benchmark-job \
                 --ai-benchmark-job-name "${BENCHMARK_JOB_NAME}" \
                 --region "${AWS_REGION}" \
@@ -2116,15 +2276,18 @@ if [ -z "${ENDPOINT_NAME:-}" ]; then
     exit 1
 fi
 
+_ep_err="$(mktemp)"
 ENDPOINT_STATUS=$(aws sagemaker describe-endpoint \
     --endpoint-name "${ENDPOINT_NAME}" \
     --region "${AWS_REGION}" \
     --query 'EndpointStatus' \
-    --output text 2>/dev/null) || {
+    --output text 2>"${_ep_err}") || {
     echo "❌ Failed to describe endpoint: ${ENDPOINT_NAME}"
     echo "   Check that the endpoint exists and your AWS credentials are valid."
+    _bm_surface_stderr "${_ep_err}" "describe-endpoint output"
     exit 1
 }
+rm -f "${_ep_err}"
 
 if [ "${ENDPOINT_STATUS}" != "InService" ]; then
     echo "❌ Endpoint is not InService (current status: ${ENDPOINT_STATUS})"
@@ -2138,6 +2301,9 @@ echo "✅ Endpoint is InService: ${ENDPOINT_NAME}"
 # ── Resolve actual instance type from endpoint ────────────────────────────────
 # For heterogeneous instance pools, INSTANCE_TYPE in do/config may not reflect
 # the actual provisioned instance. Query the endpoint to determine the real type.
+# Kept swallows (this whole block): instance-type resolution is a best-effort
+# chain of probes with a documented final fallback to INSTANCE_TYPE from do/config;
+# the endpoint itself was already verified InService just above.
 RESOLVED_INSTANCE_TYPE=""
 _EP_JSON=$(aws sagemaker describe-endpoint \
     --endpoint-name "${ENDPOINT_NAME}" \
@@ -2255,13 +2421,18 @@ echo "🔍 Pre-flight: Checking S3 output bucket..."
 
 BENCHMARK_S3_BUCKET=$(echo "${BENCHMARK_S3_OUTPUT_PATH}" | sed 's|s3://||' | cut -d'/' -f1)
 
-if ! aws s3api head-bucket --bucket "${BENCHMARK_S3_BUCKET}" --region "${AWS_REGION}" 2>/dev/null; then
+# BL165: head-bucket returns 403 (no access) as well as 404 (missing) — show
+# the real error so a permissions problem isn't misread as a missing bucket.
+_hb_err="$(mktemp)"
+if ! aws s3api head-bucket --bucket "${BENCHMARK_S3_BUCKET}" --region "${AWS_REGION}" 2>"${_hb_err}"; then
     echo "⚠️  Warning: S3 bucket does not exist: ${BENCHMARK_S3_BUCKET}"
     echo "   Buckets are provisioned during bootstrap. Run:"
     echo "     ml-container-creator bootstrap"
     echo "   (or verify AWS_REGION/credentials point at the right account)"
+    _bm_surface_stderr "${_hb_err}" "head-bucket output"
     exit 1
 else
+    rm -f "${_hb_err}"
     echo "✅ S3 bucket exists: ${BENCHMARK_S3_BUCKET}"
 fi
 
@@ -2281,6 +2452,8 @@ elif [ -n "${HF_TOKEN:-}" ]; then
     SECRET_NAME="ml-container-creator/${PROJECT_NAME}/hf-token"
     echo "🔐 Pre-flight: Ensuring Secrets Manager secret for HF token..."
 
+    # Existence probe: not-found → create; the create/put calls below surface
+    # their own failures (safe swallow).
     if ! aws secretsmanager describe-secret --secret-id "$SECRET_NAME" --region "$AWS_REGION" 2>/dev/null; then
         echo "   Creating Secrets Manager secret: ${SECRET_NAME}"
         aws secretsmanager create-secret \
@@ -2384,7 +2557,9 @@ if [ -n "${BENCHMARK_DATASET_S3URI}" ]; then
     DATASET_CONFIG_JSON="{\"InputDataConfig\":[{\"ChannelName\":\"${BENCHMARK_DATASET_CHANNEL:-traffic}\",\"DataSource\":{\"S3DataSource\":{\"S3Uri\":\"${BENCHMARK_DATASET_S3URI}\"}}}]}"
 fi
 
-# Workload config idempotency: reuse if params match, recreate if they differ
+# Workload config idempotency: reuse if params match, recreate if they differ.
+# Kept swallows: existence probe + parse-only normalization; any mismatch or
+# miss leads to (re)create, whose failure is reported loudly below.
 EXISTING_CONFIG_SPEC=""
 if aws sagemaker describe-ai-workload-config \
     --ai-workload-config-name "${WORKLOAD_CONFIG_NAME}" \
@@ -2514,16 +2689,19 @@ POLL_COUNT=0
 JOB_STATUS=""
 
 while [ ${POLL_COUNT} -lt ${MAX_POLL_ATTEMPTS} ]; do
+    _poll_err="$(mktemp)"
     JOB_STATUS=$(aws sagemaker describe-ai-benchmark-job \
         --ai-benchmark-job-name "${BENCHMARK_JOB_NAME}" \
         --region "${AWS_REGION}" \
         --query 'AIBenchmarkJobStatus' \
-        --output text 2>/dev/null) || {
+        --output text 2>"${_poll_err}") || {
         echo "⚠️  Failed to describe benchmark job (credentials may have expired)"
+        _bm_surface_stderr "${_poll_err}" "describe-ai-benchmark-job output"
         echo "   Re-run to check status manually:"
         echo "   aws sagemaker describe-ai-benchmark-job --ai-benchmark-job-name ${BENCHMARK_JOB_NAME} --region ${AWS_REGION}"
         exit 1
     }
+    rm -f "${_poll_err}"
 
     case "${JOB_STATUS}" in
         Completed)
@@ -2581,11 +2759,20 @@ if [ "${JOB_STATUS}" = "Completed" ]; then
     else
         echo "📥 Step 4: Downloading benchmark results..."
 
-        RESULTS_S3_PATH=$(aws sagemaker describe-ai-benchmark-job \
+        # BL165: was `2>/dev/null` with no `||` — a failure exited silently
+        # under `set -e` right after "Benchmark completed". Surface it.
+        _dl_err="$(mktemp)"
+        if ! RESULTS_S3_PATH=$(aws sagemaker describe-ai-benchmark-job \
             --ai-benchmark-job-name "${BENCHMARK_JOB_NAME}" \
             --region "${AWS_REGION}" \
             --query 'OutputConfig.S3OutputLocation' \
-            --output text 2>/dev/null)
+            --output text 2>"${_dl_err}"); then
+            echo "❌ Could not read the benchmark job's S3 output location"
+            _bm_surface_stderr "${_dl_err}" "describe-ai-benchmark-job output"
+            echo "   Retry later with: ./do/benchmark --status"
+            exit 1
+        fi
+        rm -f "${_dl_err}"
 
         # Create local benchmarks directory
         mkdir -p "${LOCAL_RESULTS_DIR}"
@@ -2600,23 +2787,33 @@ if [ "${JOB_STATUS}" = "Completed" ]; then
         # Strategy 1: Sync the entire output tree locally, then find results
         # This is the most reliable approach — handles any subdirectory structure
         echo "   Syncing results from S3..."
-        if aws s3 sync "${RESULTS_S3_PATH}" "${LOCAL_RESULTS_DIR}/" --region "${AWS_REGION}" 2>/dev/null; then
+        # BL165: surface a sync failure (still falls through to Strategy 2).
+        _sync_err="$(mktemp)"
+        if aws s3 sync "${RESULTS_S3_PATH}" "${LOCAL_RESULTS_DIR}/" --region "${AWS_REGION}" 2>"${_sync_err}"; then
+            rm -f "${_sync_err}"
             # Extract any tar.gz archives (benchmark service packages results as output.tar.gz)
+            # (`find` existence probes in this block: no match → empty, safe.)
             for ARCHIVE in $(find "${LOCAL_RESULTS_DIR}" -name "*.tar.gz" -type f 2>/dev/null); do
                 ARCHIVE_DIR=$(dirname "${ARCHIVE}")
                 # Detect whether ALL entries share a common leading directory prefix.
                 # Only strip if every entry starts with the same dir (e.g., "output/file1", "output/file2").
                 # A flat archive with mixed top-level files/dirs (e.g., "plots/", "profile_export.jsonl")
                 # must NOT be stripped.
+                # `tar -tzf` layout probes only pick strip-vs-flat (safe swallow);
+                # the extraction itself (primary) surfaces failures — BL165.
                 _TAR_PREFIX=$(tar -tzf "${ARCHIVE}" 2>/dev/null | sed 's|/.*||' | sort -u | wc -l | tr -d ' ')
                 _TAR_FIRST_DIR=$(tar -tzf "${ARCHIVE}" 2>/dev/null | head -1)
+                _tar_err="$(mktemp)"
                 if [ "${_TAR_PREFIX}" = "1" ] && echo "${_TAR_FIRST_DIR}" | grep -qE '^[^/]+/$'; then
                     # Single common leading directory (e.g., all under "output/") — strip it
-                    tar -xzf "${ARCHIVE}" --strip-components=1 -C "${ARCHIVE_DIR}" 2>/dev/null || true
+                    tar -xzf "${ARCHIVE}" --strip-components=1 -C "${ARCHIVE_DIR}" 2>"${_tar_err}" \
+                        || echo "   ⚠️  Could not extract ${ARCHIVE} (non-fatal)" >&2
                 else
                     # Flat archive — extract as-is
-                    tar -xzf "${ARCHIVE}" -C "${ARCHIVE_DIR}" 2>/dev/null || true
+                    tar -xzf "${ARCHIVE}" -C "${ARCHIVE_DIR}" 2>"${_tar_err}" \
+                        || echo "   ⚠️  Could not extract ${ARCHIVE} (non-fatal)" >&2
                 fi
+                _bm_surface_stderr "${_tar_err}" "tar output"
             done
 
             # Look for specific result files (priority: JSONL > aiperf JSON)
@@ -2637,6 +2834,9 @@ if [ "${JOB_STATUS}" = "Completed" ]; then
                 fi
                 RESULTS_DOWNLOADED=true
             fi
+        else
+            echo "   ⚠️  aws s3 sync failed — trying individual downloads" >&2
+            _bm_surface_stderr "${_sync_err}" "s3 sync output"
         fi
 
         # Strategy 2: If sync found nothing, try listing and downloading individual files
@@ -2646,24 +2846,44 @@ if [ "${JOB_STATUS}" = "Completed" ]; then
             RESULTS_BUCKET=$(echo "${RESULTS_S3_PATH}" | sed 's|s3://||' | cut -d'/' -f1)
             RESULTS_PREFIX=$(echo "${RESULTS_S3_PATH}" | sed "s|s3://${RESULTS_BUCKET}/||")
 
-            # List all objects and look for our target files
+            # List all objects and look for our target files.
+            # BL165: was `2>/dev/null` inside a pipeline with no `||` — a failure
+            # exited silently under `set -e -o pipefail`. Surface it and fall
+            # through to the "could not download" guidance below.
+            _ls_err="$(mktemp)"
             _ALL_KEYS=$(aws s3api list-objects-v2 \
                 --bucket "${RESULTS_BUCKET}" \
                 --prefix "${RESULTS_PREFIX}" \
                 --region "${AWS_REGION}" \
                 --query 'Contents[].Key' \
-                --output text 2>/dev/null | tr '\t' '\n')
+                --output text 2>"${_ls_err}" | tr '\t' '\n') || {
+                echo "   ⚠️  Could not list results under ${RESULTS_S3_PATH}" >&2
+                _ALL_KEYS=""
+            }
+            _bm_surface_stderr "${_ls_err}" "list-objects-v2 output"
 
             _JSONL_KEY=$(echo "${_ALL_KEYS}" | grep "profile_export\.jsonl$" | head -1)
             _JSON_KEY=$(echo "${_ALL_KEYS}" | grep "profile_export_aiperf\.json$" | head -1)
 
             if [ -n "${_JSONL_KEY}" ] && [ "${_JSONL_KEY}" != "None" ]; then
                 mkdir -p "$(dirname "${RESULTS_JSONL}")"
-                aws s3 cp "s3://${RESULTS_BUCKET}/${_JSONL_KEY}" "${RESULTS_JSONL}" --region "${AWS_REGION}" 2>/dev/null && RESULTS_DOWNLOADED=true
+                _cp_err="$(mktemp)"
+                if aws s3 cp "s3://${RESULTS_BUCKET}/${_JSONL_KEY}" "${RESULTS_JSONL}" --region "${AWS_REGION}" 2>"${_cp_err}"; then
+                    RESULTS_DOWNLOADED=true
+                else
+                    echo "   ⚠️  Could not download s3://${RESULTS_BUCKET}/${_JSONL_KEY}" >&2
+                fi
+                _bm_surface_stderr "${_cp_err}" "s3 cp output"
             fi
             if [ -n "${_JSON_KEY}" ] && [ "${_JSON_KEY}" != "None" ]; then
                 mkdir -p "$(dirname "${RESULTS_FILE}")"
-                aws s3 cp "s3://${RESULTS_BUCKET}/${_JSON_KEY}" "${RESULTS_FILE}" --region "${AWS_REGION}" 2>/dev/null && RESULTS_DOWNLOADED=true
+                _cp_err="$(mktemp)"
+                if aws s3 cp "s3://${RESULTS_BUCKET}/${_JSON_KEY}" "${RESULTS_FILE}" --region "${AWS_REGION}" 2>"${_cp_err}"; then
+                    RESULTS_DOWNLOADED=true
+                else
+                    echo "   ⚠️  Could not download s3://${RESULTS_BUCKET}/${_JSON_KEY}" >&2
+                fi
+                _bm_surface_stderr "${_cp_err}" "s3 cp output"
             fi
         fi
     fi
@@ -2829,6 +3049,7 @@ except Exception as e:
         echo "☁️  S3 results: ${RESULTS_S3_PATH:-${BENCHMARK_S3_OUTPUT_PATH}}"
 
         # Write marker for multi-level parent to find this results dir
+        # (best-effort hint; the parent falls back to `ls -td` — safe swallow).
         echo "${LOCAL_RESULTS_DIR}" > "/tmp/.mlcc-benchmark-latest-${PROJECT_NAME}" 2>/dev/null || true
     else
         echo "⚠️  Could not download results from S3"
@@ -2842,7 +3063,8 @@ except Exception as e:
         RESULTS_PREFIX=$(echo "${RESULTS_S3_PATH}" | sed "s|s3://${RESULTS_BUCKET}/||")
         echo "   aws s3api list-objects-v2 --bucket ${RESULTS_BUCKET} --prefix ${RESULTS_PREFIX} --region ${AWS_REGION}"
         echo ""
-        # Show what's actually there to help debug
+        # Show what's actually there to help debug (diagnostic-only listing; the
+        # failure was already reported above, and this has its own fallback text).
         echo "   Objects found at output path:"
         aws s3api list-objects-v2 \
             --bucket "${RESULTS_BUCKET}" \
@@ -2901,12 +3123,16 @@ except Exception as e:
 elif [ "${JOB_STATUS}" = "Failed" ]; then
     # Display failure reason
     echo "❌ Step 4: Benchmark job failed"
+    # BL165: was `2>/dev/null` with no `||` — a describe failure exited silently
+    # under `set -e` before the reason/debug hints. Surface it and continue.
+    _fr_err="$(mktemp)"
     FAILURE_REASON=$(aws sagemaker describe-ai-benchmark-job \
         --ai-benchmark-job-name "${BENCHMARK_JOB_NAME}" \
         --region "${AWS_REGION}" \
         --query 'FailureReason' \
-        --output text 2>/dev/null)
+        --output text 2>"${_fr_err}") || FAILURE_REASON="unknown (could not describe the job — see error output)"
     echo "   Reason: ${FAILURE_REASON}"
+    _bm_surface_stderr "${_fr_err}" "describe-ai-benchmark-job output"
     echo ""
     echo "   Debug:"
     echo "   aws sagemaker describe-ai-benchmark-job --ai-benchmark-job-name ${BENCHMARK_JOB_NAME} --region ${AWS_REGION}"
@@ -2922,23 +3148,27 @@ if [ "${CLEAN_AFTER}" = true ]; then
     echo ""
     echo "🧹 Cleaning up benchmark resources (--clean)..."
 
-    # Delete workload config
+    # Delete workload config (BL165: show WHY a delete failed, still non-fatal)
+    _cl_err="$(mktemp)"
     if aws sagemaker delete-ai-workload-config \
         --ai-workload-config-name "${WORKLOAD_CONFIG_NAME}" \
-        --region "${AWS_REGION}" 2>/dev/null; then
+        --region "${AWS_REGION}" 2>"${_cl_err}"; then
         echo "   ✓ Deleted workload config: ${WORKLOAD_CONFIG_NAME}"
     else
         echo "   ⚠️  Could not delete workload config: ${WORKLOAD_CONFIG_NAME}"
     fi
+    _bm_surface_stderr "${_cl_err}" "delete-ai-workload-config output"
 
     # Delete benchmark job (must be in terminal state)
+    _cl_err="$(mktemp)"
     if aws sagemaker delete-ai-benchmark-job \
         --ai-benchmark-job-name "${BENCHMARK_JOB_NAME}" \
-        --region "${AWS_REGION}" 2>/dev/null; then
+        --region "${AWS_REGION}" 2>"${_cl_err}"; then
         echo "   ✓ Deleted benchmark job: ${BENCHMARK_JOB_NAME}"
     else
         echo "   ⚠️  Could not delete benchmark job: ${BENCHMARK_JOB_NAME}"
     fi
+    _bm_surface_stderr "${_cl_err}" "delete-ai-benchmark-job output"
 
     echo "✅ Cleanup complete"
 fi

@@ -381,6 +381,8 @@ def cmd_list_adapters(args):
 
         _output({"adapters": adapters})
 
+    except (NameError, AttributeError):
+        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
     except Exception as e:
         error_msg = str(e).lower()
         if "does not exist" in error_msg or "not found" in error_msg:
@@ -443,6 +445,8 @@ def cmd_list_models(args):
 
         _output({"models": models})
 
+    except (NameError, AttributeError):
+        raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
     except Exception as e:
         error_msg = str(e).lower()
         if "does not exist" in error_msg or "not found" in error_msg:
