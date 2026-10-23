@@ -170,6 +170,56 @@ function buildImportTemplate(deployedTemplate, imports) {
  * @param {object} changeSet - `describe-change-set` output
  * @param {string[]} expectedLogicalIds
  */
+/**
+ * The resources CloudFormation names when it rejects an IMPORT change set because the
+ * template "modifies" resources that aren't being imported, e.g.
+ *   "You have modified resources [BenchmarkResultsTable] in your template that are not
+ *    being imported."
+ * Seen live for an UNCHANGED AWS::Glue::Table: CloudFormation re-evaluates its
+ * properties on any re-submitted template and reports them modified, which an IMPORT
+ * change set forbids. Returns [] when the error is anything else. Pure.
+ * @param {string} message
+ * @returns {string[]}
+ */
+function modifiedResourcesFromImportError(message) {
+    const m = /You have modified resources \[([^\]]*)\] in your template that are not being imported/.exec(String(message || ''));
+    return m ? m[1].split(',').map((s) => s.trim()).filter(Boolean) : [];
+}
+
+/**
+ * Guard for the fallback path (an UPDATE change set with --import-existing-resources):
+ * it must import exactly the expected buckets, and every other change must be an
+ * in-place Modify of a resource CloudFormation itself named as "modified" in the
+ * rejected IMPORT attempt. No Add, no Remove, no replacement (Replacement 'True').
+ * Pure; throws on anything else.
+ * @param {object} changeSet - `describe-change-set` output
+ * @param {string[]} expectedLogicalIds - bucket logical IDs to import
+ * @param {string[]} allowedModify - logical IDs CloudFormation named in its error
+ */
+function assertImportWithInPlaceRefresh(changeSet, expectedLogicalIds, allowedModify) {
+    const changes = (changeSet && changeSet.Changes) || [];
+    const seen = [];
+    const unexpected = [];
+    for (const c of changes) {
+        const rc = c.ResourceChange || {};
+        if (rc.Action === 'Import' && rc.ResourceType === 'AWS::S3::Bucket' && expectedLogicalIds.includes(rc.LogicalResourceId)) {
+            seen.push(rc.LogicalResourceId);
+        } else if (rc.Action === 'Modify' && allowedModify.includes(rc.LogicalResourceId) && rc.Replacement !== 'True') {
+            // in-place refresh of a resource CloudFormation reported as re-evaluated
+        } else {
+            unexpected.push(`${rc.Action || c.Type} ${rc.ResourceType || '?'} ${rc.LogicalResourceId || '?'}${rc.Replacement ? ` (replacement: ${rc.Replacement})` : ''}`);
+        }
+    }
+    const missing = expectedLogicalIds.filter((id) => !seen.includes(id));
+    if (unexpected.length > 0 || missing.length > 0) {
+        const detail = [
+            unexpected.length ? `Unexpected: ${unexpected.join('; ')}.` : '',
+            missing.length ? `Missing imports: ${missing.join(', ')}.` : ''
+        ].filter(Boolean).join(' ');
+        throw new Error(`import change set contains more than the bucket import and an in-place refresh of ${allowedModify.join(', ')} — refusing to execute. ${detail}`);
+    }
+}
+
 function assertImportOnlyChangeSet(changeSet, expectedLogicalIds) {
     const changes = (changeSet && changeSet.Changes) || [];
     const seen = [];
@@ -811,31 +861,60 @@ class CdkModuleRunner {
             fs.writeFileSync(templateFile, body.template);
             fs.writeFileSync(resourcesFile, JSON.stringify(body.resourcesToImport, null, 2));
 
-            const changeSetName = `mlcc-import-buckets-${Date.now()}`;
             const params = Object.keys(deployed.Parameters || {}).map((k) => `ParameterKey=${k},UsePreviousValue=true`);
-            try {
+            const expectedIds = imports.map((i) => i.logicalId);
+            const deleteChangeSet = (name) => {
+                try {
+                    this._aws(profile, ['cloudformation', 'delete-change-set', '--stack-name', stackName, '--change-set-name', name]);
+                } catch { /* best-effort cleanup; the original error is what matters */ }
+            };
+            const createAndDescribe = (name, typeArgs) => {
                 this._aws(profile, [
                     'cloudformation', 'create-change-set',
                     '--stack-name', stackName,
-                    '--change-set-name', changeSetName,
-                    '--change-set-type', 'IMPORT',
+                    '--change-set-name', name,
+                    ...typeArgs,
                     '--template-body', `file://${templateFile}`,
-                    '--resources-to-import', `file://${resourcesFile}`,
                     '--capabilities', 'CAPABILITY_IAM', 'CAPABILITY_NAMED_IAM', 'CAPABILITY_AUTO_EXPAND',
                     ...(params.length ? ['--parameters', ...params] : [])
                 ]);
-                this._aws(profile, ['cloudformation', 'wait', 'change-set-create-complete', '--stack-name', stackName, '--change-set-name', changeSetName]);
-                const described = JSON.parse(this._aws(profile, ['cloudformation', 'describe-change-set', '--stack-name', stackName, '--change-set-name', changeSetName, '--output', 'json']));
-                assertImportOnlyChangeSet(described, imports.map((i) => i.logicalId));
+                this._aws(profile, ['cloudformation', 'wait', 'change-set-create-complete', '--stack-name', stackName, '--change-set-name', name]);
+                return JSON.parse(this._aws(profile, ['cloudformation', 'describe-change-set', '--stack-name', stackName, '--change-set-name', name, '--output', 'json']));
+            };
+
+            // 1) Preferred: an IMPORT change set that contains ONLY the bucket import.
+            let changeSetName = `mlcc-import-buckets-${Date.now()}`;
+            let waitFor = 'stack-import-complete';
+            let refreshed = [];
+            try {
+                const described = createAndDescribe(changeSetName, ['--change-set-type', 'IMPORT', '--resources-to-import', `file://${resourcesFile}`]);
+                assertImportOnlyChangeSet(described, expectedIds);
             } catch (err) {
+                deleteChangeSet(changeSetName);
+                refreshed = modifiedResourcesFromImportError(err.message);
+                if (refreshed.length === 0) {
+                    throw new Error(`Bucket import into ${what} aborted — IMPORT change set failed or was not import-only (deleted it; nothing changed): ${err.message}`);
+                }
+                // 2) Fallback: CloudFormation rejected the import because it re-evaluates
+                // other, unchanged resources (seen for AWS::Glue::Table). Use an UPDATE
+                // change set with --import-existing-resources over the SAME template, and
+                // allow only the bucket import plus an in-place Modify of exactly the
+                // resources CloudFormation named.
+                console.log(`    ↪  CloudFormation re-evaluates ${refreshed.join(', ')} on any re-submitted template, so an import-only change set isn't possible here.`);
+                console.log('       Retrying as an update that imports the bucket and re-applies those resources unchanged (no add, remove, or replacement allowed).');
+                changeSetName = `mlcc-import-buckets-${Date.now()}`;
+                waitFor = 'stack-update-complete';
                 try {
-                    this._aws(profile, ['cloudformation', 'delete-change-set', '--stack-name', stackName, '--change-set-name', changeSetName]);
-                } catch { /* best-effort cleanup; the original error is what matters */ }
-                throw new Error(`Bucket import into ${what} aborted — IMPORT change set failed or was not import-only (deleted it; nothing changed): ${err.message}`);
+                    const described = createAndDescribe(changeSetName, ['--change-set-type', 'UPDATE', '--import-existing-resources']);
+                    assertImportWithInPlaceRefresh(described, expectedIds, refreshed);
+                } catch (err2) {
+                    deleteChangeSet(changeSetName);
+                    throw new Error(`Bucket import into ${what} aborted — neither an import-only change set nor an import with an in-place refresh of ${refreshed.join(', ')} was possible (deleted both; nothing changed): ${err2.message}`);
+                }
             }
             try {
                 this._aws(profile, ['cloudformation', 'execute-change-set', '--stack-name', stackName, '--change-set-name', changeSetName]);
-                this._aws(profile, ['cloudformation', 'wait', 'stack-import-complete', '--stack-name', stackName]);
+                this._aws(profile, ['cloudformation', 'wait', waitFor, '--stack-name', stackName]);
             } catch (err) {
                 throw new Error(`Bucket import into ${what} failed while executing change set ${changeSetName}: ${err.message}. Check the stack events, then re-run.`);
             }
@@ -2467,6 +2546,8 @@ module.exports = {
     findBucketLogicalId,
     buildImportTemplate,
     assertImportOnlyChangeSet,
+    assertImportWithInPlaceRefresh,
+    modifiedResourcesFromImportError,
     // Exported for unit testing (BL143 Group A — offline recovery state machine).
     recoverUpdateRollbackFailed,
     parseStuckResources,

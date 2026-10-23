@@ -25,7 +25,8 @@ const require = createRequire(import.meta.url);
 const runnerMod = require('../../infra/bootstrap-modules/module-runner.cjs');
 const {
     CdkModuleRunner, CdkMultiStackModuleRunner, declaredBucketsFor, planBucketAdoption,
-    findBucketLogicalId, buildImportTemplate, assertImportOnlyChangeSet
+    findBucketLogicalId, buildImportTemplate, assertImportOnlyChangeSet,
+    assertImportWithInPlaceRefresh, modifiedResourcesFromImportError
 } = runnerMod;
 
 const PROFILE = { accountId: '999988887777', awsRegion: 'eu-central-1', profileName: 'zz-p' };
@@ -170,7 +171,8 @@ describe('module-runner bucket-import helpers (R1.5)', () => {
  * buckets the stack owns; an executed IMPORT change set adds its buckets, a deploy
  * creates the stack and owns every declared bucket that was NOT adopted by reference.
  */
-function simulatedRunner({ module = 'training', stack = 'training', stackExists, owned = [], existing, failDescribe = false, profile = PROFILE }) {
+function simulatedRunner({ module = 'training', stack = 'training', stackExists, owned = [], existing, failDescribe = false, profile = PROFILE,
+    rejectImportFor = null, rejectImportWith = null, fallbackChanges = [] }) {
     const stackName = `mlcc-${profile.profileName}-${stack}`;
     const decl = declaredBucketsFor(stack, profile);
     const state = { exists: stackExists, owned: new Set(owned), lastImport: [] };
@@ -198,14 +200,29 @@ function simulatedRunner({ module = 'training', stack = 'training', stackExists,
         calls.push(args);
         const verb = args[1];
         if (verb === 'create-change-set') {
-            const file = args[args.indexOf('--resources-to-import') + 1].replace('file://', '');
-            state.lastImport = JSON.parse(readFileSync(file, 'utf8'));
+            state.lastType = args[args.indexOf('--change-set-type') + 1];
+            if (state.lastType === 'IMPORT') {
+                if (rejectImportFor) {
+                    throw new Error(`Command failed: aws cloudformation create-change-set ...\naws: [ERROR]: An error occurred (ValidationError) when calling the CreateChangeSet operation: You have modified resources [${rejectImportFor.join(', ')}] in your template that are not being imported. Update, create or delete operations cannot be executed during import operations.`);
+                }
+                if (rejectImportWith) throw new Error(rejectImportWith);
+                const file = args[args.indexOf('--resources-to-import') + 1].replace('file://', '');
+                state.lastImport = JSON.parse(readFileSync(file, 'utf8'));
+            } else {
+                // UPDATE + --import-existing-resources: the template's unowned buckets get imported.
+                const file = args[args.indexOf('--template-body') + 1].replace('file://', '');
+                const tpl = JSON.parse(readFileSync(file, 'utf8'));
+                state.lastImport = Object.entries(tpl.Resources)
+                    .filter(([, res]) => res.Type === 'AWS::S3::Bucket' && !state.owned.has(res.Properties.BucketName))
+                    .map(([id, res]) => ({ LogicalResourceId: id, ResourceIdentifier: { BucketName: res.Properties.BucketName } }));
+            }
         }
         if (verb === 'describe-change-set') {
             if (failDescribe) {
                 return JSON.stringify({ Changes: [{ Type: 'Resource', ResourceChange: { Action: 'Modify', ResourceType: 'AWS::IAM::Role', LogicalResourceId: 'Other' } }] });
             }
-            return JSON.stringify({ Changes: state.lastImport.map(i => ({ Type: 'Resource', ResourceChange: { Action: 'Import', ResourceType: 'AWS::S3::Bucket', LogicalResourceId: i.LogicalResourceId } })) });
+            const imports = state.lastImport.map(i => ({ Type: 'Resource', ResourceChange: { Action: 'Import', ResourceType: 'AWS::S3::Bucket', LogicalResourceId: i.LogicalResourceId } }));
+            return JSON.stringify({ Changes: [...imports, ...(state.lastType === 'UPDATE' ? fallbackChanges : [])] });
         }
         if (verb === 'execute-change-set') for (const i of state.lastImport) state.owned.add(i.ResourceIdentifier.BucketName);
         return '';
@@ -290,6 +307,65 @@ describe('CdkModuleRunner.provision — implicit bucket import (R1.5, stubbed AW
         assert.ok(v.includes('delete-change-set'));
         assert.ok(!v.includes('execute-change-set'));
         assert.ok(!v.includes('deploy'), 'never deploys after a failed import');
+    });
+
+    it('IMPORT rejected for a re-evaluated resource: falls back to an update that imports the bucket and refreshes only that resource', async () => {
+        const [bucket] = declaredBucketsFor('benchmark', PROFILE);
+        const { r, calls, state, verbs } = simulatedRunner({
+            module: 'benchmark', stack: 'benchmark', stackExists: true, existing: [bucket.name],
+            rejectImportFor: ['BenchmarkResultsTable'],
+            fallbackChanges: [{ ResourceChange: { Action: 'Modify', ResourceType: 'AWS::Glue::Table', LogicalResourceId: 'BenchmarkResultsTable', Replacement: 'Conditional' } }]
+        });
+        await quietlyAsync(() => r.provision(PROFILE, { forceDeploy: true }));
+        assert.deepStrictEqual(verbs(), ['create-change-set', 'delete-change-set',
+            'create-change-set', 'wait:change-set-create-complete', 'describe-change-set',
+            'execute-change-set', 'wait:stack-update-complete', 'deploy']);
+        const retry = calls.filter(c => c[1] === 'create-change-set')[1];
+        assert.strictEqual(retry[retry.indexOf('--change-set-type') + 1], 'UPDATE');
+        assert.ok(retry.includes('--import-existing-resources'));
+        assert.ok(!retry.includes('--resources-to-import'));
+        assert.ok(state.owned.has(bucket.name));
+    });
+
+    it('fallback refuses anything beyond the bucket import and an in-place refresh of the named resource', async () => {
+        const [bucket] = declaredBucketsFor('benchmark', PROFILE);
+        for (const extra of [
+            { ResourceChange: { Action: 'Modify', ResourceType: 'AWS::Glue::Table', LogicalResourceId: 'BenchmarkResultsTable', Replacement: 'True' } },
+            { ResourceChange: { Action: 'Modify', ResourceType: 'AWS::Glue::Database', LogicalResourceId: 'GlueDatabase', Replacement: 'False' } },
+            { ResourceChange: { Action: 'Add', ResourceType: 'AWS::IAM::Role', LogicalResourceId: 'NewRole' } }
+        ]) {
+            const { r, verbs } = simulatedRunner({
+                module: 'benchmark', stack: 'benchmark', stackExists: true, existing: [bucket.name],
+                rejectImportFor: ['BenchmarkResultsTable'], fallbackChanges: [extra]
+            });
+            await assert.rejects(() => quietlyAsync(() => r.provision(PROFILE, { forceDeploy: true })), /refusing to execute/);
+            const v = verbs();
+            assert.strictEqual(v.filter(x => x === 'delete-change-set').length, 2, 'both change sets deleted');
+            assert.ok(!v.includes('execute-change-set') && !v.includes('deploy'));
+        }
+    });
+
+    it('an IMPORT rejected for any other reason does not fall back', async () => {
+        const names = declaredBucketsFor('training', PROFILE).map(b => b.name);
+        const { r, verbs } = simulatedRunner({ stackExists: true, existing: names, rejectImportWith: 'ValidationError: Template format error' });
+        await assert.rejects(() => quietlyAsync(() => r.provision(PROFILE, { forceDeploy: true })), /IMPORT change set failed/);
+        assert.deepStrictEqual(verbs(), ['create-change-set', 'delete-change-set']);
+    });
+
+    it('modifiedResourcesFromImportError parses the CloudFormation message', () => {
+        const msg = 'An error occurred (ValidationError) when calling the CreateChangeSet operation: You have modified resources [BenchmarkResultsTable, Other] in your template that are not being imported. Update, create or delete operations cannot be executed during import operations.';
+        assert.deepStrictEqual(modifiedResourcesFromImportError(msg), ['BenchmarkResultsTable', 'Other']);
+        assert.deepStrictEqual(modifiedResourcesFromImportError('Template format error'), []);
+    });
+
+    it('assertImportWithInPlaceRefresh: exact imports + in-place Modify of named resources only', () => {
+        const imp = { ResourceChange: { Action: 'Import', ResourceType: 'AWS::S3::Bucket', LogicalResourceId: 'B' } };
+        const mod = (rep) => ({ ResourceChange: { Action: 'Modify', ResourceType: 'AWS::Glue::Table', LogicalResourceId: 'T', Replacement: rep } });
+        assert.doesNotThrow(() => assertImportWithInPlaceRefresh({ Changes: [imp, mod('Conditional')] }, ['B'], ['T']));
+        assert.doesNotThrow(() => assertImportWithInPlaceRefresh({ Changes: [imp, mod('False')] }, ['B'], ['T']));
+        assert.throws(() => assertImportWithInPlaceRefresh({ Changes: [imp, mod('True')] }, ['B'], ['T']), /refusing/);
+        assert.throws(() => assertImportWithInPlaceRefresh({ Changes: [imp, mod('False')] }, ['B'], ['Other']), /refusing/);
+        assert.throws(() => assertImportWithInPlaceRefresh({ Changes: [mod('False')] }, ['B'], ['T']), /Missing imports: B/);
     });
 
     it('fresh-stack path: a failed import after create aborts without the second deploy', async () => {
