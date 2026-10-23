@@ -109,6 +109,7 @@ nav:
           - do/ Scripts: architecture/do-scripts.md
           - Adding a Deployment Target: architecture/deployment-target-authoring.md
           - Module-Header Convention: architecture/module-header-convention.md
+          - S3 Buckets & Layout: architecture/s3-layout.md
       - Decision Records (ADRs):
           - ADR-001 Import Metadata Contract: adr/ADR-001-import-contract-metadata-schema.md
           - ADR-002 Consolidation Program: adr/ADR-002-consolidation-program.md

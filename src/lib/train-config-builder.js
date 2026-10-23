@@ -231,11 +231,13 @@ export async function run({ configFile, trainingDir }) {
         if (existsSync(profilePath)) {
             const profileData = JSON.parse(readFileSync(profilePath, 'utf8'));
             const activeProfile = profileData.profiles?.[profileData.activeProfile] || {};
-            const bucket = activeProfile.benchmarkS3Bucket || '';
+            // The profile's artifacts bucket (<project>/train/) — formerly, wrongly,
+            // the benchmark bucket (bucket consolidation R2.3).
+            const bucket = activeProfile.artifactsS3Bucket || '';
             if (bucket) {
                 // Derive project name from training dir (parent dir name)
                 const projectName = resolve(trainingPath, '..').split('/').pop();
-                profileOutputPath = `s3://${bucket}/${projectName}/training-output/`;
+                profileOutputPath = `s3://${bucket}/${projectName}/train/`;
             }
         }
     } catch { /* best-effort */ }

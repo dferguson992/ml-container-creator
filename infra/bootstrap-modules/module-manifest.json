@@ -8,7 +8,7 @@
       "required": true,
       "depends": [],
       "stackNameSuffix": "core",
-      "exports": ["RoleArn", "EcrRepositoryName", "EcrRepositoryUri"],
+      "exports": ["RoleArn", "EcrRepositoryName", "EcrRepositoryUri", "ModelsBucket"],
       "resourceLevel": "account"
     },
     "benchmark": {
@@ -34,12 +34,12 @@
     },
     "training": {
       "displayName": "Training Infrastructure",
-      "description": "Training data bucket + execution role + MLflow experiment tracking",
+      "description": "Artifacts bucket (tune/train/optimize output + MLflow store) + legacy training/adapters buckets + reward-Lambda role + MLflow experiment tracking",
       "estimatedMonthlyCost": "$2",
       "required": false,
       "depends": ["core"],
       "stackNameSuffix": "training",
-      "exports": ["TrainingBucket", "AdaptersBucket", "TrainingRoleArn", "MlflowAppArn"],
+      "exports": ["ArtifactsBucket", "TrainingBucket", "AdaptersBucket", "RewardLambdaRoleArn", "MlflowAppArn"],
       "resourceLevel": "profile"
     },
     "ci": {
@@ -49,7 +49,7 @@
       "required": false,
       "depends": ["core", "benchmark", "registry"],
       "stackNameSuffix": "ci",
-      "exports": ["CodeBuildProject", "StateMachineArn", "CiTableName"],
+      "exports": ["CodeBuildProject", "StateMachineArn", "CiTableName", "SourceBucket"],
       "resourceLevel": "profile"
     },
     "sagemaker-domain": {

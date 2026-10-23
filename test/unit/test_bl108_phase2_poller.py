@@ -327,7 +327,12 @@ class TestBenchmarkWriterUnchanged:
     # _collect_gpu_signals metrics_source provenance derivation so an eks run with
     # engine signals is labeled 'engine_metrics_only' (like hyperpod-eks) instead of
     # falling through to 'none'. Deliberate, spec-mandated writer change; pin updated.
-    _EXPECTED_SHA256 = "7dc107228273493c0beaaf466df7e33c3153271dcb32d179504c4e80129f7887"
+    #
+    # Re-pinned (bucket consolidation R2.4, owner-approved): the --dry-run preview
+    # placeholder no longer spells a convention-built bucket name
+    # (mlcc-benchmark-results-<accountId>-<region>); it now labels the profile key
+    # benchmarkS3Bucket. Display-only; real writes always pass --bucket.
+    _EXPECTED_SHA256 = "434489039597a7d981afbf7c9a5d1c5154c7c896ba1fe93b872f1ad2308c379c"
 
     def test_writer_hash_unchanged(self):
         with open(_WRITER_PATH, "rb") as f:

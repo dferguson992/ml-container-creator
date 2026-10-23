@@ -8,6 +8,9 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { KubectlV31Layer } from '@aws-cdk/lambda-layer-kubectl-v31';
 import { Construct } from 'constructs';
+import CORE_BUCKETS from '../../core/buckets.json';
+import INFERENCE_OPERATOR_BUCKETS from '../../hyperpod/stacks/buckets.json';
+import { renderBucketName } from '../../bucket-declarations';
 
 export interface MlccEksClusterStackProps extends cdk.StackProps {
     profileName: string;
@@ -52,6 +55,13 @@ export class MlccEksClusterStack extends cdk.Stack {
         cdk.Tags.of(this).add('mlcc:stack', 'eks-cluster');
 
         const ssmPrefix = `/mlcc/${profileName}/hyperpod`;
+        // Core models bucket name, rendered from its single declaration
+        // (core/buckets.json) — the same string the core stack creates, so the
+        // exact-ARN grants below are unchanged in the synthesized template.
+        const coreBucketName = renderBucketName(
+            CORE_BUCKETS.buckets.ModelsBucketResource,
+            { account: this.account, region: this.region, profileName },
+        );
 
         // ─── VPC (always created — hard cutover, no adopt path) ─────────────
         const vpc = new ec2.Vpc(this, 'Vpc', {
@@ -199,8 +209,8 @@ export class MlccEksClusterStack extends cdk.Stack {
             resources: ['arn:aws:ec2:*:*:network-interface/*'],
         }));
 
-        // BL087: S3 read access to mlcc-core lifecycle bucket.
-        // HyperPod nodes fetch on_create.sh from s3://mlcc-core-<acct>-<region>/hyperpod-lifecycle/
+        // BL087: S3 read access to the core models bucket (lifecycle script).
+        // HyperPod nodes fetch on_create.sh from s3://<core bucket>/hyperpod-lifecycle/
         // at bootstrap time. Without this, nodes fail silently during provisioning.
         // Asserted on both create and adopt (see adopt-drift note above).
         hyperpodInstanceRole.addToPrincipalPolicy(new iam.PolicyStatement({
@@ -208,8 +218,8 @@ export class MlccEksClusterStack extends cdk.Stack {
             effect: iam.Effect.ALLOW,
             actions: ['s3:GetObject', 's3:ListBucket'],
             resources: [
-                `arn:aws:s3:::mlcc-core-${this.account}-${this.region}`,
-                `arn:aws:s3:::mlcc-core-${this.account}-${this.region}/*`,
+                `arn:aws:s3:::${coreBucketName}`,
+                `arn:aws:s3:::${coreBucketName}/*`,
             ],
         }));
 
@@ -466,8 +476,8 @@ export class MlccEksClusterStack extends cdk.Stack {
                 effect: iam.Effect.ALLOW,
                 actions: ['s3:GetObject', 's3:ListBucket', 's3:GetBucketLocation'],
                 resources: [
-                    `arn:aws:s3:::mlcc-core-${this.account}-${this.region}`,
-                    `arn:aws:s3:::mlcc-core-${this.account}-${this.region}/*`,
+                    `arn:aws:s3:::${coreBucketName}`,
+                    `arn:aws:s3:::${coreBucketName}/*`,
                 ],
             }));
             // DESTROY (not RETAIN): OIDC-bound, recreated with the cluster.
@@ -527,21 +537,24 @@ export class MlccEksClusterStack extends cdk.Stack {
             }));
 
             // The inference operator writes/reads TLS material in its TLS bucket
-            // (mlcc-hyperpod-tls-<profile>, created by the inference-operator stack)
+            // (declared in hyperpod/stacks/buckets.json, created by the inference-operator stack)
             // and performs an S3 "dry-run" PutObject at startup to validate access.
             // AmazonSageMakerHyperPodInferenceAccess does NOT grant write to this
             // bucket, so the operator fails with:
-            //   AccessDenied ... s3:PutObject ... mlcc-hyperpod-tls-<profile>/inference-operator-s3-dryrun
-            // Grant it explicitly by ARN (the bucket name is deterministic, so no
+            //   AccessDenied ... s3:PutObject ... <tls bucket>/inference-operator-s3-dryrun
+            // Grant it explicitly by ARN (the bucket name is declared, so no
             // cross-stack import is needed — the bucket lives in a later stack).
             // Inference Operator v3.0 tags the ALB, S3, and ACM resources it creates
             // (per the HyperPod Inference release notes). Its TLS dry-run writes a
-            // TAGGED object to mlcc-hyperpod-tls-<profile>, so the role needs BOTH
+            // TAGGED object to the TLS bucket, so the role needs BOTH
             // s3:PutObject AND s3:PutObjectTagging (a tagged PutObject without the latter
             // fails AccessDenied on s3:PutObjectTagging). PutObject/GetObject/ListBucket
             // cover the read/write of TLS material; PutObjectTagging matches AWS's
             // documented `S3PutObjectTaggingAccess` statement.
-            const tlsBucketName = `mlcc-hyperpod-tls-${profileName}`;
+            const tlsBucketName = renderBucketName(
+                INFERENCE_OPERATOR_BUCKETS.buckets.TlsBucket,
+                { account: this.account, region: this.region, profileName },
+            );
             (hyperpodInferenceRole as iam.Role).addToPolicy(new iam.PolicyStatement({
                 sid: 'HyperPodInferenceTlsBucketAccess',
                 effect: iam.Effect.ALLOW,

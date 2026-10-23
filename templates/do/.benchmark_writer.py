@@ -1477,7 +1477,7 @@ def cmd_write(args):
         enriched_records = enrich_records(config_context, results_obj, timestamp, gpu_metrics=gpu_signals)
 
         # Compute intended S3 path (use bucket if provided, else placeholder)
-        bucket = args.bucket or f'mlcc-benchmark-results-<accountId>-{input_data["region"]}'
+        bucket = args.bucket or '<benchmark bucket (profile benchmarkS3Bucket)>'
         s3_path = compute_s3_path(bucket, input_data.get('project_name', ''), input_data.get('model_name', ''), input_data.get('instance_type', ''), input_data.get('deployment_target', 'realtime-inference'), timestamp)
         partition = compute_partition_info(input_data.get('model_name', ''), input_data.get('instance_type', ''), input_data.get('deployment_target', 'realtime-inference'))
 

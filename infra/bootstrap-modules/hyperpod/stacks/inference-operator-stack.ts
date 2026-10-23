@@ -6,6 +6,13 @@ import * as eks from 'aws-cdk-lib/aws-eks';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
+import INFERENCE_OPERATOR_BUCKETS from './buckets.json';
+import {
+    StackBucketDeclarations, bucketDeclaration, declaredBucket, renderBucketName,
+} from '../../bucket-declarations';
+
+/** The inference-operator stack's bucket declarations (single declared source, R1.2). */
+export const BUCKETS: StackBucketDeclarations = INFERENCE_OPERATOR_BUCKETS;
 
 export interface MlccInferenceOperatorStackProps extends cdk.StackProps {
     profileName: string;
@@ -68,33 +75,30 @@ export class MlccInferenceOperatorStack extends cdk.Stack {
         // ─── TLS S3 Bucket (RemovalPolicy.RETAIN) ───────────────────────────
 
         // NAMING AUDIT (BL161 R4 — ADR-012 Q3 corollary): the TLS bucket
-        // `mlcc-hyperpod-tls-<profile>` is MLCC-OWNED and safe to carry the `mlcc-`
+        // (declared in ./buckets.json) is MLCC-OWNED and safe to carry the `mlcc-`
         // prefix. Nothing resolves it by a `sagemaker-`/`hyperpod-` prefix convention:
         //   - MLCC passes the name EXPLICITLY below as the add-on's
         //     `tlsCertificateS3Bucket` configurationValue (not discovered by prefix).
         //   - IAM is granted by EXACT ARN (eks-cluster-stack.ts HyperPodInferenceTlsBucketAccess).
         //   - The add-on's configurationSchema for `tlsCertificateS3Bucket` requires only
-        //     the substring `tls`, which `mlcc-hyperpod-tls-<profile>` satisfies.
+        //     the substring `tls`, which the declared TLS bucket name satisfies.
         // Census conclusion (BL161): every MLCC-chosen name in the eks + hyperpod
         // bootstrap modules is either MLCC-fully-owned (passed explicitly / exact-ARN /
         // live handle) or an AWS-canonical name (add-on names like
         // amazon-sagemaker-hyperpod-inference; chart namespaces/SAs like
         // hyperpod-inference-system / aws-load-balancer-controller) that already conforms.
         // NO name is resolved by a `mlcc-` prefix convention, so no rename is needed.
-        const bucketName = `mlcc-hyperpod-tls-${profileName}`;
-        let newTlsBucket: s3.Bucket | undefined;
-
-        if (props.adoptTlsBucket) {
-            s3.Bucket.fromBucketName(this, 'TlsBucket', bucketName);
-        } else {
-            newTlsBucket = new s3.Bucket(this, 'TlsBucket', {
-                bucketName,
-                removalPolicy: cdk.RemovalPolicy.RETAIN,
-                autoDeleteObjects: false,
-                encryption: s3.BucketEncryption.S3_MANAGED,
-                blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-            });
-        }
+        const bucketName = renderBucketName(
+            bucketDeclaration(BUCKETS, 'TlsBucket'),
+            { account: this.account, region: this.region, profileName },
+        );
+        // Adopted by reference ONLY while the bucket exists but is not a resource of
+        // this stack (the runner checks stack ownership before setting adoptTlsBucket).
+        const tlsBucket = declaredBucket(this, 'TlsBucket', bucketName, props.adoptTlsBucket, {
+            autoDeleteObjects: false,
+            encryption: s3.BucketEncryption.S3_MANAGED,
+            blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+        });
 
         // ─── Inference Operator EKS Add-on (CDK-owned — BL161) ──────────────
         // The inference add-on is a CDK resource (not an out-of-band `aws eks
@@ -157,8 +161,8 @@ export class MlccInferenceOperatorStack extends cdk.Stack {
         });
         // The add-on consumes the TLS bucket; when MLCC creates it, ensure it exists
         // first. (An adopted bucket already exists, so no dependency is needed.)
-        if (newTlsBucket) {
-            inferenceAddon.node.addDependency(newTlsBucket);
+        if (tlsBucket instanceof s3.Bucket) {
+            inferenceAddon.node.addDependency(tlsBucket);
         }
 
         // ─── SSM Exports ────────────────────────────────────────────────────

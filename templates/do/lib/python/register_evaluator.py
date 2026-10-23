@@ -60,21 +60,14 @@ def check_name_budget(name):
 # ── MLCC-owned reward-Lambda deploy (--finalize) ───────────────────────────────
 
 
-def _resolve_training_bucket(region):
-    """The training bucket the reward-code backup is staged into — reused from the
-    bootstrap training module (never a new bucket). Prefer the profile-resolved
-    S3_BUCKET env (profile.sh maps trainingS3Bucket → S3_BUCKET); fall back to the
-    deterministic training bucket name the training stack creates."""
+def _resolve_training_bucket(region):  # noqa: ARG001 — kept for call-site compatibility
+    """The bucket the reward-code backup is staged into — the profile's (legacy)
+    training bucket, which the reward-Lambda role can read. Comes ONLY from the
+    profile-resolved env (profile.sh maps trainingS3Bucket → S3_BUCKET; or an explicit
+    TRAINING_S3_BUCKET). Returns None when unset — the backup is best-effort, so the
+    caller skips it rather than guessing a bucket name (bucket consolidation R2.1)."""
     import os
-    bucket = os.environ.get("S3_BUCKET") or os.environ.get("TRAINING_S3_BUCKET")
-    if bucket:
-        return bucket
-    # Deterministic fallback: mirrors MlccTrainingStack's bucketName.
-    import boto3
-    acct = boto3.client("sts", region_name=region).get_caller_identity()["Account"]
-    return f"mlcc-training-{acct}-{region}"
-
-
+    return os.environ.get("S3_BUCKET") or os.environ.get("TRAINING_S3_BUCKET") or None
 def _deploy_reward_lambda(*, name, local_py, role_arn, region):
     """Deploy ``local_py`` as a reward-function Lambda MLCC owns, returning its ARN.
 
@@ -94,6 +87,11 @@ def _deploy_reward_lambda(*, name, local_py, role_arn, region):
     bucket = _resolve_training_bucket(region)
     key = f"evaluators/{name}/lambda_function.py"
     try:
+        if not bucket:
+            raise RuntimeError(
+                "no training bucket in the active profile (trainingS3Bucket); "
+                "run: ml-container-creator bootstrap add-module training"
+            )
         boto3.client("s3", region_name=region).upload_file(local_py, bucket, key)
     except (NameError, AttributeError):
         raise  # R9.2/BL172: a programming error must never be swallowed as best-effort
@@ -231,9 +229,9 @@ def _register(*, name, source, evaluator_type, region, description,
         _error_exit(
             f"Failed to create the native evaluator '{name}' ({e}).\n"
             "    The evaluator role must be a SageMaker-trusted role carrying the\n"
-            "    launch-gate IAM (provisioned by `ml-container-creator bootstrap`,\n"
-            "    module `training`). If this is a permissions error, run\n"
-            "    `mcc bootstrap update --module training` to refresh the role.",
+            "    launch-gate IAM (the core execution role provisioned by\n"
+            "    `ml-container-creator bootstrap`). If this is a permissions error, run\n"
+            "    `mcc bootstrap update --module core` to refresh the role.",
             code="EVALUATOR_CREATE_FAILED",
         )
 

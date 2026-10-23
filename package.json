@@ -65,7 +65,6 @@
     "servers/lib/package.json",
     "servers/README.md",
     "config/defaults.json",
-    "config/bootstrap-stack.json",
     "config/bootstrap-e2e-stack.json",
     "config/parameter-schema-v2.json",
     "config/agent.json",

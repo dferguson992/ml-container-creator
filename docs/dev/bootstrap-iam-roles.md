@@ -142,7 +142,9 @@ and reconciles its trust and policies on every `bootstrap update` — those role
 
 | Role (`mlcc-…`) | Trust principal | Policies | RETAIN'd / adopted | Adopt-drift risk |
 |---|---|---|:--:|:--:|
-| `mlcc-training-role-<region>` | `sagemaker.amazonaws.com` | **Inline**: S3 (training + adapters buckets), CloudWatch Logs, launch-gate EC2/ENI/ECR auth (BL123) | No | **No** |
+| `mlcc-reward-lambda-role-<region>` | `lambda.amazonaws.com` + `sagemaker.amazonaws.com` | AWSLambdaBasicExecutionRole + **inline** read on the training bucket | No | **No** |
+
+(The former `mlcc-training-role-<region>` was deleted — no runtime path assumed it; every job runs as `mlcc-sagemaker-execution-role`, which carries the launch-gate permissions.)
 
 ### `ci` module (`ci/stack.ts`)
 

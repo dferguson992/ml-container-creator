@@ -24,8 +24,10 @@ _require_python_env
 source "${SCRIPT_DIR}/config"
 source "${SCRIPT_DIR}/lib/profile.sh"
 
-# ── Profile-resolved variables (env var > profile > default) ──────────────────
-TUNE_S3_BUCKET="${TUNE_S3_BUCKET:-mlcc-tune-${_PROFILE_accountId:-unknown}-${_PROFILE_awsRegion:-us-east-1}}"
+# ── Profile-resolved variables ────────────────────────────────────────────────
+# The output (artifacts) bucket is ARTIFACTS_S3_BUCKET, exported by do/lib/profile.sh
+# from the profile key artifactsS3Bucket (TUNE_S3_BUCKET is accepted as an override
+# alias). It is never rebuilt from the account/region — see _resolve_output_bucket.
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 CATALOG_FILE="${SCRIPT_DIR}/.tune_catalog.json"
@@ -326,7 +328,7 @@ _show_help() {
     echo "        fails before submission if either is missing."
     echo ""
     echo "Overrides:"
-    echo "  --output-bucket <b>   Override output bucket (defaults to TUNE_S3_BUCKET)"
+    echo "  --output-bucket <b>   Override output bucket (defaults to the profile's artifacts bucket)"
     echo "  --role <arn>          Override execution role (defaults to ROLE_ARN)"
     echo ""
     echo "Job control:"
@@ -1215,20 +1217,17 @@ print(json.dumps(schema))
 }
 
 # ── _resolve_output_bucket() ──────────────────────────────────────────────────
-# Resolve the S3 output bucket from --output-bucket, TUNE_S3_BUCKET, or fallback.
+# Resolve the S3 output bucket: --output-bucket, else the profile's artifacts
+# bucket (ARTIFACTS_S3_BUCKET; TUNE_S3_BUCKET override alias). No fallback name —
+# a missing profile key is a hard error naming the bootstrap module to add.
 _resolve_output_bucket() {
     if [ -n "${ARG_OUTPUT_BUCKET}" ]; then
         echo "${ARG_OUTPUT_BUCKET}"
-    elif [ -n "${TUNE_S3_BUCKET:-}" ]; then
-        echo "${TUNE_S3_BUCKET}"
-    elif [ -n "${ADAPTER_S3_BUCKET:-}" ]; then
-        echo "${ADAPTER_S3_BUCKET}"
-    else
-        echo "mlcc-tune-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo 'UNKNOWN')-${AWS_REGION}"
+        return 0
     fi
+    _require_bucket ARTIFACTS_S3_BUCKET || return 1
+    echo "${ARTIFACTS_S3_BUCKET}"
 }
-
-
 # ── _check_idempotency() ──────────────────────────────────────────────────────
 # Check TUNE_JOB_NAME_<TECHNIQUE> in config, query status if exists.
 # Returns 0 if a new job should be created, 1 if existing job was handled.
@@ -1527,7 +1526,7 @@ _submit_job() {
     _preflight_rft_inputs
 
     local output_bucket
-    output_bucket=$(_resolve_output_bucket)
+    output_bucket=$(_resolve_output_bucket) || exit 1
 
     local role_arn
     if [ -n "${ARG_ROLE}" ]; then
@@ -2087,7 +2086,7 @@ _dry_run() {
     _preflight_rft_inputs
 
     local output_bucket
-    output_bucket=$(_resolve_output_bucket)
+    output_bucket=$(_resolve_output_bucket) || exit 1
 
     local role_arn
     if [ -n "${ARG_ROLE}" ]; then

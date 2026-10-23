@@ -131,13 +131,29 @@ class TestDeployRewardLambda:
         assert captured["create"]["Handler"] == "lambda_function.lambda_handler"
         assert arn.startswith("arn:aws:lambda:")
 
-    def test_training_bucket_falls_back_to_deterministic_name(self, monkeypatch):
+    def test_training_bucket_never_derived_from_account(self, monkeypatch):
+        # Bucket consolidation R2.1: with no profile key there is NO convention-built
+        # fallback name (formerly mlcc-training-<sts account>-<region>).
         captured = {}
         self._install_fake_boto3(monkeypatch, captured)
         monkeypatch.delenv("S3_BUCKET", raising=False)
         monkeypatch.delenv("TRAINING_S3_BUCKET", raising=False)
-        bucket = re_mod._resolve_training_bucket("us-west-2")
-        assert bucket == "mlcc-training-111122223333-us-west-2"
+        assert re_mod._resolve_training_bucket("us-west-2") is None
+
+    def test_deploy_skips_backup_without_profile_bucket(self, monkeypatch, tmp_path):
+        captured = {}
+        self._install_fake_boto3(monkeypatch, captured)
+        monkeypatch.delenv("S3_BUCKET", raising=False)
+        monkeypatch.delenv("TRAINING_S3_BUCKET", raising=False)
+        f = tmp_path / "math-reward.py"
+        f.write_text("def handler(e, c=None):\n    return []\nlambda_handler = handler\n")
+        arn = re_mod._deploy_reward_lambda(
+            name="math-reward", local_py=str(f),
+            role_arn="arn:aws:iam::1:role/mlcc-reward-lambda-role-us-west-2",
+            region="us-west-2",
+        )
+        assert "s3" not in captured  # best-effort backup skipped, no guessed bucket
+        assert arn.startswith("arn:aws:lambda:")
 
 
 class TestCreateEvaluatorNative:

@@ -21,6 +21,7 @@ import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import BootstrapConfig from './bootstrap-config.js';
 import AwsProfileParser from './aws-profile-parser.js';
 import McpCommandHandler from './mcp-command-handler.js';
@@ -32,6 +33,16 @@ import { loadModuleManifest, selectModules, validateDependencies, findDependents
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+/**
+ * Per-stack bucket declarations (infra/bootstrap-modules/<stack dir>/buckets.json) —
+ * the single declared source of every MLCC bucket name (bucket consolidation R1.2).
+ * Loaded lazily (like module-runner.cjs) so commands that never touch buckets do not
+ * depend on the bootstrap-modules tree being present.
+ * @returns {{ declaredBucketsForStack: Function }}
+ */
+function bucketDeclarations() {
+    return createRequire(import.meta.url)('../../infra/bootstrap-modules/bucket-declarations.cjs');
+}
 
 /**
  * Retired modules that are no longer in module-manifest.json but may still be present
@@ -66,7 +77,7 @@ const DENORMALIZED_FLAT_KEYS = [
     // registry
     'modelPackageGroupName',
     // training
-    'mlflowAppArn', 'trainingS3Bucket', 'adapterS3Bucket',
+    'mlflowAppArn', 'artifactsS3Bucket', 'trainingS3Bucket', 'adapterS3Bucket', 'rewardLambdaRoleArn',
     // ci
     'ciInfraProvisioned', 'ciTableName', 'codebuildSourceS3Bucket',
     // eks (BL143)
@@ -92,8 +103,6 @@ export default class BootstrapCommandHandler {
     _buildResourceTags() { return this.provisioners._buildResourceTags(); }
     _setupEcrRepository() { return this.provisioners._setupEcrRepository(); }
     _setupIamRole(options) { return this.provisioners._setupIamRole(options); }
-    _setupS3Buckets() { return this.provisioners._setupS3Buckets(); }
-    _createS3Bucket(name, tags) { return this.provisioners._createS3Bucket(name, tags); }
     _verifyCliV2() { return this.provisioners._verifyCliV2(); }
 
 
@@ -549,7 +558,10 @@ export default class BootstrapCommandHandler {
                     accountId,
                     awsRegion: region,
                     awsProfile,
-                    roleArn: coreOutputs.RoleArn || profileData.roleArn
+                    roleArn: coreOutputs.RoleArn || profileData.roleArn,
+                    // The artifact store is the training stack's declared artifacts
+                    // bucket (its CFN output) — provision-mlflow creates no bucket (D3).
+                    artifactsBucket: (moduleOutputs.training || {}).ArtifactsBucket
                 });
                 if (mlflowAppArn) {
                     moduleOutputs.training = moduleOutputs.training || {};
@@ -611,24 +623,33 @@ export default class BootstrapCommandHandler {
         const manifest = loadModuleManifest();
         let ordered = topologicalSort(provisioned);
 
-        // Scoped redeploy: `--module <name>` targets a single provisioned module.
+        // Scoped redeploy: `--module <name>[,<name>...]` targets provisioned module(s).
         // Validate against the provisioned set and narrow `ordered` to just that
         // module so no other module's CDK stack is deployed. The full profile's
         // provisionedModules list is preserved (see save block below).
-        const scopedModule = options.module;
+        // Accepts a comma-separated list (`--module training,core`); the listed
+        // modules deploy in topological order and no other stack is touched.
+        const scopedModules = typeof options.module === 'string'
+            ? options.module.split(',').map(m => m.trim()).filter(Boolean)
+            : [];
+        const scopedModule = scopedModules.length > 0;
         if (scopedModule) {
-            if (!provisioned.includes(scopedModule)) {
-                console.log(`❌ Module "${scopedModule}" is not provisioned for profile "${name}".`);
+            const unknown = scopedModules.filter(m => !provisioned.includes(m));
+            if (unknown.length > 0) {
+                for (const m of unknown) {
+                    console.log(`❌ Module "${m}" is not provisioned for profile "${name}".`);
+                }
                 console.log(`   Available provisioned modules: ${provisioned.join(', ')}`);
                 return;
             }
-            ordered = [scopedModule];
-            console.log(`   Scoped to single module: ${scopedModule}`);
+            ordered = ordered.filter(m => scopedModules.includes(m));
+            console.log(`   Scoped to module(s): ${ordered.join(', ')}`);
         }
 
         // Dry-run: show `cdk diff` per module, apply nothing.
         if (options.dryRun) {
-            console.log('\n🔍 Dry run — showing pending changes per module (nothing will be applied).\n');
+            console.log('\n🔍 Dry run — showing planned bucket imports and pending changes per module');
+            console.log('   (read-only: no change set is created, nothing is applied).\n');
             console.log(`   Modules: ${ordered.join(', ')}\n`);
             this._ensureModuleDeps();
             const { CdkModuleRunner, CdkMultiStackModuleRunner } = await import('../../infra/bootstrap-modules/module-runner.cjs');
@@ -676,7 +697,10 @@ export default class BootstrapCommandHandler {
                     accountId: profileConfig.accountId,
                     awsRegion: profileConfig.awsRegion,
                     awsProfile: profileConfig.awsProfile,
-                    roleArn: coreOutputs.RoleArn || profileConfig.roleArn
+                    roleArn: coreOutputs.RoleArn || profileConfig.roleArn,
+                    // The artifact store is the training stack's declared artifacts
+                    // bucket (its CFN output) — provision-mlflow creates no bucket (D3).
+                    artifactsBucket: (moduleOutputs.training || {}).ArtifactsBucket
                 });
                 if (mlflowAppArn) {
                     moduleOutputs.training = moduleOutputs.training || {};
@@ -756,6 +780,24 @@ export default class BootstrapCommandHandler {
                     to: profileConfig.sharedStackFrom
                 });
             }
+
+            // Seed artifactsS3Bucket (bucket consolidation R1.7) for a profile created
+            // before the training stack exported ArtifactsBucket. The value comes from
+            // the MLflow App's recorded ArtifactStoreUri — a declared source — never
+            // from a name pattern. A profile without an MLflow App is left alone: its
+            // next `bootstrap update --module training` records the stack output.
+            if (!profileConfig.artifactsS3Bucket && profileConfig.mlflowAppArn) {
+                const seeded = this._artifactsBucketFromMlflowApp(profileConfig);
+                if (seeded) {
+                    changes.push({
+                        profile: name,
+                        field: 'artifactsS3Bucket (from MLflow App ArtifactStoreUri)',
+                        from: '(unset)',
+                        to: seeded,
+                        seedArtifactsBucket: seeded
+                    });
+                }
+            }
         }
 
         if (changes.length === 0) {
@@ -790,10 +832,39 @@ export default class BootstrapCommandHandler {
                 profileConfig.sharedInfraFrom = profileConfig.sharedStackFrom;
                 delete profileConfig.sharedStackFrom;
             }
+            const seed = changes.find(c => c.profile === name && c.seedArtifactsBucket);
+            if (seed) {
+                // Record it where a stack output would land, then re-derive the flat
+                // key, so module removal / re-denormalization keeps it consistent.
+                profileConfig.moduleOutputs = profileConfig.moduleOutputs || {};
+                profileConfig.moduleOutputs.training = {
+                    ...(profileConfig.moduleOutputs.training || {}),
+                    ArtifactsBucket: seed.seedArtifactsBucket
+                };
+                this._denormalizeModuleOutputs(profileConfig);
+            }
         }
 
         this.config.write(config);
         console.log('✅ Migration complete.');
+    }
+
+    /**
+     * Read the artifacts bucket recorded by the profile's MLflow App
+     * (describe-mlflow-app ArtifactStoreUri). Read-only; null when unavailable.
+     * Extracted so tests can stub the AWS call.
+     * @param {object} profileConfig
+     * @returns {string|null}
+     */
+    _artifactsBucketFromMlflowApp(profileConfig) {
+        const { artifactsBucketFromMlflowApp } = createRequire(import.meta.url)(
+            '../../infra/bootstrap-modules/training/provision-mlflow.cjs'
+        );
+        return artifactsBucketFromMlflowApp({
+            mlflowAppArn: profileConfig.mlflowAppArn,
+            awsRegion: profileConfig.awsRegion,
+            awsProfile: profileConfig.awsProfile
+        });
     }
 
     /**
@@ -1153,9 +1224,13 @@ export default class BootstrapCommandHandler {
             }
         }
 
-        // training → mlflowAppArn, trainingS3Bucket, adapterS3Bucket, rewardLambdaRoleArn
+        // training → mlflowAppArn, artifactsS3Bucket, trainingS3Bucket, adapterS3Bucket,
+        // rewardLambdaRoleArn. artifactsS3Bucket (the per-project artifacts bucket —
+        // tune/train/optimize output + MLflow store) is the ONLY way do/ learns that
+        // bucket's name (bucket consolidation R2.1).
         if (outputs.training) {
             if (outputs.training.MlflowAppArn) profileData.mlflowAppArn = outputs.training.MlflowAppArn;
+            if (outputs.training.ArtifactsBucket) profileData.artifactsS3Bucket = outputs.training.ArtifactsBucket;
             if (outputs.training.TrainingBucket) profileData.trainingS3Bucket = outputs.training.TrainingBucket;
             if (outputs.training.AdaptersBucket) profileData.adapterS3Bucket = outputs.training.AdaptersBucket;
             // Dual-trust role for reward-function Lambdas created via
@@ -1317,35 +1392,43 @@ export default class BootstrapCommandHandler {
     /**
      * Warn that a module's S3 bucket(s) will persist after teardown.
      * Buckets use RemovalPolicy.RETAIN, so `cdk destroy` leaves them in place
-     * (data is preserved) but they become unmanaged — no stack owns them until
-     * the module is re-added, at which point they're adopted automatically.
+     * (data is preserved) but no stack owns them until the module is re-added
+     * (`bootstrap add-module` or `bootstrap update`), which imports them back into
+     * their stack automatically (R1.5).
+     *
+     * The bucket list is DERIVED from each module's stack declarations
+     * (infra/bootstrap-modules/<stack dir>/buckets.json) — never a hand-copied map.
      *
      * @param {string[]} moduleNames - Modules being removed
      * @param {object} profileConfig - Active profile config (accountId, awsRegion)
+     * @param {string} [profileName] - Bootstrap profile name (for {profile} names)
+     * @param {object} [manifest] - module manifest (defaults to the shipped one)
      */
-    _warnPersistentBuckets(moduleNames, profileConfig) {
-        const bucketOwners = {
-            benchmark: `mlcc-benchmark-results-${profileConfig.accountId}-${profileConfig.awsRegion}`,
-            training: `mlcc-training-${profileConfig.accountId}-${profileConfig.awsRegion}`
-        };
-        const affected = moduleNames
-            .filter(m => bucketOwners[m])
-            .map(m => bucketOwners[m]);
-
+    _warnPersistentBuckets(moduleNames, profileConfig, profileName = '', manifest = loadModuleManifest()) {
+        const affected = [];
+        for (const m of moduleNames) {
+            const mod = manifest.modules[m] || LEGACY_REMOVABLE_MODULES[m];
+            if (!mod) continue;
+            const stacks = Array.isArray(mod.stacks) ? mod.stacks : [mod.stackNameSuffix];
+            for (const stack of stacks) {
+                const vars = { account: profileConfig.accountId, region: profileConfig.awsRegion, profileName };
+                for (const b of bucketDeclarations().declaredBucketsForStack(stack, vars)) affected.push(b.name);
+            }
+        }
         if (affected.length === 0) {
             return;
         }
-
-        console.log('\n   ⚠️  S3 buckets will PERSIST after teardown (RemovalPolicy: RETAIN):');
+        console.log('\n   ⚠  S3 buckets will PERSIST after teardown (RemovalPolicy: RETAIN):');
         for (const b of affected) {
             console.log(`        • s3://${b}`);
         }
         console.log('      Your data is preserved, but these buckets become UNMANAGED — no');
-        console.log('      CDK stack owns them until you re-add the module (they are adopted');
-        console.log('      automatically on re-provision). To reclaim the storage/name, delete');
-        console.log('      them manually: aws s3 rb s3://<bucket> --force');
+        console.log('      CDK stack owns them until you re-add the module. Re-adding it');
+        console.log('      (`bootstrap add-module <module>`, or `bootstrap update`) brings them back');
+        console.log('      under CloudFormation automatically (import, no data change).');
+        console.log('      To reclaim the storage/name instead, delete them manually:');
+        console.log('      aws s3 rb s3://<bucket> --force');
     }
-
     // ── Display helpers ─────────────────────────────────────────────
 
     /**
@@ -1598,7 +1681,7 @@ export default class BootstrapCommandHandler {
             const remaining = provisioned.filter(m => !toRemove.includes(m));
             console.log('\n   Profile update:');
             console.log(`     provisionedModules: [${provisioned.join(', ')}] → [${remaining.join(', ')}]`);
-            this._warnPersistentBuckets(toRemove, profileConfig);
+            this._warnPersistentBuckets(toRemove, profileConfig, name, manifest);
             console.log('\n   Re-run without --dry-run to apply.');
             return;
         }
@@ -1623,7 +1706,7 @@ export default class BootstrapCommandHandler {
 
         // Confirm removal
         if (!options.force) {
-            this._warnPersistentBuckets([moduleName], profileConfig);
+            this._warnPersistentBuckets([moduleName], profileConfig, name, manifest);
             // The `eks` module owns the EKS cluster — its teardown is the slow one and
             // DESTROYS the cluster. `hyperpod` depends on eks, so removing eks removes
             // hyperpod too (BL143 hard-cutover: this is the destructive cutover step).
@@ -1727,8 +1810,10 @@ SUBCOMMANDS:
   list                                List all bootstrap profiles
   scan                                Discover pre-existing MLCC-managed resources in AWS
   prune                               Remove deleted and unknown records from the deployment manifest
-  update [--dry-run]                  Re-provision all installed modules (--dry-run shows cdk diff per module, applies nothing)
-  migrate                             Upgrade legacy profiles to current naming conventions
+  update [--module a,b] [--dry-run]   Re-provision installed modules (all, or only the listed ones). Existing MLCC
+                                      buckets not yet owned by their stack are imported first (no data change).
+                                      --dry-run shows planned imports + cdk diff per module, applies nothing
+  migrate                             Upgrade legacy profiles (naming; seeds artifactsS3Bucket from the MLflow App)
   sync-schemas                        Download AWS service model schemas (sagemaker, iam, ecr, s3)
   sync-model-families                 Discover tune-eligible models from JumpStart Hub and update catalog
   sync-serving-versions               Discover latest vLLM/SGLang/TRT-LLM image versions and update catalog
@@ -1737,7 +1822,7 @@ MODULES:
   core                                IAM role + ECR repository (always required)
   benchmark                           S3 bucket + Glue DB for benchmark results
   registry                            Model Package Group + AI Registry Hub
-  training                            Training data bucket + execution role + MLflow (best-effort)
+  training                            Artifacts bucket (+ legacy training/adapters buckets) + MLflow (best-effort)
   ci                                  CodeBuild + DynamoDB + StepFunctions
   sagemaker-domain                    SageMaker Studio domain + default user profile
   eks                                 Standalone EKS cluster (VPC, OIDC, add-ons, inference role) ~$73+/mo

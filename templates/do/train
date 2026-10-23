@@ -28,9 +28,11 @@ source "${SCRIPT_DIR}/config"
 source "${SCRIPT_DIR}/lib/profile.sh"
 source "${SCRIPT_DIR}/lib/resolve-instance.sh"
 
-# CORE_BUCKET (mlcc-core) backs the dataset sidecar registry used for
-# name/version resolution and listing.
-CORE_BUCKET="${CORE_BUCKET:-${CODEBUILD_SOURCE_S3_BUCKET:-${_PROFILE_codebuildSourceS3Bucket:-}}}"
+# CORE_BUCKET (the core models bucket) backs the dataset sidecar registry used for
+# name/version resolution and listing. It comes ONLY from the profile key
+# coreS3Bucket (CORE_S3_BUCKET via do/lib/profile.sh) — never the CodeBuild source
+# bucket (bucket consolidation R2.3).
+CORE_BUCKET="${CORE_BUCKET:-${CORE_S3_BUCKET:-}}"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 CONFIG_FILE="${SCRIPT_DIR}/training/config.yaml"
@@ -861,17 +863,15 @@ _validate_config() {
     fi
 
     if [ -z "${TRAIN_OUTPUT_PATH}" ]; then
-        # Auto-resolve from profile: use benchmarkS3Bucket or construct from project name
-        if [ -n "${_PROFILE_benchmarkS3Bucket:-}" ]; then
-            TRAIN_OUTPUT_PATH="s3://${_PROFILE_benchmarkS3Bucket}/${PROJECT_NAME}/training-output/"
-        elif [ -n "${BENCHMARK_S3_OUTPUT_PATH:-}" ]; then
-            # Derive from benchmark output path (replace /benchmarks/ with /training-output/)
-            TRAIN_OUTPUT_PATH="${BENCHMARK_S3_OUTPUT_PATH%/benchmarks/*}/training-output/${PROJECT_NAME}/"
+        # Auto-resolve from the profile's artifacts bucket: <project>/train/
+        # (bucket consolidation R2.3 — formerly, wrongly, the benchmark bucket).
+        if [ -n "${ARTIFACTS_S3_BUCKET:-}" ]; then
+            TRAIN_OUTPUT_PATH="s3://${ARTIFACTS_S3_BUCKET}/${PROJECT_NAME}/train/"
         fi
         if [ -z "${TRAIN_OUTPUT_PATH}" ]; then
             echo "❌ Missing required field: output_path"
             echo "   The S3 output path is required in do/training/config.yaml"
-            echo "   Or run 'ml-container-creator bootstrap' to configure an S3 bucket."
+            _require_bucket ARTIFACTS_S3_BUCKET || true
             echo ""
             echo "   Expected format: output_path: \"s3://my-bucket/output/\""
             echo ""

@@ -92,7 +92,6 @@ ml-container-creator/
 ├── config/
 │   ├── parameter-schema-v2.json       # Source of truth for all 68 CLI parameters
 │   ├── tune-catalog.json              # Fine-tuning model catalog
-│   ├── bootstrap-stack.json           # CloudFormation template for bootstrap
 │   ├── defaults.json                  # Default values
 │   └── presets/                       # Pre-built configuration presets
 ├── scripts/

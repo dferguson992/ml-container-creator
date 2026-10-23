@@ -46,15 +46,17 @@ const profileName = app.node.tryGetContext('profileName') || 'default';
 const accountId = app.node.tryGetContext('accountId');
 const region = app.node.tryGetContext('region');
 const targetModule = app.node.tryGetContext('module'); // undefined = instantiate all
-// When the runner detects a module's S3 bucket already exists (retained from a
-// prior teardown), it passes adoptExistingBuckets=true so the stack adopts the
-// bucket by reference instead of colliding on create.
+// Bucket adopt flags. Each stack declares its buckets (and the context key that
+// adopts each one) in its buckets.json. The runner sets a bucket's adopt flag ONLY
+// when the bucket exists AND is not already a resource of the stack — so a stack
+// adopts by reference only while it is first created (the runner then imports the
+// bucket in the same run, R1.5), and a bucket the stack owns is never orphaned by a
+// later deploy (R1.1).
 const adoptExistingBuckets = app.node.tryGetContext('adoptExistingBuckets') === 'true';
-// The training module owns a SECOND retained bucket (adapters). The runner
-// detects it independently and passes adoptExistingAdaptersBucket=true so the
-// adapters bucket is adopted only when it actually exists, decoupled from the
-// training-data bucket's own adopt decision.
+// The training module owns further independent buckets (adapters, artifacts); each
+// has its own adopt flag so it is adopted only when IT is unowned-but-existing.
 const adoptExistingAdaptersBucket = app.node.tryGetContext('adoptExistingAdaptersBucket') === 'true';
+const adoptExistingArtifactsBucket = app.node.tryGetContext('adoptExistingArtifactsBucket') === 'true';
 // When the runner detects the core ECR repository already exists (retained from
 // a prior teardown), it passes adoptExistingEcr=true so the core stack adopts
 // the repo by reference instead of colliding on create.
@@ -84,7 +86,7 @@ const factories: Record<string, () => cdk.Stack> = {
         description: `MLCC Model Registry (profile: ${profileName})`,
     }),
     training: () => new MlccTrainingStack(app, stackName('training'), {
-        env, profileName, adoptExistingBuckets, adoptExistingAdaptersBucket,
+        env, profileName, adoptExistingBuckets, adoptExistingAdaptersBucket, adoptExistingArtifactsBucket,
         description: `MLCC Training Infrastructure (profile: ${profileName})`,
     }),
     ci: () => new MlccCiStack(app, stackName('ci'), {
