@@ -290,7 +290,7 @@ program
     .option('--non-interactive', 'Run without prompts (requires --profile and --region)')
     .option('--name <name>', 'Bootstrap profile name (default: "default")')
     .option('--with <modules>', 'Comma-separated modules to provision (non-interactive; default: core,registry)')
-    .option('--module <name>', 'Redeploy only the named module\'s CDK stack (for update)')
+    .option('--module <names>', 'Redeploy only these modules\' CDK stacks, comma-separated (for update, e.g. training,core)')
     .option('--force', 'Force removal without confirmation')
     .option('--force-delete', 'Also destroy retained roles/buckets on remove-module (eks/hyperpod)')
     .option('--skip-teardown', 'Forget a module from the profile without a cdk destroy (stacks already deleted out-of-band)')
