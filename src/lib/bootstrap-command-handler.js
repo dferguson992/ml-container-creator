@@ -1153,11 +1153,18 @@ export default class BootstrapCommandHandler {
             }
         }
 
-        // training → mlflowAppArn, trainingS3Bucket, adapterS3Bucket
+        // training → mlflowAppArn, trainingS3Bucket, adapterS3Bucket, rewardLambdaRoleArn
         if (outputs.training) {
             if (outputs.training.MlflowAppArn) profileData.mlflowAppArn = outputs.training.MlflowAppArn;
             if (outputs.training.TrainingBucket) profileData.trainingS3Bucket = outputs.training.TrainingBucket;
             if (outputs.training.AdaptersBucket) profileData.adapterS3Bucket = outputs.training.AdaptersBucket;
+            // Dual-trust role for reward-function Lambdas created via
+            // `do/register evaluator --finalize` (RLVR/MTRL). Threaded to the runtime
+            // as MLCC_REWARD_LAMBDA_ROLE_ARN so the register path need not be told the
+            // role on the CLI.
+            if (outputs.training.RewardLambdaRoleArn) {
+                profileData.rewardLambdaRoleArn = outputs.training.RewardLambdaRoleArn;
+            }
         }
 
         // ci → ciInfraProvisioned, ciTableName, codebuildSourceS3Bucket

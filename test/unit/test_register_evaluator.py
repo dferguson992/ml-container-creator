@@ -79,6 +79,67 @@ def _install_fake_evaluator_sdk(created):
     return cleanup
 
 
+class TestDeployRewardLambda:
+    """The MLCC-owned --finalize deploy: stage code into the REUSED training bucket,
+    zip the file AS lambda_function.py (so lambda_function.lambda_handler resolves),
+    create the Lambda with the dual-trust role, return its ARN. Fixes the SDK path's
+    NoSuchBucket + handler-mismatch + role breakages. All offline (fake boto3)."""
+
+    def _install_fake_boto3(self, monkeypatch, captured):
+        class _ResourceConflict(Exception):
+            pass
+
+        class _LambdaClient:
+            exceptions = types.SimpleNamespace(ResourceConflictException=_ResourceConflict)
+
+            def create_function(self, **kw):
+                captured["create"] = kw
+                return {"FunctionArn": f"arn:aws:lambda:us-west-2:1:function:{kw['FunctionName']}"}
+
+        class _S3Client:
+            def upload_file(self, local, bucket, key):
+                captured["s3"] = {"local": local, "bucket": bucket, "key": key}
+
+        class _StsClient:
+            def get_caller_identity(self):
+                return {"Account": "111122223333"}
+
+        def _client(svc, region_name=None):
+            return {"lambda": _LambdaClient(), "s3": _S3Client(),
+                    "sts": _StsClient()}[svc]
+
+        fake = types.ModuleType("boto3")
+        fake.client = _client
+        monkeypatch.setitem(sys.modules, "boto3", fake)
+
+    def test_deploy_uses_training_bucket_handler_and_role(self, monkeypatch, tmp_path):
+        captured = {}
+        self._install_fake_boto3(monkeypatch, captured)
+        monkeypatch.setenv("S3_BUCKET", "mlcc-training-111122223333-us-west-2")
+        f = tmp_path / "math-reward.py"
+        f.write_text("def handler(e, c=None):\n    return []\nlambda_handler = handler\n")
+
+        arn = re_mod._deploy_reward_lambda(
+            name="math-reward", local_py=str(f),
+            role_arn="arn:aws:iam::1:role/mlcc-reward-lambda-role-us-west-2",
+            region="us-west-2",
+        )
+        # Reused the training bucket for the backup (NOT a new/default bucket).
+        assert captured["s3"]["bucket"] == "mlcc-training-111122223333-us-west-2"
+        # Created with the dual-trust role and the standard handler name.
+        assert captured["create"]["Role"].endswith("mlcc-reward-lambda-role-us-west-2")
+        assert captured["create"]["Handler"] == "lambda_function.lambda_handler"
+        assert arn.startswith("arn:aws:lambda:")
+
+    def test_training_bucket_falls_back_to_deterministic_name(self, monkeypatch):
+        captured = {}
+        self._install_fake_boto3(monkeypatch, captured)
+        monkeypatch.delenv("S3_BUCKET", raising=False)
+        monkeypatch.delenv("TRAINING_S3_BUCKET", raising=False)
+        bucket = re_mod._resolve_training_bucket("us-west-2")
+        assert bucket == "mlcc-training-111122223333-us-west-2"
+
+
 class TestCreateEvaluatorNative:
     def test_reward_function_passes_type_and_source(self, monkeypatch):
         created = {}

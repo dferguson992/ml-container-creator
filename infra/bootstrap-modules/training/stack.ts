@@ -109,6 +109,52 @@ export class MlccTrainingStack extends cdk.Stack {
             resources: ['*'],
         }));
 
+        // ── Reward-Lambda role (RLVR/MTRL verifiable-reward evaluators) ─────────
+        // `do/register evaluator --from-sample --finalize` has SageMaker CREATE and
+        // OWN a managed Lambda from the user's reward function. That requires a role
+        // with DUAL trust — assumable by BOTH sagemaker.amazonaws.com (SageMaker
+        // creates the function on the user's behalf) AND lambda.amazonaws.com (the
+        // function assumes it at invoke time). The plain training role above trusts
+        // only SageMaker, so it cannot be the reward-Lambda role. This role is the
+        // single source of truth for that path; its ARN is exported and threaded to
+        // the runtime as MLCC_REWARD_LAMBDA_ROLE_ARN (consumed by register_evaluator).
+        const rewardLambdaRole = new iam.Role(this, 'RewardLambdaRole', {
+            roleName: `mlcc-reward-lambda-role-${this.region}`,
+            assumedBy: new iam.CompositePrincipal(
+                new iam.ServicePrincipal('lambda.amazonaws.com'),
+                new iam.ServicePrincipal('sagemaker.amazonaws.com'),
+            ),
+            description:
+                'Dual-trust (sagemaker + lambda) role for RLVR/MTRL reward-function '
+                + 'Lambdas created via do/register evaluator --finalize',
+        });
+
+        // Basic Lambda execution: write its own CloudWatch logs.
+        rewardLambdaRole.addManagedPolicy(
+            iam.ManagedPolicy.fromAwsManagedPolicyName(
+                'service-role/AWSLambdaBasicExecutionRole',
+            ),
+        );
+
+        // Read the reward-function code backup the SDK stages during --finalize
+        // (it writes the .py to the training bucket under evaluators/<name>). No
+        // write — the create path only reads it back; the ZIP is built in-memory.
+        rewardLambdaRole.addToPolicy(new iam.PolicyStatement({
+            actions: ['s3:GetObject', 's3:ListBucket'],
+            resources: [trainingBucket.bucketArn, `${trainingBucket.bucketArn}/*`],
+        }));
+
+        // The training role must be able to PASS the reward-Lambda role to the
+        // Lambda service when SageMaker creates the function on its behalf.
+        trainingRole.addToPolicy(new iam.PolicyStatement({
+            sid: 'MlccPassRewardLambdaRole',
+            actions: ['iam:PassRole'],
+            resources: [rewardLambdaRole.roleArn],
+            conditions: {
+                StringEquals: { 'iam:PassedToService': 'lambda.amazonaws.com' },
+            },
+        }));
+
         // Outputs
         new cdk.CfnOutput(this, 'TrainingBucketOutput', {
             value: bucketName,
@@ -123,6 +169,11 @@ export class MlccTrainingStack extends cdk.Stack {
         new cdk.CfnOutput(this, 'TrainingRoleArnOutput', {
             value: trainingRole.roleArn,
             exportName: `mlcc-${profileName}-training-TrainingRoleArn`,
+        });
+
+        new cdk.CfnOutput(this, 'RewardLambdaRoleArnOutput', {
+            value: rewardLambdaRole.roleArn,
+            exportName: `mlcc-${profileName}-training-RewardLambdaRoleArn`,
         });
     }
 }

@@ -76,6 +76,17 @@ CODEBUILD_SOURCE_S3_BUCKET="${CODEBUILD_SOURCE_S3_BUCKET:-${_PROFILE_codebuildSo
 MLFLOW_APP_ARN="${MLFLOW_APP_ARN:-${_PROFILE_mlflowAppArn:-}}"
 [ -n "${MLFLOW_APP_ARN}" ] && export MLFLOW_APP_ARN
 
+# Map the profile's rewardLambdaRoleArn (provisioned by the training bootstrap
+# module — the dual-trust sagemaker+lambda role) to the env var the evaluator
+# register path consumes. `do/register evaluator --finalize` reads
+# MLCC_REWARD_LAMBDA_ROLE_ARN from the environment to pass as the created Lambda's
+# execution role; without it, SageMaker's create fails with a Lambda trust error.
+# EXPORTED (like MLFLOW_APP_ARN) because register_evaluator reads os.environ. Empty
+# when the module predates this role — the register path then guides the user to
+# re-bootstrap the training module.
+MLCC_REWARD_LAMBDA_ROLE_ARN="${MLCC_REWARD_LAMBDA_ROLE_ARN:-${_PROFILE_rewardLambdaRoleArn:-}}"
+[ -n "${MLCC_REWARD_LAMBDA_ROLE_ARN}" ] && export MLCC_REWARD_LAMBDA_ROLE_ARN
+
 # ── Profile secrets (BL076) ───────────────────────────────────────────────
 # Secret ARNs are stored in the active bootstrap profile's 'secrets' map.
 # profile.sh exports them as _PROFILE_secrets_<key> so scripts can resolve
