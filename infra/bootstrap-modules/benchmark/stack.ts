@@ -5,6 +5,13 @@ import * as cdk from 'aws-cdk-lib';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as glue from 'aws-cdk-lib/aws-glue';
 import { Construct } from 'constructs';
+import BENCHMARK_BUCKETS from './buckets.json';
+import {
+    StackBucketDeclarations, bucketDeclaration, declaredBucket, renderBucketName,
+} from '../bucket-declarations';
+
+/** The benchmark stack's bucket declarations (single declared source, R1.2). */
+export const BUCKETS: StackBucketDeclarations = BENCHMARK_BUCKETS;
 
 export interface MlccBenchmarkStackProps extends cdk.StackProps {
     profileName: string;
@@ -28,22 +35,21 @@ export class MlccBenchmarkStack extends cdk.Stack {
         cdk.Tags.of(this).add('mlcc:module', 'benchmark');
         cdk.Tags.of(this).add('mlcc:profile', profileName);
 
-        const bucketName = `mlcc-benchmark-results-${this.account}-${this.region}`;
+        const bucketName = renderBucketName(
+            bucketDeclaration(BUCKETS, 'BenchmarkBucket'),
+            { account: this.account, region: this.region, profileName },
+        );
 
         // S3 bucket for benchmark results (RETAIN on delete — data is valuable).
-        // Because the bucket is retained on teardown, a later re-provision would
-        // collide with the existing bucket. When adoptExistingBuckets is set
-        // (the runner detected the bucket already exists via head-bucket), adopt
-        // it by reference instead of creating it.
-        this.benchmarkBucket = adoptExistingBuckets
-            ? s3.Bucket.fromBucketName(this, 'BenchmarkBucket', bucketName)
-            : new s3.Bucket(this, 'BenchmarkBucket', {
-                bucketName,
-                versioned: true,
-                encryption: s3.BucketEncryption.S3_MANAGED,
-                removalPolicy: cdk.RemovalPolicy.RETAIN,
-                blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-            });
+        // Declared in ./buckets.json. The runner adopts it by reference ONLY while it
+        // exists but is not yet a resource of this stack, i.e. while the stack is
+        // first created (the runner imports it in the same run); a bucket this stack
+        // owns is always kept as a resource.
+        this.benchmarkBucket = declaredBucket(this, 'BenchmarkBucket', bucketName, adoptExistingBuckets, {
+            versioned: true,
+            encryption: s3.BucketEncryption.S3_MANAGED,
+            blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+        });
 
         // Glue database for Athena queries over benchmark results
         this.glueDatabase = new glue.CfnDatabase(this, 'GlueDatabase', {

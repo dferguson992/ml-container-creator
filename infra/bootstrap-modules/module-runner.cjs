@@ -15,8 +15,11 @@
  * by the Node process.
  */
 
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { declaredBucketsForStack } = require('./bucket-declarations.cjs');
 
 const MODULES_ROOT = path.resolve(__dirname);
 
@@ -71,36 +74,122 @@ const ADOPTED_SERVICE_ROLES = [
 ];
 
 /**
- * Modules that own a retained S3 bucket, and the bucket-name template.
- * These buckets use RemovalPolicy.RETAIN, so they survive `cdk destroy`.
- * On re-provision we must adopt the existing bucket instead of recreating it.
- * @param {string} accountId
- * @param {string} region
- * @returns {Record<string, string>} module name -> bucket name
+ * The S3 buckets a stack declares (its buckets.json), with rendered physical names.
+ * Replaces the former hand-copied retainedBucketFor / retainedAdaptersBucketFor /
+ * TLS-bucket name maps: the declaration next to each stack is the ONE source
+ * (ADR-008; bucket consolidation R1.2).
+ * @param {string} stackNameSuffix
+ * @param {object} profile - { accountId, awsRegion, profileName }
+ * @returns {Array<object>} [{ logicalId, name, adoptContext, ... }]
  */
-function retainedBucketFor(moduleName, accountId, region) {
-    const map = {
-        benchmark: `mlcc-benchmark-results-${accountId}-${region}`,
-        training: `mlcc-training-${accountId}-${region}`,
-        core: `mlcc-core-${accountId}-${region}`,
-        ci: `mlcc-codebuild-source-${accountId}-${region}`,
-    };
-    return map[moduleName];
+function declaredBucketsFor(stackNameSuffix, profile) {
+    return declaredBucketsForStack(stackNameSuffix, {
+        account: profile.accountId,
+        region: profile.awsRegion,
+        profileName: profile.profileName
+    });
 }
 
 /**
- * Modules that own a SECOND retained S3 bucket, and the bucket-name template.
- * The training module owns both the training-data bucket (above) and the
- * adapters bucket, each RETAINed and each able to exist independently. This
- * companion map lets the runner detect the adapters bucket's existence
- * separately, so a re-provision adopts it only when it actually exists.
- * @returns {string|undefined} bucket name, or undefined if the module owns none
+ * Decide, per declared bucket, whether the stack must adopt it by reference.
+ * Adopt ONLY when the bucket exists AND is not already a resource of this stack.
+ * A bucket the stack already owns is always kept as a resource — adopting it by
+ * reference would drop it from the template and CloudFormation would orphan it
+ * (DELETE_SKIPPED) on the next update (bucket consolidation R1.1, report F1).
+ * Pure: the caller supplies the existence and ownership facts.
+ * @param {Array<object>} declared - from declaredBucketsFor()
+ * @param {Set<string>} ownedNames - physical IDs of AWS::S3::Bucket resources in the stack
+ * @param {(name: string) => boolean} exists
+ * @returns {Array<{bucket: object, decision: 'owned'|'adopt'|'create'}>}
  */
-function retainedAdaptersBucketFor(moduleName, accountId, region) {
-    const map = {
-        training: `mlcc-training-adapters-${accountId}-${region}`,
-    };
-    return map[moduleName];
+function planBucketAdoption(declared, ownedNames, exists) {
+    return declared.map((bucket) => {
+        if (ownedNames.has(bucket.name)) return { bucket, decision: 'owned' };
+        if (exists(bucket.name)) return { bucket, decision: 'adopt' };
+        return { bucket, decision: 'create' };
+    });
+}
+
+/**
+ * Locate a declared bucket's logical ID in a synthesized CDK template: by the
+ * aws:cdk:path metadata (`<stack>/<constructId>/Resource`), else by BucketName.
+ * @returns {string|undefined}
+ */
+function findBucketLogicalId(template, stackName, bucket) {
+    const resources = (template && template.Resources) || {};
+    const wantedPath = `${stackName}/${bucket.logicalId}/Resource`;
+    for (const [logicalId, res] of Object.entries(resources)) {
+        if (!res || res.Type !== 'AWS::S3::Bucket') continue;
+        if (res.Metadata && res.Metadata['aws:cdk:path'] === wantedPath) return logicalId;
+    }
+    for (const [logicalId, res] of Object.entries(resources)) {
+        if (!res || res.Type !== 'AWS::S3::Bucket') continue;
+        if (res.Properties && res.Properties.BucketName === bucket.name) return logicalId;
+    }
+    return undefined;
+}
+
+/**
+ * Build the template + resources-to-import for a CloudFormation IMPORT change set
+ * that contains ONLY the bucket import (R1.5; report risk R3). The template is the
+ * DEPLOYED template verbatim plus one minimal AWS::S3::Bucket per imported bucket
+ * (BucketName + Retain policies). Properties are deliberately minimal: import does
+ * not reconcile properties, so the follow-up normal deploy must see a diff to apply
+ * the configured versioning / encryption / public-access block / lifecycle / tags.
+ * Pure.
+ * @param {object} deployedTemplate - current stack template (parsed)
+ * @param {Array<{logicalId: string, bucketName: string}>} imports
+ * @returns {{ template: object, resourcesToImport: Array<object> }}
+ */
+function buildImportTemplate(deployedTemplate, imports) {
+    const template = JSON.parse(JSON.stringify(deployedTemplate));
+    template.Resources = template.Resources || {};
+    const resourcesToImport = [];
+    for (const { logicalId, bucketName } of imports) {
+        if (template.Resources[logicalId]) {
+            throw new Error(`Cannot import ${bucketName}: logical ID ${logicalId} already exists in the deployed template`);
+        }
+        template.Resources[logicalId] = {
+            Type: 'AWS::S3::Bucket',
+            DeletionPolicy: 'Retain',
+            UpdateReplacePolicy: 'Retain',
+            Properties: { BucketName: bucketName }
+        };
+        resourcesToImport.push({
+            ResourceType: 'AWS::S3::Bucket',
+            LogicalResourceId: logicalId,
+            ResourceIdentifier: { BucketName: bucketName }
+        });
+    }
+    return { template, resourcesToImport };
+}
+
+/**
+ * Assert a described IMPORT change set contains exactly the expected bucket imports
+ * and nothing else (no Add / Modify / Remove). Pure; throws on any extra change.
+ * @param {object} changeSet - `describe-change-set` output
+ * @param {string[]} expectedLogicalIds
+ */
+function assertImportOnlyChangeSet(changeSet, expectedLogicalIds) {
+    const changes = (changeSet && changeSet.Changes) || [];
+    const seen = [];
+    const unexpected = [];
+    for (const c of changes) {
+        const rc = c.ResourceChange || {};
+        if (rc.Action === 'Import' && rc.ResourceType === 'AWS::S3::Bucket' && expectedLogicalIds.includes(rc.LogicalResourceId)) {
+            seen.push(rc.LogicalResourceId);
+        } else {
+            unexpected.push(`${rc.Action || c.Type} ${rc.ResourceType || '?'} ${rc.LogicalResourceId || '?'}`);
+        }
+    }
+    const missing = expectedLogicalIds.filter((id) => !seen.includes(id));
+    if (unexpected.length > 0 || missing.length > 0) {
+        const detail = [
+            unexpected.length ? `Unexpected: ${unexpected.join('; ')}.` : '',
+            missing.length ? `Missing imports: ${missing.join(', ')}.` : ''
+        ].filter(Boolean).join(' ');
+        throw new Error(`IMPORT change set is not import-only — refusing to execute. ${detail}`);
+    }
 }
 
 /**
@@ -296,24 +385,37 @@ class CdkModuleRunner {
     }
 
     /**
-     * Compute the CDK context flags for adopting retained resources (S3 bucket,
-     * ECR repo) that already exist. Shared by provision() and diff() so the
-     * dry-run preview synthesizes the SAME template as the real deploy.
+     * Compute the CDK context flags for adopting retained resources (S3 buckets,
+     * ECR repo, service roles) that already exist. Shared by provision() and diff()
+     * so the dry-run preview synthesizes the SAME template as the real deploy.
+     *
+     * Buckets come from this stack's buckets.json. A bucket is adopted by reference
+     * ONLY when it exists AND is not already a resource of this stack; a bucket the
+     * stack owns stays a resource, so a second bootstrap never DELETE_SKIPs it (R1.1).
+     * Adopt-by-reference only happens while CREATING a stack (the bucket survived a
+     * teardown); provision() imports the bucket in the same run (R1.5).
      * @param {object} profile - { accountId, awsRegion, awsProfile?, profileName }
-     * @param {object} [opts] - { verbose?: boolean } — print ♻️ adoption notices
+     * @param {object} [opts] - { verbose?: boolean } — print ♻️ adoption notices;
+     *   { assumeImported?: boolean } — synthesize as if every existing-but-unowned bucket
+     *   were already imported (diff() on an existing stack: provision() imports first,
+     *   so the deploy that follows carries no bucket adopt flag)
      * @returns {string[]} array of --context flags (possibly empty)
      */
     _computeAdoptFlags(profile, opts = {}) {
         const flags = [];
-        const bucketName = retainedBucketFor(this.name, profile.accountId, profile.awsRegion);
-        if (bucketName && this._bucketExists(bucketName, profile)) {
-            if (opts.verbose) console.log(`  ♻️  Existing bucket detected (${bucketName}) — adopting instead of recreating`);
-            flags.push('--context adoptExistingBuckets=true');
-        }
-        const adaptersBucketName = retainedAdaptersBucketFor(this.name, profile.accountId, profile.awsRegion);
-        if (adaptersBucketName && this._bucketExists(adaptersBucketName, profile)) {
-            if (opts.verbose) console.log(`  ♻️  Existing adapters bucket detected (${adaptersBucketName}) — adopting instead of recreating`);
-            flags.push('--context adoptExistingAdaptersBucket=true');
+        const declared = declaredBucketsFor(this.stackNameSuffix, profile);
+        if (declared.length > 0) {
+            const stackName = getStackName(profile.profileName, this.stackNameSuffix);
+            const owned = this._stackOwnedBucketNames(stackName, profile);
+            const plan = planBucketAdoption(declared, owned, (name) => this._bucketExists(name, profile));
+            for (const { bucket, decision } of plan) {
+                if (decision !== 'adopt' || opts.assumeImported) continue;
+                if (opts.verbose) {
+                    console.log(`  ♻️  Existing bucket ${bucket.name} is not a resource of ${stackName} — referencing it while the stack is created`);
+                    console.log('     (it is imported into the stack right after, in this same run)');
+                }
+                flags.push(`--context ${bucket.adoptContext}=true`);
+            }
         }
         const ecrRepo = retainedEcrRepoFor(this.name);
         if (ecrRepo && this._ecrRepoExists(ecrRepo, profile)) {
@@ -392,6 +494,15 @@ class CdkModuleRunner {
      *   forceDeploy=true (used by `bootstrap update`) always runs `cdk deploy`
      *   so CloudFormation diffs the template and applies any changes, instead of
      *   short-circuiting when the stack already exists.
+     * Declared buckets that exist but are not stack resources are IMPORTED into the
+     * stack as part of this call (R1.5, implicit — there is no separate command):
+     *   • stack exists → import first, then the normal deploy (the buckets are now
+     *     owned, so their configured properties apply);
+     *   • stack does not exist yet (bucket retained after a teardown) → create the
+     *     stack referencing the bucket, import it, deploy again — one run converges.
+     * The add-module short-circuit (stack already provisioned) still imports, and
+     * deploys once when it did import. A failed import throws (change set deleted);
+     * there is no adopt-by-reference fallback.
      * @returns {Promise<Record<string, string>>} Stack outputs
      */
     async provision(profile, opts = {}) {
@@ -402,19 +513,61 @@ class CdkModuleRunner {
         // starts clean, rather than failing with an un-updatable-stack error.
         await this._cleanupUnupdatableStack(stackName, profile);
 
-        // Idempotency short-circuit for `add-module`: if the stack already
-        // exists, don't redeploy. `bootstrap update` passes forceDeploy=true to
-        // bypass this — cdk deploy is itself a no-op when nothing changed, but
-        // will apply template changes when there are any.
-        if (!opts.forceDeploy) {
-            const currentStatus = await this.status(profile);
-            if (currentStatus.state === 'provisioned') {
-                console.log(`  ✅ ${this.name} already provisioned (${stackName})`);
-                return this._getStackOutputs(stackName, profile);
-            }
+        return this._provisionConverged(profile, opts, {
+            alreadyProvisioned: () => console.log(`  ✅ ${this.name} already provisioned (${stackName})`),
+            deploy: (isUpdate) => this._cdkDeploy(profile, isUpdate)
+        });
+    }
+
+    /**
+     * Shared provision flow (single-stack runner and each stack of the multi-stack
+     * runner): idempotency short-circuit + implicit bucket import (R1.5).
+     * @param {object} profile
+     * @param {object} opts - { forceDeploy?: boolean, synthContext?: Record<string,string> }
+     * @param {object} hooks - { deploy(isUpdate): Promise|void, alreadyProvisioned(): void }
+     * @returns {Promise<Record<string, string>>} Stack outputs
+     */
+    async _provisionConverged(profile, opts, hooks) {
+        const stackName = getStackName(profile.profileName, this.stackNameSuffix);
+        const hasBuckets = declaredBucketsFor(this.stackNameSuffix, profile).length > 0;
+        const importOpts = { synthContext: opts.synthContext || {} };
+
+        // Stack existence is needed for the add-module short-circuit and to decide
+        // whether the import runs before or after the deploy.
+        const existed = (hasBuckets || !opts.forceDeploy)
+            ? (await this.status(profile)).state === 'provisioned'
+            : true;
+
+        let imported = [];
+        if (hasBuckets && existed) imported = this._importUnownedBuckets(profile, importOpts);
+
+        // Idempotency short-circuit for `add-module`: an existing stack is not
+        // redeployed — unless it just imported buckets, which need one deploy to
+        // apply their configured properties. `bootstrap update` passes forceDeploy.
+        if (!opts.forceDeploy && existed && imported.length === 0) {
+            hooks.alreadyProvisioned();
+            return this._getStackOutputs(stackName, profile);
         }
 
-        console.log(`  ${opts.forceDeploy ? '🔄 Updating' : '🚀 Deploying'} ${this.name} module (${stackName})...`);
+        await hooks.deploy(opts.forceDeploy === true || existed);
+
+        if (hasBuckets && !existed) {
+            // Created while referencing retained buckets — import them now and
+            // deploy again so the run ends with every declared bucket owned.
+            const late = this._importUnownedBuckets(profile, importOpts);
+            if (late.length > 0) await hooks.deploy(true);
+        }
+        return this._getStackOutputs(stackName, profile);
+    }
+
+    /**
+     * Run `cdk deploy` for this stack with the current adopt flags.
+     * @param {object} profile
+     * @param {boolean} isUpdate - label only
+     */
+    _cdkDeploy(profile, isUpdate) {
+        const stackName = getStackName(profile.profileName, this.stackNameSuffix);
+        console.log(`  ${isUpdate ? '🔄 Updating' : '🚀 Deploying'} ${this.name} module (${stackName})...`);
 
         // Detect retained resources to adopt (bucket/ECR) — shared with diff()
         // so the dry-run preview synthesizes the SAME template as the real deploy.
@@ -448,7 +601,6 @@ class CdkModuleRunner {
         }
 
         console.log(`  ✅ ${this.name} module deployed`);
-        return this._getStackOutputs(stackName, profile);
     }
 
     /**
@@ -500,13 +652,33 @@ class CdkModuleRunner {
         const stackName = getStackName(profile.profileName, this.stackNameSuffix);
         console.log(`  🔍 Diffing ${this.name} module (${stackName})...`);
 
-        // Use the SAME adopt flags the real deploy would use, so the diff
-        // reflects reality (e.g. an adopted bucket shows as a reference, not a
-        // spurious [+] AWS::S3::Bucket create).
-        const adoptFlags = this._computeAdoptFlags(profile, { verbose: false });
+        // Planned bucket imports (R1.5), read-only: no change set is created.
+        let existed = false;
+        if (declaredBucketsFor(this.stackNameSuffix, profile).length > 0) {
+            existed = (await this.status(profile)).state === 'provisioned';
+            this._previewBucketImports(profile, existed);
+        }
 
+        // Use the SAME adopt flags the real deploy would use, so the diff
+        // reflects reality. On an existing stack provision() imports unowned
+        // buckets BEFORE deploying, so the deploy (and this diff) carries no bucket
+        // adopt flag; the imported buckets show as [+] AWS::S3::Bucket here.
+        const adoptFlags = this._computeAdoptFlags(profile, { verbose: false, assumeImported: existed });
+        this._cdkDiff(profile, adoptFlags);
+    }
+
+    /**
+     * Run `cdk diff` for this stack and stream the output.
+     * @param {object} profile
+     * @param {string[]} adoptFlags
+     */
+    _cdkDiff(profile, adoptFlags) {
+        const stackName = getStackName(profile.profileName, this.stackNameSuffix);
+        // --method template: compare templates directly. The default ('auto')
+        // creates a temporary change set, and the preview must stay read-only.
         const cdkCmd = [
             'npx cdk diff', stackName,
+            '--method template',
             `--context module=${this.stackNameSuffix}`,
             `--context profileName=${profile.profileName}`,
             `--context accountId=${profile.accountId}`,
@@ -531,6 +703,200 @@ class CdkModuleRunner {
             // `cdk diff` exits non-zero when there ARE differences — that's not
             // an error for our purposes. Only surface real failures.
             // (exit code 1 = diffs present; we let the streamed output speak.)
+        }
+    }
+
+    /**
+     * Plan this stack's declared buckets (owned / to import / to create). Read-only.
+     * @returns {{ stackName: string, plan: Array<{bucket: object, decision: string}> }}
+     */
+    _bucketPlan(profile) {
+        const stackName = getStackName(profile.profileName, this.stackNameSuffix);
+        const declared = declaredBucketsFor(this.stackNameSuffix, profile);
+        if (declared.length === 0) return { stackName, plan: [] };
+        const owned = this._stackOwnedBucketNames(stackName, profile);
+        return { stackName, plan: planBucketAdoption(declared, owned, (name) => this._bucketExists(name, profile)) };
+    }
+
+    /**
+     * Print one plan line per declared bucket.
+     * @param {Array<object>} plan
+     * @param {boolean} stackExists - false: an unowned bucket is referenced while the
+     *   stack is created, then imported in the same run
+     */
+    _printBucketPlan(plan, stackExists) {
+        const adoptLabel = stackExists
+            ? 'exists, not in the stack — will be imported'
+            : 'exists, stack not created yet — referenced at create, then imported in the same run';
+        for (const { bucket, decision } of plan) {
+            const label = { owned: 'owned by the stack — nothing to import', adopt: adoptLabel, create: 'does not exist — the deploy creates it' }[decision];
+            console.log(`    • s3://${bucket.name} (${bucket.logicalId}): ${label}`);
+        }
+    }
+
+    /**
+     * Read-only preview of the implicit bucket import (dry run / diff). Creates no
+     * change set and writes nothing.
+     * @param {object} profile
+     * @param {boolean} stackExists
+     * @returns {string[]} names of the buckets that would be imported
+     */
+    _previewBucketImports(profile, stackExists) {
+        const { stackName, plan } = this._bucketPlan(profile);
+        if (plan.length === 0) return [];
+        this._printBucketPlan(plan, stackExists);
+        const names = plan.filter((p) => p.decision === 'adopt').map((p) => p.bucket.name);
+        console.log(names.length > 0
+            ? `    📥 Would import into ${stackName}: ${names.map((n) => `s3://${n}`).join(', ')} (IMPORT change set, no data change)`
+            : `    ✓  ${stackName}: nothing to import`);
+        return names;
+    }
+
+    /**
+     * Implicit bucket import (R1.5) — a step of provision(), never a separate command.
+     *
+     * For each bucket this stack declares that EXISTS but is NOT yet a resource of
+     * the (existing) stack: create a CloudFormation IMPORT change set whose template
+     * is the deployed template plus ONLY those buckets (no other diff — report risk
+     * R3), verify the change set is import-only, execute it and wait. The caller then
+     * runs the normal deploy so the configured properties (versioning, encryption,
+     * public access block, lifecycle, tags) apply. Idempotent: owned buckets are
+     * skipped. Any failure deletes the change set and throws, naming the stack and
+     * buckets — the caller must not fall back to adopt-by-reference.
+     *
+     * @param {object} profile - { accountId, awsRegion, awsProfile?, profileName }
+     * @param {object} [opts] - { synthContext?: Record<string,string> } extra CDK context
+     *   for the offline synth (the multi-stack runner's SSM context)
+     * @returns {string[]} names of the buckets imported (empty = nothing to do)
+     */
+    _importUnownedBuckets(profile, opts = {}) {
+        const { stackName, plan } = this._bucketPlan(profile);
+        if (plan.length === 0) return [];
+        this._printBucketPlan(plan, true);
+        const toImport = plan.filter((p) => p.decision === 'adopt').map((p) => p.bucket);
+        if (toImport.length === 0) return [];
+
+        const what = `${stackName} (${toImport.map((b) => `s3://${b.name}`).join(', ')})`;
+        for (const b of toImport) {
+            console.log(`    📥 Bringing existing bucket s3://${b.name} under CloudFormation (import, no data change)`);
+        }
+
+        let imports;
+        let deployed;
+        let body;
+        try {
+            const synthesized = this._synthTemplate(profile, opts.synthContext || {});
+            imports = toImport.map((bucket) => {
+                const logicalId = findBucketLogicalId(synthesized, stackName, bucket);
+                if (!logicalId) {
+                    throw new Error(`synthesized template has no AWS::S3::Bucket for ${bucket.name} (${bucket.logicalId})`);
+                }
+                return { logicalId, bucketName: bucket.name };
+            });
+            deployed = this._getDeployedTemplate(stackName, profile);
+            const built = buildImportTemplate(deployed, imports);
+            body = { template: JSON.stringify(built.template), resourcesToImport: built.resourcesToImport };
+        } catch (err) {
+            throw new Error(`Bucket import into ${what} failed before any change set was created: ${err.message}`);
+        }
+        const size = Buffer.byteLength(body.template, 'utf8');
+        if (size > 51200) {
+            throw new Error(`Bucket import into ${what} aborted: import template is ${size} bytes (> 51,200 inline limit); import manually with --template-url`);
+        }
+
+        const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `mlcc-import-${this.stackNameSuffix}-`));
+        const templateFile = path.join(workDir, 'import-template.json');
+        const resourcesFile = path.join(workDir, 'resources-to-import.json');
+        try {
+            fs.writeFileSync(templateFile, body.template);
+            fs.writeFileSync(resourcesFile, JSON.stringify(body.resourcesToImport, null, 2));
+
+            const changeSetName = `mlcc-import-buckets-${Date.now()}`;
+            const params = Object.keys(deployed.Parameters || {}).map((k) => `ParameterKey=${k},UsePreviousValue=true`);
+            try {
+                this._aws(profile, [
+                    'cloudformation', 'create-change-set',
+                    '--stack-name', stackName,
+                    '--change-set-name', changeSetName,
+                    '--change-set-type', 'IMPORT',
+                    '--template-body', `file://${templateFile}`,
+                    '--resources-to-import', `file://${resourcesFile}`,
+                    '--capabilities', 'CAPABILITY_IAM', 'CAPABILITY_NAMED_IAM', 'CAPABILITY_AUTO_EXPAND',
+                    ...(params.length ? ['--parameters', ...params] : [])
+                ]);
+                this._aws(profile, ['cloudformation', 'wait', 'change-set-create-complete', '--stack-name', stackName, '--change-set-name', changeSetName]);
+                const described = JSON.parse(this._aws(profile, ['cloudformation', 'describe-change-set', '--stack-name', stackName, '--change-set-name', changeSetName, '--output', 'json']));
+                assertImportOnlyChangeSet(described, imports.map((i) => i.logicalId));
+            } catch (err) {
+                try {
+                    this._aws(profile, ['cloudformation', 'delete-change-set', '--stack-name', stackName, '--change-set-name', changeSetName]);
+                } catch { /* best-effort cleanup; the original error is what matters */ }
+                throw new Error(`Bucket import into ${what} aborted — IMPORT change set failed or was not import-only (deleted it; nothing changed): ${err.message}`);
+            }
+            try {
+                this._aws(profile, ['cloudformation', 'execute-change-set', '--stack-name', stackName, '--change-set-name', changeSetName]);
+                this._aws(profile, ['cloudformation', 'wait', 'stack-import-complete', '--stack-name', stackName]);
+            } catch (err) {
+                throw new Error(`Bucket import into ${what} failed while executing change set ${changeSetName}: ${err.message}. Check the stack events, then re-run.`);
+            }
+        } finally {
+            fs.rmSync(workDir, { recursive: true, force: true });
+        }
+        console.log(`    ✅ Imported into ${stackName}: ${imports.map((i) => i.bucketName).join(', ')}`);
+        return toImport.map((b) => b.name);
+    }
+
+    /**
+     * Run an AWS CLI command (argv form — no shell interpolation) and return stdout.
+     * @param {object} profile - { awsRegion, awsProfile? }
+     * @param {string[]} args
+     * @returns {string}
+     */
+    _aws(profile, args) {
+        const argv = [...args, '--region', profile.awsRegion];
+        if (profile.awsProfile) argv.push('--profile', profile.awsProfile);
+        return execFileSync('aws', argv, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    }
+
+    /**
+     * The stack's CURRENT deployed template (`get-template --template-stage Original`).
+     * @returns {object}
+     */
+    _getDeployedTemplate(stackName, profile) {
+        const out = this._aws(profile, [
+            'cloudformation', 'get-template', '--stack-name', stackName,
+            '--template-stage', 'Original', '--query', 'TemplateBody', '--output', 'json'
+        ]);
+        const body = JSON.parse(out);
+        return typeof body === 'string' ? JSON.parse(body) : body;
+    }
+
+    /**
+     * Synthesize this stack WITHOUT any bucket adopt flags (every declared bucket as a
+     * resource) and return the parsed template. Used only to read the buckets'
+     * logical IDs for the import; offline (no AWS calls).
+     * @returns {object}
+     */
+    _synthTemplate(profile, extraContext = {}) {
+        const stackName = getStackName(profile.profileName, this.stackNameSuffix);
+        const outDir = fs.mkdtempSync(path.join(os.tmpdir(), `mlcc-synth-${this.stackNameSuffix}-`));
+        execFileSync('npx', [
+            'cdk', 'synth', stackName, '--quiet', '--output', outDir,
+            ...Object.entries(extraContext).flatMap(([k, v]) => ['--context', `${k}=${v}`]),
+            '--context', `module=${this.stackNameSuffix}`,
+            '--context', `profileName=${profile.profileName}`,
+            '--context', `accountId=${profile.accountId}`,
+            '--context', `region=${profile.awsRegion}`
+        ], {
+            cwd: MODULES_ROOT,
+            encoding: 'utf8',
+            stdio: ['pipe', 'pipe', 'pipe'],
+            env: { ...process.env, CDK_DEFAULT_REGION: profile.awsRegion, CDK_DEFAULT_ACCOUNT: profile.accountId }
+        });
+        try {
+            return JSON.parse(fs.readFileSync(path.join(outDir, `${stackName}.template.json`), 'utf8'));
+        } finally {
+            fs.rmSync(outDir, { recursive: true, force: true });
         }
     }
 
@@ -702,6 +1068,39 @@ class CdkModuleRunner {
             if (msg.includes('403') || msg.includes('Forbidden')) return true;
             return false;
         }
+    }
+
+    /**
+     * Physical names of the AWS::S3::Bucket resources currently in a stack
+     * (`describe-stack-resources`). A stack that does not exist owns nothing → empty
+     * set. Any OTHER failure throws: guessing "not owned" for a bucket the stack
+     * does own would adopt it by reference and orphan it (R1.1), so never guess.
+     * @param {string} stackName
+     * @param {object} profile - { awsRegion, awsProfile? }
+     * @returns {Set<string>}
+     */
+    _stackOwnedBucketNames(stackName, profile) {
+        let out;
+        try {
+            out = this._aws(profile, [
+                'cloudformation', 'describe-stack-resources', '--stack-name', stackName, '--output', 'json'
+            ]);
+        } catch (err) {
+            const msg = (err.stderr || err.message || '').toString();
+            if (/does not exist/i.test(msg)) return new Set();
+            throw new Error(
+                `Could not determine which buckets ${stackName} owns (describe-stack-resources failed): ` +
+                `${msg.split('\n')[0]}. Refusing to guess — adopting an owned bucket by reference would orphan it.`
+            );
+        }
+        const parsed = JSON.parse(out || '{}');
+        const names = new Set();
+        for (const r of parsed.StackResources || []) {
+            if (r.ResourceType !== 'AWS::S3::Bucket' || !r.PhysicalResourceId) continue;
+            if (/^DELETE_/.test(r.ResourceStatus || '')) continue;
+            names.add(r.PhysicalResourceId);
+        }
+        return names;
     }
 
     /**
@@ -1253,8 +1652,10 @@ class CdkMultiStackModuleRunner {
         }
 
         // Ensure lifecycle script exists in S3 (required by HyperPod CreateCluster).
-        // Uses the core models bucket which must already be provisioned.
-        const lifecycleBucket = `mlcc-core-${profile.accountId}-${profile.awsRegion}`;
+        // Uses the core models bucket which must already be provisioned; its name
+        // comes from the core stack's declaration (core/buckets.json).
+        const coreBucket = declaredBucketsFor('core', profile).find((b) => b.logicalId === 'ModelsBucketResource');
+        const lifecycleBucket = coreBucket.name;
         const lifecycleKey = 'hyperpod-lifecycle/on_create.sh';
         try {
             execSync(
@@ -1524,16 +1925,22 @@ class CdkMultiStackModuleRunner {
         // Cleanup un-updatable stacks first
         await runner._cleanupUnupdatableStack(stackName, profile);
 
-        // Idempotency short-circuit
-        if (!opts.forceDeploy) {
-            const currentStatus = await runner.status(profile);
-            if (currentStatus.state === 'provisioned') {
-                console.log(`    ✅ ${stackSuffix} already provisioned (${stackName})`);
-                return runner._getStackOutputs(stackName, profile);
-            }
-        }
+        // Same flow as the single-stack runner: idempotency short-circuit plus the
+        // implicit import of declared-but-unowned buckets (R1.5, e.g. the
+        // inference-operator TLS bucket). Stacks without declared buckets behave
+        // exactly as before.
+        return runner._provisionConverged(profile, { ...opts, synthContext: ssmContext }, {
+            alreadyProvisioned: () => console.log(`    ✅ ${stackSuffix} already provisioned (${stackName})`),
+            deploy: (isUpdate) => this._cdkDeployStack(runner, stackSuffix, profile, isUpdate, ssmContext)
+        });
+    }
 
-        console.log(`    ${opts.forceDeploy ? '🔄 Updating' : '🚀 Deploying'} ${stackSuffix} (${stackName})...`);
+    /**
+     * Run `cdk deploy` for one stack of this module with SSM context injected.
+     */
+    _cdkDeployStack(runner, stackSuffix, profile, isUpdate, ssmContext) {
+        const stackName = getStackName(profile.profileName, stackSuffix);
+        console.log(`    ${isUpdate ? '🔄 Updating' : '🚀 Deploying'} ${stackSuffix} (${stackName})...`);
 
         // Compile TypeScript before deploying so source changes are always picked up.
         // This is a fast no-op when nothing changed (tsc incremental).
@@ -1544,14 +1951,11 @@ class CdkMultiStackModuleRunner {
             throw new Error('Bootstrap TypeScript build failed');
         }
 
-        // Build adopt flags for this specific stack. _computeAdoptFlags now covers
-        // bucket/ECR AND the RETAIN'd service-role adoption (shared with diff), so the
-        // role flag is NOT computed separately here anymore (avoids a duplicate
-        // --context adoptRoles=true).
+        // Build adopt flags for this specific stack. _computeAdoptFlags covers the
+        // declared buckets (incl. the inference-operator TLS bucket, ownership-checked),
+        // ECR AND the RETAIN'd service-role adoption (shared with diff), so no flag is
+        // computed separately here (avoids duplicate --context flags).
         const adoptFlags = runner._computeAdoptFlags(profile, { verbose: true });
-
-        // Detect retained TLS bucket for inference-operator stack
-        const tlsBucketAdoptFlag = this._detectRetainedTlsBucket(stackSuffix, profile);
 
         // Add SSM context flags
         const contextFlags = Object.entries(ssmContext).map(
@@ -1566,7 +1970,6 @@ class CdkMultiStackModuleRunner {
             `--context accountId=${profile.accountId}`,
             `--context region=${profile.awsRegion}`,
             ...adoptFlags,
-            ...tlsBucketAdoptFlag,
             ...contextFlags,
         ].filter(Boolean).join(' ');
 
@@ -1588,31 +1991,6 @@ class CdkMultiStackModuleRunner {
         }
 
         console.log(`    ✅ ${stackSuffix} deployed`);
-        return runner._getStackOutputs(stackName, profile);
-    }
-
-    /**
-     * Detect whether the inference-operator's TLS bucket already exists
-     * (RETAIN'd from a prior deploy). Returns context flag if found.
-     * @param {string} stackSuffix
-     * @param {object} profile
-     * @returns {string[]}
-     */
-    _detectRetainedTlsBucket(stackSuffix, profile) {
-        if (stackSuffix !== 'inference-operator') return [];
-
-        const bucketName = `mlcc-hyperpod-tls-${profile.profileName}`;
-        try {
-            execSync(
-                `aws s3api head-bucket --bucket ${bucketName} --region ${profile.awsRegion}` +
-                (profile.awsProfile ? ` --profile ${profile.awsProfile}` : ''),
-                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-            );
-            console.log(`  ♻️  Existing TLS bucket detected (${bucketName}) — adopting instead of recreating`);
-            return ['--context adoptTlsBucket=true'];
-        } catch {
-            return [];
-        }
     }
 
     /**
@@ -1971,7 +2349,7 @@ class CdkMultiStackModuleRunner {
 
         // TLS bucket — RETAIN'd, skip deletion to avoid S3 DNS propagation issues.
         // The bucket is cheap to keep and avoids the 24-hour name reuse delay.
-        // To truly remove it: `aws s3 rb s3://mlcc-hyperpod-tls-<profile> --force`
+        // To truly remove it: `aws s3 rb s3://<tls bucket> --force` (name: hyperpod/stacks/buckets.json)
 
         // Delete IAM roles
         const roleNames = [
@@ -2082,6 +2460,13 @@ class CdkMultiStackModuleRunner {
 module.exports = {
     CdkModuleRunner,
     CdkMultiStackModuleRunner,
+    // Bucket ownership / import (bucket consolidation R1.1, R1.2, R1.5) — pure helpers
+    // exported for unit tests.
+    declaredBucketsFor,
+    planBucketAdoption,
+    findBucketLogicalId,
+    buildImportTemplate,
+    assertImportOnlyChangeSet,
     // Exported for unit testing (BL143 Group A — offline recovery state machine).
     recoverUpdateRollbackFailed,
     parseStuckResources,

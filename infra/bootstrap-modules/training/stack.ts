@@ -5,117 +5,95 @@ import * as cdk from 'aws-cdk-lib';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
+import TRAINING_BUCKETS from './buckets.json';
+import {
+    StackBucketDeclarations, bucketDeclaration, declaredBucket, renderBucketName,
+} from '../bucket-declarations';
+
+/** The training stack's bucket declarations (single declared source, R1.2). */
+export const BUCKETS: StackBucketDeclarations = TRAINING_BUCKETS;
 
 export interface MlccTrainingStackProps extends cdk.StackProps {
     profileName: string;
     adoptExistingBuckets?: boolean;
     adoptExistingAdaptersBucket?: boolean;
+    adoptExistingArtifactsBucket?: boolean;
 }
 
 /**
- * Training module: S3 bucket for training data + training execution role.
+ * Training module: the per-project artifacts bucket (tune/train/optimize output and
+ * the MLflow App artifact store), the legacy training + adapters buckets, and the
+ * dual-trust reward-Lambda role.
+ *
+ * Every bucket is declared in ./buckets.json and is a CloudFormation resource of
+ * this stack (RETAIN). The runner adopts a bucket by reference ONLY when it exists
+ * and is not yet a resource of this stack (while the stack is created); the runner
+ * imports it in the same run, after which the stack owns it and no deploy ever
+ * orphans it.
  */
 export class MlccTrainingStack extends cdk.Stack {
     constructor(scope: Construct, id: string, props: MlccTrainingStackProps) {
         super(scope, id, props);
 
-        const { profileName, adoptExistingBuckets, adoptExistingAdaptersBucket } = props;
+        const {
+            profileName, adoptExistingBuckets, adoptExistingAdaptersBucket, adoptExistingArtifactsBucket,
+        } = props;
 
         cdk.Tags.of(this).add('mlcc:managed-by', 'ml-container-creator');
         cdk.Tags.of(this).add('mlcc:module', 'training');
         cdk.Tags.of(this).add('mlcc:profile', profileName);
 
-        const bucketName = `mlcc-training-${this.account}-${this.region}`;
-        const adaptersBucketName = `mlcc-training-adapters-${this.account}-${this.region}`;
+        const nameVars = { account: this.account, region: this.region, profileName };
+        const bucketName = renderBucketName(bucketDeclaration(BUCKETS, 'TrainingBucket'), nameVars);
+        const adaptersBucketName = renderBucketName(bucketDeclaration(BUCKETS, 'AdaptersBucket'), nameVars);
+        const artifactsBucketName = renderBucketName(bucketDeclaration(BUCKETS, 'ArtifactsBucket'), nameVars);
 
-        // Training data bucket (RETAIN on delete — data is valuable). When the
-        // bucket already exists from a prior provision (retained on teardown),
-        // adopt it by reference instead of colliding on create.
-        const trainingBucket = adoptExistingBuckets
-            ? s3.Bucket.fromBucketName(this, 'TrainingBucket', bucketName)
-            : new s3.Bucket(this, 'TrainingBucket', {
-                bucketName,
-                versioned: true,
-                encryption: s3.BucketEncryption.S3_MANAGED,
-                removalPolicy: cdk.RemovalPolicy.RETAIN,
-                blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-            });
-
-        // Adapters bucket — LoRA adapter staging for do/adapter. Separate bucket
-        // (distinct lifecycle: small, long-lived, re-deployed) but owned by the
-        // same training module/stack. RETAIN — adapters are valuable deploy artifacts.
-        const adaptersBucket = adoptExistingAdaptersBucket
-            ? s3.Bucket.fromBucketName(this, 'AdaptersBucket', adaptersBucketName)
-            : new s3.Bucket(this, 'AdaptersBucket', {
-                bucketName: adaptersBucketName,
-                versioned: true,
-                encryption: s3.BucketEncryption.S3_MANAGED,
-                removalPolicy: cdk.RemovalPolicy.RETAIN,
-                blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-            });
-
-        const trainingRole = new iam.Role(this, 'TrainingRole', {
-            roleName: `mlcc-training-role-${this.region}`,
-            assumedBy: new iam.ServicePrincipal('sagemaker.amazonaws.com'),
-            description: 'SageMaker training execution role for mlcc',
+        // Artifacts bucket — per-project raw job output (<project>/tune|train|optimize/)
+        // and the MLflow App artifact store. Physical name is the pre-existing store
+        // (owner decision D7); RETAIN. Versioning stays OFF (D2): it holds hundreds of
+        // GiB of overwritten checkpoint state and versioning can only be suspended,
+        // never removed. Lifecycle = abort incomplete multipart uploads only (D1) —
+        // nothing that could delete resume state or recorded artifacts.
+        declaredBucket(this, 'ArtifactsBucket', artifactsBucketName, adoptExistingArtifactsBucket, {
+            versioned: false,
+            encryption: s3.BucketEncryption.S3_MANAGED,
+            blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+            lifecycleRules: [{
+                id: 'AbortIncompleteMultipartUploads',
+                abortIncompleteMultipartUploadAfter: cdk.Duration.days(7),
+            }],
         });
 
-        trainingRole.addToPolicy(new iam.PolicyStatement({
-            actions: ['s3:GetObject', 's3:PutObject', 's3:ListBucket'],
-            resources: [
-                trainingBucket.bucketArn, `${trainingBucket.bucketArn}/*`,
-                adaptersBucket.bucketArn, `${adaptersBucket.bucketArn}/*`,
-            ],
-        }));
+        // Training data bucket — LEGACY (frozen): kept and owned so recorded URIs and
+        // the reward-evaluator code backups stay valid. RETAIN.
+        const trainingBucket = declaredBucket(this, 'TrainingBucket', bucketName, adoptExistingBuckets, {
+            versioned: true,
+            encryption: s3.BucketEncryption.S3_MANAGED,
+            blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+        });
 
-        trainingRole.addToPolicy(new iam.PolicyStatement({
-            actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'],
-            resources: ['arn:aws:logs:*:*:*'],
-        }));
+        // Adapters bucket — LoRA adapter staging for do/adapter (SageMaker IC path).
+        // Separate bucket owned by the same stack. RETAIN — adapters are valuable
+        // deploy artifacts.
+        declaredBucket(this, 'AdaptersBucket', adaptersBucketName, adoptExistingAdaptersBucket, {
+            versioned: true,
+            encryption: s3.BucketEncryption.S3_MANAGED,
+            blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+        });
 
-        // ── Launch-gate IAM (BL123) ─────────────────────────────────────────────
-        // The 11 actions a SageMaker training-type workload needs to LAUNCH — the
-        // minimum delta the BL122 spike's IamRoleResolver flagged for the native
-        // ai_registry DataSet/Evaluator create path (which runs a training-type
-        // workload) and the managed-RL customization jobs: EC2 VPC/ENI setup,
-        // CloudWatch metric emission, and the ECR auth token. These are
-        // service-scoped at launch time, so resource '*' is required (ENI/VPC
-        // describe + GetAuthorizationToken take no narrower ARN).
-        //
-        // BL123 is the SOLE writer of this block. BL117 CONSUMES it and MUST NOT
-        // add a second copy — extend THIS statement if the full runtime set grows
-        // (the spike flagged the launch gate as not-yet-exhaustive). A runtime
-        // AccessDenied here surfaces as a permission error from the create call;
-        // the actionable guidance is to re-run `ml-container-creator bootstrap`
-        // (or add-module training) to refresh this role.
-        trainingRole.addToPolicy(new iam.PolicyStatement({
-            sid: 'MlccLaunchGate',
-            actions: [
-                // CloudWatch metrics the training container publishes.
-                'cloudwatch:PutMetricData',
-                // ECR auth token for pulling the training/DLC image.
-                'ecr:GetAuthorizationToken',
-                // EC2 VPC/ENI setup for a VPC-attached training job.
-                'ec2:CreateNetworkInterface',
-                'ec2:CreateNetworkInterfacePermission',
-                'ec2:DeleteNetworkInterface',
-                'ec2:DeleteNetworkInterfacePermission',
-                'ec2:DescribeDhcpOptions',
-                'ec2:DescribeNetworkInterfaces',
-                'ec2:DescribeSecurityGroups',
-                'ec2:DescribeSubnets',
-                'ec2:DescribeVpcs',
-            ],
-            resources: ['*'],
-        }));
+        // NOTE (owner decision D4): the former `mlcc-training-role-<region>` execution
+        // role was removed. No runtime path assumed it — every SageMaker job MLCC
+        // launches (tune, train, stage, optimize, benchmark, MLflow) runs as the core
+        // execution role (ROLE_ARN), which already carries the launch-gate
+        // permissions (core/stack.ts VpcNetworking / ECRPull / CloudWatchMetrics) and
+        // the reward-Lambda PassRole below.
 
         // ── Reward-Lambda role (RLVR/MTRL verifiable-reward evaluators) ─────────
         // `do/register evaluator --from-sample --finalize` has SageMaker CREATE and
         // OWN a managed Lambda from the user's reward function. That requires a role
         // with DUAL trust — assumable by BOTH sagemaker.amazonaws.com (SageMaker
         // creates the function on the user's behalf) AND lambda.amazonaws.com (the
-        // function assumes it at invoke time). The plain training role above trusts
-        // only SageMaker, so it cannot be the reward-Lambda role. This role is the
+        // function assumes it at invoke time). This role is the
         // single source of truth for that path; its ARN is exported and threaded to
         // the runtime as MLCC_REWARD_LAMBDA_ROLE_ARN (consumed by register_evaluator).
         const rewardLambdaRole = new iam.Role(this, 'RewardLambdaRole', {
@@ -144,16 +122,10 @@ export class MlccTrainingStack extends cdk.Stack {
             resources: [trainingBucket.bucketArn, `${trainingBucket.bucketArn}/*`],
         }));
 
-        // The training role must be able to PASS the reward-Lambda role to the
-        // Lambda service when SageMaker creates the function on its behalf.
-        trainingRole.addToPolicy(new iam.PolicyStatement({
-            sid: 'MlccPassRewardLambdaRole',
-            actions: ['iam:PassRole'],
-            resources: [rewardLambdaRole.roleArn],
-            conditions: {
-                StringEquals: { 'iam:PassedToService': 'lambda.amazonaws.com' },
-            },
-        }));
+        // (The former `MlccPassRewardLambdaRole` statement lived on the deleted,
+        // never-assumed training role, so removing it changes no effective permission.
+        // The reward Lambda is created by `do/register evaluator --finalize` with the
+        // caller's own credentials.)
 
         // Outputs
         new cdk.CfnOutput(this, 'TrainingBucketOutput', {
@@ -166,10 +138,14 @@ export class MlccTrainingStack extends cdk.Stack {
             exportName: `mlcc-${profileName}-training-AdaptersBucket`,
         });
 
-        new cdk.CfnOutput(this, 'TrainingRoleArnOutput', {
-            value: trainingRole.roleArn,
-            exportName: `mlcc-${profileName}-training-TrainingRoleArn`,
+        // Artifacts bucket name → moduleOutputs.training.ArtifactsBucket →
+        // profile artifactsS3Bucket → ARTIFACTS_S3_BUCKET (do/lib/profile.sh). The
+        // ONLY way consumers (do/tune, do/train, do/optimize, provision-mlflow) learn it.
+        new cdk.CfnOutput(this, 'ArtifactsBucketOutput', {
+            value: artifactsBucketName,
+            exportName: `mlcc-${profileName}-training-ArtifactsBucket`,
         });
+
 
         new cdk.CfnOutput(this, 'RewardLambdaRoleArnOutput', {
             value: rewardLambdaRole.roleArn,

@@ -115,7 +115,7 @@ By default, `--from-tune` stages adapter weights via a **SageMaker Processing Jo
 ./do/adapter add tuned-sft --from-tune sft
 
 # Or pass the S3 path explicitly (--weights still works as a deprecated alias)
-./do/adapter add tuned-sft --from-weights s3://mlcc-tune-123456789012-us-east-1/output/adapter.tar.gz
+./do/adapter add tuned-sft --from-weights s3://<artifacts-bucket>/<project>/tune/sft/<job>/output/model/checkpoints/hf/
 
 # Stage locally instead of via Processing Job
 ./do/adapter add tuned-sft --from-tune --local
@@ -136,13 +136,13 @@ By default, `--from-tune` stages adapter weights via a **SageMaker Processing Jo
 ./do/add-ic tuned-v1 --from-tune
 
 # Or pass the S3 path explicitly (--model-data still works as a deprecated alias)
-./do/add-ic tuned-v1 --from-weights s3://mlcc-tune-123456789012-us-east-1/output/model.tar.gz
+./do/add-ic tuned-v1 --from-weights s3://<artifacts-bucket>/<project>/tune/sft/<job>/output/model/checkpoints/hf_merged/
 
 # Or a registered full-model version
 ./do/add-ic tuned-v1 --from-registry arn:aws:sagemaker:us-east-1:123456789012:model-package/my-project/3
 
 # Swap the current base IC's artifact in place
-./do/add-ic default --update --from-weights s3://mlcc-tune-123456789012-us-east-1/output/model.tar.gz
+./do/add-ic default --update --from-weights s3://<artifacts-bucket>/<project>/tune/sft/<job>/output/model/checkpoints/hf_merged/
 ```
 
 ### One `--from-*` family on every target
@@ -1014,7 +1014,7 @@ Each alias is validated against the selected technique's descriptor exactly like
 | Flag | Type | Description |
 |---|---|---|
 | `--model` | HuggingFace model ID | Override the model to customize (defaults to `MODEL_ID` from `do/config`) |
-| `--output-bucket` | S3 bucket name | Override the output bucket (defaults to `TUNE_S3_BUCKET`) |
+| `--output-bucket` | S3 bucket name | Override the output bucket (defaults to the profile's artifacts bucket, `ARTIFACTS_S3_BUCKET`) |
 | `--role` | IAM role ARN | Override the execution role |
 
 ### Job control

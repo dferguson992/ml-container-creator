@@ -21,6 +21,12 @@ const BOOTSTRAP = resolve(__dirname, '../../infra/bootstrap-modules');
 const EKS_CLUSTER_STACK = resolve(BOOTSTRAP, 'eks/stacks/eks-cluster-stack.ts');
 const HYPERPOD_CLUSTER_STACK = resolve(BOOTSTRAP, 'hyperpod/stacks/hyperpod-cluster-stack.ts');
 const INFERENCE_OPERATOR_STACK = resolve(BOOTSTRAP, 'hyperpod/stacks/inference-operator-stack.ts');
+const MODULES_ROOT = BOOTSTRAP;
+// The TLS bucket's single declaration (bucket consolidation R1.2) — the name contract
+// these source checks guard now lives here, not as a literal in the stacks.
+const TLS_DECLARATION = JSON.parse(
+    readFileSync(resolve(BOOTSTRAP, 'hyperpod/stacks/buckets.json'), 'utf8')
+).buckets.TlsBucket;
 
 describe('HyperPod CDK Stack Files', () => {
     describe('Stack file existence', () => {
@@ -154,8 +160,11 @@ describe('HyperPod CDK Stack Files', () => {
 
                 assert.ok(lifecyclePolicy.includes('\'s3:GetObject\''));
                 assert.ok(lifecyclePolicy.includes('\'s3:ListBucket\''));
-                assert.ok(lifecyclePolicy.includes('arn:aws:s3:::mlcc-core-${this.account}-${this.region}'));
-                assert.ok(lifecyclePolicy.includes('arn:aws:s3:::mlcc-core-${this.account}-${this.region}/*'));
+                // Bucket consolidation R2: the core bucket name is rendered from its one
+                // declaration (core/buckets.json), never spelled out in the stack.
+                assert.ok(lifecyclePolicy.includes('arn:aws:s3:::${coreBucketName}'));
+                assert.ok(lifecyclePolicy.includes('arn:aws:s3:::${coreBucketName}/*'));
+                assert.match(source, /const coreBucketName = renderBucketName\(\s*CORE_BUCKETS\.buckets\.ModelsBucketResource/);
             });
 
             it('grants HyperPod ENI management permissions', () => {
@@ -279,10 +288,12 @@ describe('HyperPod CDK Stack Files', () => {
             assert.ok(policy.includes('\'s3:PutObject\''), 'must allow s3:PutObject');
             assert.ok(policy.includes('\'s3:PutObjectTagging\''), 'must allow s3:PutObjectTagging (v3.0 tagging)');
             assert.ok(policy.includes('tlsBucketName'), 'scoped to the TLS bucket (tlsBucketName)');
-            assert.ok(
-                source.includes('const tlsBucketName = `mlcc-hyperpod-tls-${profileName}`'),
-                'tlsBucketName must be mlcc-hyperpod-tls-<profile>'
-            );
+            // Bucket consolidation R2: rendered from the inference-operator stack's one
+            // declaration (hyperpod/stacks/buckets.json), not a spelled-out literal.
+            assert.match(source, /const tlsBucketName = renderBucketName\(\s*INFERENCE_OPERATOR_BUCKETS\.buckets\.TlsBucket/,
+                'tlsBucketName must be rendered from the TlsBucket declaration');
+            assert.equal(TLS_DECLARATION.name, 'mlcc-hyperpod-tls-{profile}',
+                'the declared TLS bucket name must stay mlcc-hyperpod-tls-<profile>');
         });
 
         it('grants the inference role ACM certificate tagging', () => {
@@ -433,7 +444,9 @@ describe('HyperPod CDK Stack Files', () => {
         const source = readFileSync(INFERENCE_OPERATOR_STACK, 'utf8');
 
         it('creates TLS S3 bucket with correct naming', () => {
-            assert.ok(source.includes('hyperpod-tls-'));
+            // Name comes from the declaration (bucket consolidation R2), not a literal.
+            assert.equal(TLS_DECLARATION.name, 'mlcc-hyperpod-tls-{profile}');
+            assert.match(source, /renderBucketName\(\s*bucketDeclaration\(BUCKETS, 'TlsBucket'\)/);
             assert.ok(source.includes('TlsBucket'));
         });
 
@@ -505,10 +518,10 @@ describe('HyperPod CDK Stack Files', () => {
             // referenced by its EXPLICIT name in the add-on configurationValues, NOT
             // resolved by a sagemaker-/hyperpod- prefix convention. If a future change
             // switched to prefix-based resolution, this assertion fails loudly.
-            assert.ok(
-                source.includes('const bucketName = `mlcc-hyperpod-tls-${profileName}`'),
-                'TLS bucket name must be mlcc-hyperpod-tls-<profile>'
-            );
+            assert.match(source, /const bucketName = renderBucketName\(\s*bucketDeclaration\(BUCKETS, 'TlsBucket'\)/,
+                'TLS bucket name must be rendered from the TlsBucket declaration');
+            assert.equal(TLS_DECLARATION.name, 'mlcc-hyperpod-tls-{profile}',
+                'the declared TLS bucket name must stay mlcc-hyperpod-tls-<profile>');
             assert.ok(
                 source.includes('tlsCertificateS3Bucket: bucketName'),
                 'the add-on config must pass the bucket name explicitly as tlsCertificateS3Bucket'
@@ -520,8 +533,12 @@ describe('HyperPod CDK Stack Files', () => {
         });
 
         it('supports adopt-existing TLS bucket', () => {
+            // Adoption goes through the shared declaredBucket helper (which owns the
+            // fromBucketName / new-Bucket choice), keyed by the declared adopt context.
             assert.ok(source.includes('adoptTlsBucket'));
-            assert.ok(source.includes('fromBucketName'));
+            assert.equal(TLS_DECLARATION.adoptContext, 'adoptTlsBucket');
+            assert.match(source, /declaredBucket\(this, 'TlsBucket', bucketName, props\.adoptTlsBucket/);
+            assert.ok(readFileSync(resolve(MODULES_ROOT, 'bucket-declarations.ts'), 'utf8').includes('fromBucketName'));
         });
 
         it('supports adopt-existing inference addon', () => {

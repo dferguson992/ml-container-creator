@@ -1607,13 +1607,14 @@ ROLE_ARN=$(echo "${_PROFILE_JSON}" | python3 -c "import sys,json; print(json.loa
 # When --dataset <name> is passed, resolve it to an S3 URI via the shared dataset
 # sidecar registry (same resolve-dataset helper used by do/optimize / do/tune) and
 # drive the benchmark's traffic from that dataset instead of synthetic prompts.
-# CORE_BUCKET (mlcc-core) backs the sidecar registry — resolve it from the profile.
-CORE_BUCKET="${CORE_BUCKET:-${CODEBUILD_SOURCE_S3_BUCKET:-}}"
+# CORE_BUCKET (the core models bucket) backs the sidecar registry — resolved ONLY
+# from the profile key coreS3Bucket (CORE_S3_BUCKET via do/lib/profile.sh), never
+# the CodeBuild source bucket (bucket consolidation R2.3).
+CORE_BUCKET="${CORE_BUCKET:-${CORE_S3_BUCKET:-}}"
 if [ -z "${CORE_BUCKET}" ]; then
     # Parse-only read on the always-valid _PROFILE_JSON (see above) — safe.
-    CORE_BUCKET=$(echo "${_PROFILE_JSON}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('codebuildSourceS3Bucket', ''))" 2>/dev/null) || CORE_BUCKET=""
+    CORE_BUCKET=$(echo "${_PROFILE_JSON}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('coreS3Bucket', ''))" 2>/dev/null) || CORE_BUCKET=""
 fi
-
 # Dataset-derived values, empty unless --dataset resolves successfully.
 BENCHMARK_DATASET_S3URI=""
 BENCHMARK_DATASET_FORMAT=""

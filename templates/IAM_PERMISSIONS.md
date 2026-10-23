@@ -50,7 +50,7 @@ Invoke functions (reward model evaluation during training/tuning).
 ### PassRole
 Self-pass to SageMaker service, scoped to `mlcc-sagemaker-execution-role`.
 
-The role is defined in `config/bootstrap-stack.json` and updated automatically when you re-run bootstrap after upgrading.
+The role is defined in the core bootstrap stack (`infra/bootstrap-modules/core/stack.ts`) and updated automatically when you re-run bootstrap after upgrading.
 
 If you use a custom role (`--role-arn`), ensure it has at minimum:
 
@@ -76,7 +76,7 @@ Created automatically by `./do/submit` as `<%= codebuildProjectName %>-service-r
 
 - **CloudWatch Logs**: Write build logs to `/aws/codebuild/<%= codebuildProjectName %>*`
 - **ECR**: Push images to `ml-container-creator` repository
-- **S3**: Read source archives from `codebuild-source-*` buckets
+- **S3**: Read source archives from the CodeBuild source bucket (profile key `codebuildSourceS3Bucket`)
 
 ## User/CI Permissions
 

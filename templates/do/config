@@ -345,7 +345,8 @@ export NGC_API_KEY="<%= ngcApiKey %>"
 <% if (deploymentTarget !== 'batch-transform') { %>
 # Managed Model Customization (do/tune)
 # ── Profile-resolved values (from ~/.ml-container-creator/config.json) ────
-# TUNE_S3_BUCKET — see do/lib/profile.sh
+# ARTIFACTS_S3_BUCKET (tune output) — from the profile key artifactsS3Bucket via
+# do/lib/profile.sh (an exported TUNE_S3_BUCKET is honored as an override alias)
 export TUNE_SUPPORTED=<%= (typeof tuneSupported !== 'undefined' && tuneSupported) ? 'true' : 'false' %>
 <% if (typeof tuneSupported !== 'undefined' && tuneSupported) { %>
 <% if (typeof tuneModelId !== 'undefined' && tuneModelId) { %>

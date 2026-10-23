@@ -5,6 +5,8 @@ import * as cdk from 'aws-cdk-lib';
 import * as sagemaker from 'aws-cdk-lib/aws-sagemaker';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
+import CORE_BUCKETS from '../../core/buckets.json';
+import { renderBucketName } from '../../bucket-declarations';
 
 export interface MlccHyperPodClusterStackProps extends cdk.StackProps {
     profileName: string;
@@ -66,7 +68,10 @@ export class MlccHyperPodClusterStack extends cdk.Stack {
         // LifeCycleConfig is required for all EKS-orchestrated instance groups,
         // even at 0 instances. Use the core models bucket for the lifecycle script.
         const lifecycleS3Uri = this.node.tryGetContext('lifecycleS3Uri')
-            || `s3://mlcc-core-${this.account}-${this.region}/hyperpod-lifecycle/`;
+            || `s3://${renderBucketName(
+                CORE_BUCKETS.buckets.ModelsBucketResource,
+                { account: this.account, region: this.region, profileName },
+            )}/hyperpod-lifecycle/`;
 
         const cluster = new sagemaker.CfnCluster(this, 'HyperPodCluster', {
             clusterName,

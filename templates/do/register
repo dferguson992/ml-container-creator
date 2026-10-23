@@ -31,13 +31,13 @@ ECR_REPOSITORY_NAME="${ECR_REPOSITORY_NAME:-${_PROFILE_ecrRepositoryName:-ml-con
 # same staging mechanism as `./do/tune --dataset hf://...`.
 HELPER_SCRIPT="${SCRIPT_DIR}/.tune_helper.py"
 
-# CORE_BUCKET is the mlcc-core bucket (e.g. mlcc-core-<account>-<region>). It is
-# recorded in the active profile as coreS3Bucket. Datasets registered
-# via do/register are moved to the canonical location:
+# CORE_BUCKET is the core models bucket, recorded in the active profile as
+# coreS3Bucket (CORE_S3_BUCKET via do/lib/profile.sh; modelsS3Bucket is the
+# deprecated alias key). Datasets registered via do/register are moved to the
+# canonical location:
 #   s3://<CORE_BUCKET>/datasets/<name>/
-# Prefer coreS3Bucket (the mlcc-core bucket); fall back to modelsS3Bucket; never use
-# the CodeBuild source bucket which is scoped to CI build artifacts, not shared data.
-CORE_BUCKET="${CORE_BUCKET:-${_PROFILE_coreS3Bucket:-${_PROFILE_modelsS3Bucket:-${CODEBUILD_SOURCE_S3_BUCKET:-}}}}"
+# Never the CodeBuild source bucket, which is scoped to CI build artifacts.
+CORE_BUCKET="${CORE_BUCKET:-${CORE_S3_BUCKET:-}}"
 
 # Resolve INSTANCE_TYPE for heterogeneous pool endpoints (may be empty from config,
 # filled by do/deploy after InService resolution)
@@ -103,8 +103,8 @@ _show_usage() {
     echo "  Moves a dataset into the canonical MLCC datasets location on the mlcc-core"
     echo "  bucket and registers the resulting URI so it can be reused across tuning jobs:"
     echo "      s3://<CORE_BUCKET>/datasets/<name>/"
-    echo "  (CORE_BUCKET is the mlcc-core bucket recorded in your profile, e.g."
-    echo "   mlcc-core-<account>-<region>.)"
+    echo "  (CORE_BUCKET is the core models bucket recorded in your bootstrap profile"
+    echo "   as coreS3Bucket.)"
     echo ""
     echo "  Provide exactly one input source:"
     echo "  --s3-uri <s3://...> Existing S3 dataset. Copied to the canonical location with"
@@ -925,9 +925,8 @@ if [ "${SUBCOMMAND}" = "dataset" ]; then
 
     # Resolve CORE_BUCKET (mlcc-core) — required for the canonical location.
     if [ -z "${CORE_BUCKET}" ]; then
-        echo "❌ No mlcc-core bucket recorded in profile (codebuildSourceS3Bucket is empty)."
-        echo "   Run 'ml-container-creator bootstrap' to provision the mlcc-core bucket,"
-        echo "   or set CORE_BUCKET explicitly."
+        _require_bucket CORE_S3_BUCKET || true
+        echo "   (or set CORE_BUCKET explicitly.)"
         exit 1
     fi
 

@@ -83,14 +83,23 @@ describe('do/adapter — adapter bucket resolution (BL056)', () => {
 describe('training CDK stack — AdaptersBucket (BL056)', () => {
     const stack = read('infra/bootstrap-modules/training/stack.ts');
 
+    // Bucket consolidation R1.2: bucket names are declared ONCE in training/buckets.json
+    // and the stack constructs each declared bucket through declaredBucket(). The
+    // never-assumed training role that used to carry the adapters-bucket grant was
+    // deleted (D4) — every job runs as the core execution role (mlcc-* S3 grant).
+    const decl = JSON.parse(read('infra/bootstrap-modules/training/buckets.json'));
+
     it('declares an AdaptersBucket construct', () => {
-        assert.ok(stack.includes('new s3.Bucket(this, \'AdaptersBucket\''),
+        assert.ok(stack.includes('declaredBucket(this, \'AdaptersBucket\''),
             'training stack should create an AdaptersBucket');
     });
 
     it('uses a distinct adapters bucket name', () => {
-        assert.ok(stack.includes('mlcc-training-adapters-${this.account}-${this.region}'),
-            'adapters bucket should have a distinct, deterministic name');
+        const names = Object.values(decl.buckets).map(b => b.name);
+        assert.ok(decl.buckets.AdaptersBucket, 'AdaptersBucket is declared in training/buckets.json');
+        assert.strictEqual(new Set(names).size, names.length, 'every training bucket name is distinct');
+        assert.match(decl.buckets.AdaptersBucket.name, /\{account\}-\{region\}$/,
+            'adapters bucket name is deterministic per account + region');
     });
 
     it('exports the AdaptersBucket via CfnOutput', () => {
@@ -98,9 +107,9 @@ describe('training CDK stack — AdaptersBucket (BL056)', () => {
             'training stack should export AdaptersBucket for denormalization');
     });
 
-    it('grants the training role access to the adapters bucket', () => {
-        assert.ok(stack.includes('adaptersBucket.bucketArn'),
-            'training role IAM policy should include the adapters bucket ARN');
+    it('no longer carries the unused training role (D4)', () => {
+        assert.ok(!stack.includes('new iam.Role(this, \'TrainingRole\''),
+            'the never-assumed mlcc-training-role must be deleted');
     });
 });
 
