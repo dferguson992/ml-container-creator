@@ -129,7 +129,7 @@
     "test:perf": "node scripts/analyze-test-performance.js",
     "lint": "eslint src/ servers/ bin/ --ext .js,.cjs,.mjs",
     "lint:fix": "eslint src/ servers/ bin/ --ext .js,.cjs,.mjs --fix",
-    "codegen": "node scripts/codegen-cli.js && node scripts/codegen-validator.js && node scripts/codegen-widget.js && node scripts/codegen-parameter-matrix.js && node scripts/codegen-target-guard.js && node scripts/codegen-deploy-flags.js && node scripts/codegen-train-schema.js && eslint src/lib/generated/ --fix",
+    "codegen": "node scripts/codegen-cli.js && node scripts/codegen-validator.js && node scripts/codegen-widget.js && node scripts/codegen-parameter-matrix.js && node scripts/codegen-target-guard.js && node scripts/codegen-deploy-flags.js && node scripts/codegen-train-schema.js && node scripts/codegen-export-map.js && eslint src/lib/generated/ --fix",
     "sync:models": "node scripts/sync-model-families.js",
     "sync:serving": "node scripts/sync-serving-versions.js",
     "sync:all": "npm run sync:models && npm run sync:serving",

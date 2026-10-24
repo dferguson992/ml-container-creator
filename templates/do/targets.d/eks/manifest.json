@@ -25,7 +25,8 @@
     "HP_CPU_REQUEST",
     "HP_MEM_REQUEST",
     "KUBECONFIG",
-    "EKS_INFERENCE_ROLE_ARN"
+    "EKS_INFERENCE_ROLE_ARN",
+    "HP_BENCHMARK_METRICS_ENABLED"
   ],
   "serving_config_source": "kubernetes",
   "cluster_contract": { "script": "lib/eks-contract.sh", "entry": "_eks_contract_preflight" },

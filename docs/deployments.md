@@ -325,11 +325,39 @@ override it for one run with `--target <mode>`.
 
 | Mode | Command | Output |
 |---|---|---|
-| Default | `./do/export` | Prints the `ml-container-creator …` CLI command that reproduces this project. |
-| JSON | `./do/export --json` | Prints the configuration as JSON (camelCase keys), ready to feed back in via `ml-container-creator --config=<file>`. |
+| Default | `./do/export` | Prints the `ml-container-creator …` CLI command that reproduces this project (values shell-quoted). |
+| JSON | `./do/export --json` | Prints the canonical generator `--config` object, ready to feed back in via `ml-container-creator --config=<file> --skip-prompts`. |
 | Notebook | `./do/export --notebook` | Writes `deploy_notebook.ipynb` — a runnable, step-by-step Jupyter notebook that builds, deploys, tests, and tears down the endpoint. |
 
-`--notebook` and `--json` are mutually exclusive.
+`--notebook` and `--json` are mutually exclusive. `./do/export --help` lists the options.
+
+How the CLI and JSON modes work:
+
+- `do/config` is read at **run time**, so edits made after generation are exported.
+- Each `do/config` variable maps to exactly one generator parameter through the
+  `doConfigVar` field in `config/parameter-schema-v2.json`; the JSON keys are the
+  schema parameter keys (`region`, `hyperpodCluster`, `asyncMaxConcurrent`,
+  `modelEnv`, …) and values are typed (numbers, booleans, `KEY=VALUE` maps). The CLI
+  command is rendered from the same data, using each parameter's `cliFlag`.
+- Only parameters that apply to the effective target (the schema's
+  `appliesTo.deploymentTargets`) and differ from their default are emitted.
+- Secrets (`HF_TOKEN`, `NGC_API_KEY`) are emitted as `$HF_TOKEN` / `$NGC_API_KEY`
+  references, never values. Runtime-owned state (deploy status, endpoint names,
+  speculative-decoding settings, benchmark job state) and derived values are not
+  exported. Profile-resolved values (role ARN, secret ARNs, async/batch S3 paths)
+  come from your bootstrap profile, not the export.
+- The CLI and JSON modes are stdlib Python and need no project venv.
+
+> **Upgrade note (Wave 8).** `do/export --json` now writes the `--config` parameter
+> names. Earlier versions wrote internal template names that `--config` silently
+> dropped: `awsRegion` → `region`, `awsRoleArn` → `roleArn`, `hyperPodCluster` /
+> `hyperPodNamespace` / `hyperPodReplicas` → `hyperpodCluster` / `hyperpodNamespace` /
+> `hyperpodReplicas`, `asyncMaxConcurrentInvocations` → `asyncMaxConcurrent`,
+> `batchMaxConcurrentTransforms` → `batchMaxConcurrent`, `batchMaxPayloadInMB` →
+> `batchMaxPayload`, and the nested `endpointConfig` / `icConfig` / `modelEnvVars` /
+> `serverEnvVars` objects → flat `endpoint*` / `ic*` keys and `modelEnv` / `serverEnv`
+> / `icEnv` maps. Scripts that parse the old keys must switch to the new names.
+> `--config` files written with the old keys still load (the loader accepts both).
 
 #### The deploy notebook (`--notebook`)
 

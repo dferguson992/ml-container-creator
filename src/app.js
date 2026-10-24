@@ -433,11 +433,19 @@ export async function writeProject(templateDir, destDir, answers, registryConfig
     orderedEnvVars.push(..._dedupedEnvVars);
 
     // Prepare template variables
+    // Wave 8 (BL160): raw --server-env key -> the engine-prefixed do/config var it
+    // renders as, so do/config can record the key list (MLCC_SERVER_ENV_KEYS) that
+    // do/export reads back at runtime into the canonical `serverEnv` parameter.
+    const serverEnvKeyMap = {};
+    Object.keys(serverEnvVars).forEach((key) => {
+        serverEnvKeyMap[key] = Object.keys(resolvePrefixedEnvVars(engine, { [key]: '' }))[0];
+    });
     const templateVars = {
         ...answers,
         comments,
         orderedEnvVars,
-        serverEnvVars: prefixedServerEnvVars
+        serverEnvVars: prefixedServerEnvVars,
+        serverEnvKeyMap
     };
 
     // BL107: inject the active engine's env-var prefix from its serve-layer
@@ -829,7 +837,8 @@ export async function postGenerate(destDir, answers, tritonBackends = {}) {
 /**
  * Keys that contain sensitive values and should be redacted in generation params.
  */
-const REDACT_KEYS = new Set(['hfToken', 'ngcToken']);
+// ngcApiKey is the answer key --ngc-token and the secret prompts populate.
+const REDACT_KEYS = new Set(['hfToken', 'ngcToken', 'ngcApiKey']);
 
 /**
  * Write .mlcc-generation-params.json to the project root.
@@ -1189,7 +1198,10 @@ function _setExecutablePermissions(destDir) {
         'do/tune',
         'do/train',
         'do/stage',
-        'do/validate'
+        'do/validate',
+        // Wave 8: do/export was never made executable (`./do/export` failed with
+        // "Permission denied" in every generated project).
+        'do/export'
     ];
 
     const shellScripts = defaultScripts;

@@ -32,7 +32,7 @@ All settings centralized in `do/config`. Override via environment variables.
 | `./do/adapter` | Deploy/manage LoRA adapters on a base endpoint |
 | `./do/register` | Register model in SageMaker Model Registry |
 | `./do/manifest` | Generate deployment manifest (multi-model, multi-region) |
-| `./do/export` | Export project configuration as portable archive |
+| `./do/export` | Export the current do/config as a reproduce-it CLI command, a generator `--config` JSON (`--json`), or a notebook (`--notebook`) |
 | `./do/validate` | Target-aware pre-deploy checks (right-sizing, config, cluster contract, SageMaker payloads); `--format json` for CI |
 | `./do/run` | Run container locally (docker run) |
 | `./do/logs` | Tail CloudWatch logs for endpoint |

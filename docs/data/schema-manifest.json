@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-23T20:16:20.069Z",
+  "generatedAt": "2026-10-24T19:03:19.963Z",
   "generatedBy": "scripts/codegen-widget.js",
   "source": "config/parameter-schema-v2.json",
   "version": "1.9.1",
@@ -140,7 +140,9 @@
           "deploymentTargets": [
             "managed-inference",
             "async-inference",
-            "batch-transform"
+            "batch-transform",
+            "hyperpod-eks",
+            "eks"
           ],
           "architectures": [
             "*"
