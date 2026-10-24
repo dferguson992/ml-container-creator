@@ -53,8 +53,11 @@ function runDriver(args, env = {}) {
 function eksFnBody() {
     const idx = benchmarkSrc.indexOf('_run_eks_aiperf_benchmark()');
     assert.ok(idx >= 0, 'benchmark must define _run_eks_aiperf_benchmark()');
-    // Slice a generous window; the function is self-contained within it.
-    return benchmarkSrc.slice(idx, idx + 11000);
+    // Slice to the function's closing brace (a column-0 "}") rather than a fixed
+    // character window, so growth inside the function (e.g. the Wave 6.1 R7c
+    // adapter check) cannot push assertions out of view.
+    const end = benchmarkSrc.indexOf('\n}\n', idx);
+    return benchmarkSrc.slice(idx, end === -1 ? undefined : end + 2);
 }
 
 describe('Plain-EKS AIPerf benchmark', () => {

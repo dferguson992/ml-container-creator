@@ -399,8 +399,7 @@
             "configKey": "maxLoraRank",
             "default": 16,
             "validation": {
-                "min": 8,
-                "max": 512
+                "enum": [1, 8, 16, 32, 64, 128, 256, 320, 512]
             },
             "phase": "features",
             "group": "lora",

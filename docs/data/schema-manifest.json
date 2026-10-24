@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-19T20:28:07.962Z",
+  "generatedAt": "2026-10-23T20:16:20.069Z",
   "generatedBy": "scripts/codegen-widget.js",
   "source": "config/parameter-schema-v2.json",
   "version": "1.9.1",
@@ -279,8 +279,17 @@
         "datalist": null,
         "default": 16,
         "validation": {
-          "min": 8,
-          "max": 512
+          "enum": [
+            1,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            320,
+            512
+          ]
         },
         "group": "lora",
         "appliesTo": {

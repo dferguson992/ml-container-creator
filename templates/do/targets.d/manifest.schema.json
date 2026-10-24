@@ -85,6 +85,17 @@
       "enum": ["kubernetes", "sagemaker-ic"],
       "description": "Which resolve-serving-config.sh resolution arm this target uses. kubernetes: reads HP_*/BENCHMARK_* (hyperpod-eks, eks). sagemaker-ic: reads DEPLOYED_INSTANCE_TYPE/IC_ENV_* (realtime, async, batch)."
     },
+    "adapter_delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "mount_path", "subdir"],
+      "description": "Wave 6.1 (R1.1, BL189): how LoRA adapters reach the serving pod on this target, so do/adapter and the deploy driver derive the mapping instead of hardcoding it. strategy model-prefix: the adapter lives under <model S3 prefix>/<subdir>/<project>/<name>/ and the pod sees it at <mount_path>/<subdir>/<project>/<name> through the S3 model mount (hyperpod-eks with prefetchEnabled: false; eks with EKS_MODEL_MOUNT=s3). Omit on targets that load adapters another way (realtime-inference adapter ICs).",
+      "properties": {
+        "strategy": { "type": "string", "enum": ["model-prefix"] },
+        "mount_path": { "type": "string", "pattern": "^/" },
+        "subdir": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+      }
+    },
     "verbs": {
       "type": "object",
       "additionalProperties": { "type": "boolean" },

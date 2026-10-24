@@ -64,7 +64,7 @@ const HP_CMDS = commandLines(HP);
 describe('Feature: v18-w4-01-bl112 — direct-pod port-forward (Req 5.1)', () => {
     it('port-forwards to pod/<name>, never svc/', () => {
         assert.ok(
-            /kubectl port-forward "pod\/\$\{_POD\}" "\$\{HP_LOCAL_PORT:-8080\}:8080"/.test(HP_CMDS),
+            /kubectl port-forward "pod\/\$\{_pod\}" "\$\{HP_LOCAL_PORT:-8080\}:8080"/.test(HP_CMDS),
             'must port-forward directly to the resolved pod on 8080'
         );
         assert.ok(
@@ -83,10 +83,12 @@ describe('Feature: v18-w4-01-bl112 — direct-pod port-forward (Req 5.1)', () =>
             /--field-selector=status\.phase=Running/.test(HP_CMDS),
             'must filter to Running pods (same guard as do/benchmark)'
         );
+        // Wave 6.1 R1.6: EVERY Running pod (was: only the first).
         assert.ok(
-            /jsonpath='\{\.items\[0\]\.metadata\.name\}'/.test(HP_CMDS),
-            'must take the first Running pod name'
+            /jsonpath='\{range \.items\[\*\]\}\{\.metadata\.name\}\{"\\n"\}\{end\}'/.test(HP_CMDS),
+            'must list every Running pod name'
         );
+        assert.ok(/for _pod in \$\{_PODS\}; do/.test(HP_CMDS), 'must act on each Running pod');
     });
 
     it('errors clearly when no Running pod is found (before port-forward)', () => {
@@ -95,14 +97,14 @@ describe('Feature: v18-w4-01-bl112 — direct-pod port-forward (Req 5.1)', () =>
             'must emit a no-pod error'
         );
         const noPodPos = HP.indexOf('No Running pod found');
-        const pfPos = HP.indexOf('kubectl port-forward "pod/');
+        const pfPos = HP.indexOf('kubectl port-forward "pod/', noPodPos);
         assert.ok(noPodPos !== -1 && pfPos !== -1 && noPodPos < pfPos,
             'the no-pod guard must precede the port-forward');
     });
 
     it('fails fast if the port-forward does not start', () => {
         assert.ok(/kill -0 \$\{_PF_PID\}/.test(HP_CMDS), 'must verify the port-forward PID');
-        assert.ok(/Port-forward failed to start/.test(HP), 'must report a failed port-forward');
+        assert.ok(/Port-forward to pod\/\$\{_pod\} failed to start/.test(HP), 'must report a failed port-forward');
     });
 });
 
@@ -148,10 +150,10 @@ describe('Feature: v18-w4-01-bl112 — vLLM error handling', () => {
 
     it('update aborts before load when unload fails', () => {
         const dispatch = HP.slice(HP.indexOf('# ── Dispatch to lora_vllm.py'));
-        const updateArm = dispatch.slice(dispatch.indexOf('update)'), dispatch.indexOf('list)'));
+        const updateArm = dispatch.slice(dispatch.indexOf('                update)'), dispatch.indexOf('                list)'));
         assert.ok(
-            /_lora_do_unload "\$\{LORA_NAME\}" \|\| exit 1\s*\n\s*_lora_do_load/.test(updateArm),
-            'a failed unload must exit 1 before the load runs'
+            /_lora_do_unload "\$\{LORA_NAME\}" \|\| return 1\s*\n\s*_lora_do_load/.test(updateArm),
+            'a failed unload must abort (per pod) before the load runs'
         );
     });
 

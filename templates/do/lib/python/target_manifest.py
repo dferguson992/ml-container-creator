@@ -27,6 +27,7 @@ CLI (one-shot, for bash callers):
     serving_config_source — prints kubernetes|sagemaker-ic
     aliases | required_vars | runtime_owned_vars — prints a JSON array
     optional_vars | verbs — prints a JSON object
+    adapter_delivery  — prints the JSON object (or {} when the target declares none)
     resolve           — resolves an alias to its canonical target name
 
   <target> accepts a canonical name OR an alias (resolved via `aliases`).
@@ -190,10 +191,16 @@ def runtime_owned_vars(target: str, targets_dir: str | None = None) -> list[str]
     return list(read_manifest(target, targets_dir).get("runtime_owned_vars", []))
 
 
+def adapter_delivery(target: str, targets_dir: str | None = None) -> dict:
+    """Return the target's adapter_delivery declaration (Wave 6.1 R1.1), or {}
+    when the target loads adapters another way (e.g. SMAI adapter ICs)."""
+    return dict(read_manifest(target, targets_dir).get("adapter_delivery") or {})
+
+
 # ── CLI one-shot for bash callers ──────────────────────────────────────────────
 
 _ARRAY_FIELDS = {"aliases", "required_vars", "runtime_owned_vars"}
-_OBJECT_FIELDS = {"optional_vars", "verbs"}
+_OBJECT_FIELDS = {"optional_vars", "verbs", "adapter_delivery"}
 _STRING_FIELDS = {
     "target",
     "status_var",

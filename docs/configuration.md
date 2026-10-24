@@ -103,8 +103,8 @@ Parameters supported by MCC, organized by category. Each can be set via CLI flag
 | Parameter | CLI Flag | Type | Default | Description |
 |---|---|---|---|---|
 | `enableLora` | `--enable-lora` | boolean | `true` | Enable LoRA adapter serving (env: `ML_ENABLE_LORA`). Disable with `--enable-lora=false` |
-| `maxLoras` | `--max-loras` | integer | `30` | Maximum concurrent LoRA adapters in GPU memory (env: `ML_MAX_LORAS`) |
-| `maxLoraRank` | `--max-lora-rank` | integer | `64` | Maximum LoRA rank (env: `ML_MAX_LORA_RANK`) |
+| `maxLoras` | `--max-loras` | integer | `4` | Maximum concurrent LoRA adapters in GPU memory (env: `ML_MAX_LORAS`). Default comes from the serve engine manifest (`capability_map.lora_max.default`) |
+| `maxLoraRank` | `--max-lora-rank` | integer | `16` | Maximum LoRA rank (env: `ML_MAX_LORA_RANK`). One of the engine's allowed values (vLLM: 1, 8, 16, 32, 64, 128, 256, 320, 512); default and allowed set come from the serve engine manifest. On hyperpod-eks / eks, deploy raises it to fit recorded tune adapters |
 
 ### Authentication
 

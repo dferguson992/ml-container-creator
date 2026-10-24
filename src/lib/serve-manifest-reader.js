@@ -314,6 +314,80 @@ export function capabilityMap(engine, serveDir = SERVE_D) {
 }
 
 /**
+ * Wave 6.1 (BL188): {capability: default} for every capability_map entry that
+ * declares a `default`. This is the SINGLE source for MLCC's LoRA sizing defaults
+ * (vLLM lora_max=4 / lora_max_rank=16); the generator resolver, prompt,
+ * Dockerfile and parameter schema derive from it (drift-tested). Values keep the
+ * manifest's JSON type. {} when the engine declares none.
+ * @param {string} engine
+ * @param {string} [serveDir]
+ * @returns {Object<string,(string|number)>}
+ */
+export function capabilityDefaults(engine, serveDir = SERVE_D) {
+    const manifest = readManifest(engine, serveDir);
+    const caps = manifest && manifest.capability_map;
+    if (!caps || typeof caps !== 'object') return {};
+    const out = {};
+    for (const [name, decl] of Object.entries(caps)) {
+        if (decl && Object.prototype.hasOwnProperty.call(decl, 'default') && decl.default !== null) {
+            out[name] = decl.default;
+        }
+    }
+    return out;
+}
+
+/**
+ * The sorted discrete values an engine accepts for a capability (e.g. vLLM
+ * lora_max_rank), or [] when it accepts any positive integer.
+ * @param {string} engine
+ * @param {string} capability
+ * @param {string} [serveDir]
+ * @returns {number[]}
+ */
+export function capabilityAllowed(engine, capability, serveDir = SERVE_D) {
+    const manifest = readManifest(engine, serveDir);
+    const decl = manifest && manifest.capability_map && manifest.capability_map[capability];
+    if (!decl || !Array.isArray(decl.allowed)) return [];
+    return decl.allowed.filter((v) => Number.isInteger(v) && v > 0).sort((a, b) => a - b);
+}
+
+/** The engine's default max LoRA rank (capability lora_max_rank.default), or null. */
+export function loraRankDefault(engine, serveDir = SERVE_D) {
+    const v = capabilityDefaults(engine, serveDir).lora_max_rank;
+    return Number.isInteger(v) ? v : null;
+}
+
+/** The engine's allowed max LoRA rank values ([] = any positive integer). */
+export function loraRankAllowed(engine, serveDir = SERVE_D) {
+    return capabilityAllowed(engine, 'lora_max_rank', serveDir);
+}
+
+/** The engine's default max concurrent LoRA adapters (capability lora_max.default), or null. */
+export function loraMaxDefault(engine, serveDir = SERVE_D) {
+    const v = capabilityDefaults(engine, serveDir).lora_max;
+    return Number.isInteger(v) ? v : null;
+}
+
+/**
+ * Generation-time LoRA sizing defaults ({maxLoras, maxLoraRank}) for the
+ * template resolver, the LoRA prompts and the Dockerfile ENV. Read from the
+ * selected engine's manifest; an engine that declares no default for a field
+ * (e.g. SGLang has no lora_max, LMI/llama-cpp have no capability_map) falls back
+ * to the vLLM manifest — the engine whose VLLM_MAX_LORAS / VLLM_MAX_LORA_RANK the
+ * Dockerfile emits. Never a literal (BL188 drift test).
+ * @param {string} [engine]
+ * @param {string} [serveDir]
+ * @returns {{maxLoras: number|null, maxLoraRank: number|null}}
+ */
+export function loraSizingDefaults(engine, serveDir = SERVE_D) {
+    const pick = (fn) => {
+        const own = engine ? fn(engine, serveDir) : null;
+        return own !== null ? own : fn('vllm', serveDir);
+    };
+    return { maxLoras: pick(loraMaxDefault), maxLoraRank: pick(loraRankDefault) };
+}
+
+/**
  * Resolve MLCC-computed Tier-1 capability VALUES for an engine into concrete
  * `{ key, value }` env-var pairs (ADR-010). This is the SINGLE home of the
  * companion-flag rule (Req 6): a capability is emitted only when it has a

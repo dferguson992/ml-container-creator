@@ -513,13 +513,7 @@ if [ -n "${_ADAPTER_USE_VLLM_HOTLOAD}" ]; then
                 ;;
         esac
 
-        # ── Direct-pod port-forward setup (same pattern as do/test and do/benchmark) ──
-        # Resolve the Running serving pod by the app=${PROJECT_NAME} label and
-        # port-forward directly to it on port 8080 (NOT a svc/ resource). The
-        # routing Service exposes TLS/443 for production traffic, so the
-        # direct-pod hop is the correct dev-time connection.
-        echo "🔌 Port-forwarding pod for ${PROJECT_NAME} to localhost:${HP_LOCAL_PORT:-8080}..."
-
+        # ── Cluster connection (kubeconfig) ──────────────────────────────────
         # Get kubeconfig for HyperPod cluster
         KUBECONFIG_PATH="${HOME}/.kube/hyperpod-${HP_CLUSTER_NAME}"
 
@@ -549,14 +543,18 @@ if [ -n "${_ADAPTER_USE_VLLM_HOTLOAD}" ]; then
         fi
         export KUBECONFIG="${KUBECONFIG_PATH}"
 
-        # Resolve the Running serving pod by label (same --field-selector guard as do/benchmark).
-        local _POD _pod_err
+        # ── Every Running serving pod (Wave 6.1 R1.6) ────────────────────────
+        # Adapters live in each vLLM process, so load/unload must reach EVERY
+        # Running replica, not just the first. The phase guard keeps a
+        # Terminating pod (mid-rollout) out of the set.
+        local _PODS _pod_err
         _pod_err="$(mktemp)"
-        _POD=$(kubectl get pod -n "${HP_NAMESPACE:-default}" \
+        _PODS=$(kubectl get pod -n "${HP_NAMESPACE:-default}" \
             -l "app=${PROJECT_NAME}" \
             --field-selector=status.phase=Running \
-            -o jsonpath='{.items[0].metadata.name}' 2>"${_pod_err}") || _POD=""
-        if [ -z "${_POD}" ]; then
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>"${_pod_err}") || _PODS=""
+        _PODS=$(printf '%s\n' "${_PODS}" | sed '/^[[:space:]]*$/d')
+        if [ -z "${_PODS}" ]; then
             echo "❌ No Running pod found for app=${PROJECT_NAME} in namespace ${HP_NAMESPACE:-default}"
             if [ -s "${_pod_err}" ]; then
                 sed 's/^/   kubectl: /' "${_pod_err}"
@@ -567,21 +565,104 @@ if [ -n "${_ADAPTER_USE_VLLM_HOTLOAD}" ]; then
         fi
         rm -f "${_pod_err}"
 
-        kubectl port-forward "pod/${_POD}" "${HP_LOCAL_PORT:-8080}:8080" \
-            -n "${HP_NAMESPACE:-default}" &
-        _PF_PID=$!
-        trap "kill ${_PF_PID} 2>/dev/null || true" EXIT
-        sleep 3
+        # ── Delivery + rank pre-check (load/update only), before any engine call ──
+        local _LORA_PATH=""
+        if [ "${ACTION}" = "load" ] || [ "${ACTION}" = "update" ]; then
+            # Wave 6.1 R1.1/R1.3 (Part A): vLLM loads adapters from a LOCAL path
+            # and the pod has no AWS credentials, so an s3:// source is mapped to
+            # its path under the pod's model mount, per the target descriptor's
+            # adapter_delivery (model-prefix: <model-prefix>/.mlcc-adapters/...).
+            # The model base comes from the live InferenceEndpointConfig
+            # (hyperpod-eks) or the S3 model mount config (eks). An adapter
+            # outside that prefix is refused with the exact copy command.
+            # TODO(W6.1 Part B): promote --from-tune / --from-hub / --from-weights
+            # sources into the canonical <model-prefix>/.mlcc-adapters/<project>/<name>/
+            # (s3_layout.py) here instead of refusing; never pass s3:// to vLLM.
+            local _iec_json_f _base_json _src_type="" _bucket="" _prefix="" _prefetch=""
+            _iec_json_f="$(mktemp)"
+            if [ "${DEPLOYMENT_TARGET}" = "hyperpod-eks" ]; then
+                kubectl get inferenceendpointconfig "${PROJECT_NAME}" -n "${HP_NAMESPACE:-default}" \
+                    -o json >"${_iec_json_f}" 2>/dev/null || : >"${_iec_json_f}"
+            fi
+            _base_json=$(python3 "${SCRIPT_DIR}/lib/python/adapter_delivery.py" model-base \
+                --target "${DEPLOYMENT_TARGET}" --iec-json "${_iec_json_f}" 2>/dev/null || echo '{}')
+            eval "$(printf '%s' "${_base_json}" | python3 -c '
+import json, shlex, sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    d = {}
+for k, v in (("_src_type", "source_type"), ("_bucket", "bucket"), ("_prefix", "prefix"), ("_prefetch", "prefetch")):
+    print("%s=%s" % (k, shlex.quote(str(d.get(v) or ""))))
+')"
+            local _map_rc=0
+            _LORA_PATH=$(python3 "${SCRIPT_DIR}/lib/python/adapter_delivery.py" local-path \
+                --target "${DEPLOYMENT_TARGET}" --uri "${WEIGHTS_URI}" --project "${PROJECT_NAME}" \
+                --name "${LORA_NAME}" --source-type "${_src_type}" --bucket "${_bucket}" \
+                --prefix "${_prefix}" --prefetch "${_prefetch}") || _map_rc=$?
+            if [ "${_map_rc}" -ne 0 ]; then
+                printf '%s\n' "${_LORA_PATH}"
+                rm -f "${_iec_json_f}"
+                exit 1
+            fi
+            echo "📍 Pod path: ${_LORA_PATH}"
 
-        if ! kill -0 ${_PF_PID} 2>/dev/null; then
-            echo "❌ Port-forward failed to start"
-            echo "   Check: kubectl get pods -n ${HP_NAMESPACE:-default} -l app=${PROJECT_NAME}"
-            exit 1
+            # Wave 6.1 R3.2: pre-check the adapter's rank (adapter_config.json r and
+            # rank_pattern) against the LIVE serving max_lora_rank (pod env, else
+            # the InferenceEndpointConfig env, else the engine default) and refuse
+            # with the exact fix BEFORE calling the engine. vLLM fixes the limit at
+            # start, so a too-big adapter can only be served after a redeploy.
+            local _adapter_rank _pods_json_f _live_json _live_limit _live_src
+            _adapter_rank=$(python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" adapter-rank "${WEIGHTS_URI}" 2>/dev/null || echo "")
+            _pods_json_f="$(mktemp)"
+            kubectl get pod -n "${HP_NAMESPACE:-default}" -l "app=${PROJECT_NAME}" \
+                --field-selector=status.phase=Running -o json >"${_pods_json_f}" 2>/dev/null || : >"${_pods_json_f}"
+            _live_json=$(python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" live-limit \
+                --pods-json "${_pods_json_f}" --iec-json "${_iec_json_f}" 2>/dev/null || echo '{}')
+            rm -f "${_pods_json_f}" "${_iec_json_f}"
+            _live_limit=$(printf '%s' "${_live_json}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("limit") or "")' 2>/dev/null || echo "")
+            _live_src=$(printf '%s' "${_live_json}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("source") or "")' 2>/dev/null || echo "")
+            if [ -n "${_adapter_rank}" ] && [ -n "${_live_limit}" ]; then
+                echo "🔍 Rank check: adapter r${_adapter_rank} vs serving max_lora_rank ${_live_limit} (${_live_src})"
+                if ! python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" rank-fit --name "${LORA_NAME}" \
+                    --rank "${_adapter_rank}" --limit "${_live_limit}" --limit-kind live \
+                    --target "${DEPLOYMENT_TARGET}"; then
+                    echo "❌ Refusing to load '${LORA_NAME}' (nothing was sent to the engine)."
+                    exit 1
+                fi
+            else
+                echo "   ⚠️  Rank check skipped (adapter rank or serving limit unreadable); vLLM validates at load."
+            fi
         fi
-        echo "✅ Port-forward established"
-        echo ""
 
+        # ── Per-pod direct port-forward (same pattern as do/test and do/benchmark) ──
+        # Port-forward directly to each pod on 8080 (NOT a svc/ resource: the
+        # routing Service exposes TLS/443 for production traffic), one pod at a
+        # time on HP_LOCAL_PORT.
         local BASE_URL="http://localhost:${HP_LOCAL_PORT:-8080}"
+        _PF_PID=""
+        _adapter_pf_start() {
+            local _pod="$1"
+            echo "🔌 Port-forwarding pod/${_pod} to localhost:${HP_LOCAL_PORT:-8080}..."
+            kubectl port-forward "pod/${_pod}" "${HP_LOCAL_PORT:-8080}:8080" \
+                -n "${HP_NAMESPACE:-default}" >/dev/null 2>&1 &
+            _PF_PID=$!
+            trap "kill ${_PF_PID} 2>/dev/null || true" EXIT
+            sleep "${HP_PF_WAIT:-3}"
+            if ! kill -0 ${_PF_PID} 2>/dev/null; then
+                echo "❌ Port-forward to pod/${_pod} failed to start"
+                echo "   Check: kubectl get pods -n ${HP_NAMESPACE:-default} -l app=${PROJECT_NAME}"
+                return 1
+            fi
+            echo "✅ Port-forward established"
+            return 0
+        }
+        _adapter_pf_stop() {
+            [ -n "${_PF_PID}" ] || return 0
+            kill "${_PF_PID}" 2>/dev/null || true
+            wait "${_PF_PID}" 2>/dev/null || true
+            _PF_PID=""
+        }
 
         # ── Dispatch to lora_vllm.py ─────────────────────────────────────────
         # Reusable helpers so `update` can compose unload-then-load without
@@ -667,27 +748,11 @@ print(v)
             return 1
         }
 
-        case "${ACTION}" in
-            load)
-                _lora_do_load "${LORA_NAME}" "${WEIGHTS_URI}" || exit 1
-                ;;
-            unload)
-                _lora_do_unload "${LORA_NAME}" || exit 1
-                ;;
-            update)
-                # remove-then-add: unload the existing adapter, then load the new
-                # weights. A failed unload aborts before the load so weights are
-                # not half-swapped.
-                _lora_do_unload "${LORA_NAME}" || exit 1
-                _lora_do_load "${LORA_NAME}" "${WEIGHTS_URI}" || exit 1
-                ;;
-            list)
-                echo "📋 Listing loaded LoRA adapters on ${PROJECT_NAME}..."
-                echo ""
-                local RESULT=""
-                _lora_helper_call RESULT list "${BASE_URL}"
-                local COUNT
-                COUNT=$(printf '%s' "${RESULT}" | python3 -c '
+        _lora_do_list() {
+            local RESULT=""
+            _lora_helper_call RESULT list "${BASE_URL}"
+            local COUNT
+            COUNT=$(printf '%s' "${RESULT}" | python3 -c '
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -695,26 +760,79 @@ except ValueError:
     print("ERR"); sys.exit(0)
 print(len(d) if isinstance(d, list) else "ERR")
 ')
-                if [ "${COUNT}" = "ERR" ]; then
-                    echo "❌ Could not list LoRA adapters (unexpected helper output)."
-                    [ -n "${RESULT}" ] && echo "   Output: ${RESULT}"
-                    exit 1
-                elif [ "${COUNT}" = "0" ]; then
-                    echo "   No LoRA adapters loaded."
-                    echo ""
-                    echo "   Load one: do/adapter add <name> --from-weights s3://..."
-                else
-                    printf "   %-30s %s\n" "NAME" "PATH"
-                    printf "   %-30s %s\n" "----" "----"
-                    echo "${RESULT}" | python3 -c "
+            if [ "${COUNT}" = "ERR" ]; then
+                echo "❌ Could not list LoRA adapters (unexpected helper output)."
+                [ -n "${RESULT}" ] && echo "   Output: ${RESULT}"
+                return 1
+            elif [ "${COUNT}" = "0" ]; then
+                echo "   No LoRA adapters loaded."
+                echo ""
+                echo "   Load one: do/adapter add <name> --from-weights s3://..."
+            else
+                printf "   %-30s %s\n" "NAME" "PATH"
+                printf "   %-30s %s\n" "----" "----"
+                echo "${RESULT}" | python3 -c "
 import sys, json
 loras = json.load(sys.stdin)
 for l in loras:
     print(f'   {l[\"name\"]:<30} {l.get(\"path\", \"\")}')
 "
-                fi
-                ;;
-        esac
+            fi
+            return 0
+        }
+
+        _lora_run_action() {
+            case "${ACTION}" in
+                load)
+                    _lora_do_load "${LORA_NAME}" "${_LORA_PATH}" || return 1
+                    ;;
+                unload)
+                    _lora_do_unload "${LORA_NAME}" || return 1
+                    ;;
+                update)
+                    # remove-then-add: unload the existing adapter, then load the new
+                    # weights. A failed unload aborts before the load so weights are
+                    # not half-swapped.
+                    _lora_do_unload "${LORA_NAME}" || return 1
+                    _lora_do_load "${LORA_NAME}" "${_LORA_PATH}" || return 1
+                    ;;
+                list)
+                    _lora_do_list || return 1
+                    ;;
+            esac
+            return 0
+        }
+
+        if [ "${ACTION}" = "list" ]; then
+            echo "📋 Listing loaded LoRA adapters on ${PROJECT_NAME}..."
+            echo ""
+        fi
+        local _pod_total=0 _pod_failed=0 _summary=""
+        local _pod
+        for _pod in ${_PODS}; do
+            _pod_total=$((_pod_total + 1))
+            echo ""
+            echo "── pod/${_pod} ──"
+            if _adapter_pf_start "${_pod}" && _lora_run_action; then
+                _summary="${_summary}   ✓ pod/${_pod}
+"
+            else
+                _pod_failed=$((_pod_failed + 1))
+                _summary="${_summary}   ✗ pod/${_pod}
+"
+            fi
+            _adapter_pf_stop
+        done
+        trap - EXIT
+        if [ "${_pod_total}" -gt 1 ] || [ "${_pod_failed}" -gt 0 ]; then
+            echo ""
+            echo "📋 Per-pod result (${ACTION} '${LORA_NAME:-*}'): $((_pod_total - _pod_failed))/${_pod_total} succeeded"
+            printf '%s' "${_summary}"
+        fi
+        if [ "${_pod_failed}" -gt 0 ]; then
+            exit 1
+        fi
+        return 0
     }
 
     _adapter_hyperpod "$@"
@@ -1658,6 +1776,33 @@ _adapter_add() {
                         exit 1
                     fi
                 fi
+            fi
+        fi
+    fi
+
+    # ── Rank pre-check vs the LIVE serving limit (Wave 6.1 R3.2) ─────────
+    # The base IC's container env carries the engine's MAX_LORA_RANK when it is
+    # overridden (IC_ENV_*); otherwise the engine default applies. Refuse with the
+    # exact fix before creating the adapter IC — vLLM would reject it at load.
+    local _smai_rank _smai_env_f _smai_live _smai_limit _smai_src
+    _smai_rank=$(python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" adapter-rank "${weights_uri}" 2>/dev/null || echo "")
+    if [ -n "${_smai_rank}" ]; then
+        _smai_env_f="$(mktemp)"
+        aws sagemaker describe-inference-component \
+            --inference-component-name "${base_ic_name}" \
+            --query 'Specification.Container.Environment' --output json \
+            --region "${AWS_REGION}" >"${_smai_env_f}" 2>/dev/null || : >"${_smai_env_f}"
+        _smai_live=$(python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" live-limit --env-json "${_smai_env_f}" 2>/dev/null || echo '{}')
+        rm -f "${_smai_env_f}"
+        _smai_limit=$(printf '%s' "${_smai_live}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("limit") or "")' 2>/dev/null || echo "")
+        _smai_src=$(printf '%s' "${_smai_live}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("source") or "")' 2>/dev/null || echo "")
+        if [ -n "${_smai_limit}" ]; then
+            echo "🔍 Rank check: adapter r${_smai_rank} vs serving max_lora_rank ${_smai_limit} (${_smai_src})"
+            if ! python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" rank-fit --name "${adapter_name}" \
+                --rank "${_smai_rank}" --limit "${_smai_limit}" --limit-kind live \
+                --target "${DEPLOYMENT_TARGET:-realtime-inference}"; then
+                echo "❌ Refusing to create the adapter inference component (nothing was created)."
+                exit 1
             fi
         fi
     fi

@@ -1753,6 +1753,20 @@ except Exception:
     local technique_upper
     technique_upper=$(echo "${ARG_TECHNIQUE}" | tr '[:lower:]' '[:upper:]')
     _update_config_var "TUNE_JOB_NAME_${technique_upper}" "${JOB_NAME}"
+    # Wave 6.1 R2.2 (BL188): record the rank this technique will PRODUCE (the
+    # resolved lora_rank knob — the per-model SDK recipe default or the user's
+    # --set/--lora-rank) so deploy derives max_lora_rank from it without the SDK.
+    # Never blocks or lowers the technique's rank (R2.5).
+    local _tune_lora_rank=""
+    _tune_lora_rank=$(printf '%s' "${resolved_hp:-}" | python3 -c 'import json,sys
+try:
+    v = json.load(sys.stdin).get("lora_rank")
+except (ValueError, AttributeError):
+    v = None
+print(v if isinstance(v, int) and v > 0 else "")' 2>/dev/null || echo "")
+    if [ -n "${_tune_lora_rank}" ]; then
+        _update_config_var "TUNE_LORA_RANK_${technique_upper}" "${_tune_lora_rank}"
+    fi
     _update_config_var "TUNE_TECHNIQUE" "${ARG_TECHNIQUE}"
     _update_config_var "TUNE_TRAINING_TYPE" "${ARG_TRAINING_TYPE}"
     _update_config_var "TUNE_DATASET_PATH" "${ARG_DATASET}"
@@ -1966,12 +1980,32 @@ _handle_completion() {
         fi
         if [ -n "${_lora_r}" ]; then
             echo "   LoRA rank: ${_lora_r}${_lora_alpha:+  | alpha: ${_lora_alpha}}"
-            # Rank-fit: warn (not block) if rank exceeds the deployed serving buffer.
-            if [ -n "${VLLM_MAX_LORA_RANK:-}" ] && [ "${_lora_r}" -gt "${VLLM_MAX_LORA_RANK}" ] 2>/dev/null; then
+            # Rank-fit (BL164 R5, Wave 6.1 R2.5): compare against the EFFECTIVE
+            # serving limit — what the next deploy applies (explicit
+            # <engine>_MAX_LORA_RANK, else derived from the recorded adapters +
+            # engine default) — so the note is no longer silent when no explicit
+            # VLLM_MAX_LORA_RANK is set. Informational only: never blocks the
+            # tune and never lowers the technique's rank.
+            # "Current" = the limit WITHOUT this technique's own records (what the
+            # deployment was sized for before this tune); the next deploy derives
+            # the limit WITH them.
+            local _eff_json _eff_rank _eff_explicit _technique_lc
+            _technique_lc=$(echo "${ARG_TECHNIQUE}" | tr '[:upper:]' '[:lower:]')
+            _eff_json=$(python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" effective-lora-rank --rank-only \
+                --exclude-technique "${_technique_lc}" 2>/dev/null || echo "")
+            _eff_rank=$(printf '%s' "${_eff_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("rank") or "")' 2>/dev/null || echo "")
+            _eff_explicit=$(printf '%s' "${_eff_json}" | python3 -c 'import json,sys; v=json.load(sys.stdin).get("explicit"); print("" if v is None else v)' 2>/dev/null || echo "")
+            if [ -n "${_eff_rank}" ] && [ "${_lora_r}" -gt "${_eff_rank}" ] 2>/dev/null; then
                 echo ""
-                echo "   ⚠️  Adapter rank ${_lora_r} exceeds the serving max_lora_rank (${VLLM_MAX_LORA_RANK})."
-                echo "      The engine will reject/truncate it at load. Raise VLLM_MAX_LORA_RANK in"
-                echo "      do/config (>= ${_lora_r}) and redeploy before hot-loading this adapter."
+                echo "   ℹ️  Adapter rank ${_lora_r} is above the current serving max_lora_rank (${_eff_rank})."
+                if [ -n "${_eff_explicit}" ]; then
+                    echo "      Your explicit max_lora_rank=${_eff_explicit} in do/config wins: raise it to at least"
+                    echo "      ${_lora_r} (or unset it so deploy derives it) and redeploy before hot-loading."
+                else
+                    echo "      The next ./do/deploy raises it automatically (derived from the recorded"
+                    echo "      tune adapters) — redeploy before hot-loading this adapter"
+                    echo "      (./do/adapter add refuses it until then)."
+                fi
             fi
         else
             echo "   (adapter rank/alpha unavailable — adapter_config.json not readable)"

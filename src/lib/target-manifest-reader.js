@@ -113,6 +113,15 @@ export function verbs(target, targetsDir = TARGETS_D) {
 }
 
 /**
+ * The target's adapter_delivery declaration (Wave 6.1 R1.1): how LoRA adapters
+ * reach the serving pod ({strategy, mount_path, subdir}), or {} when none.
+ * @returns {{strategy?: string, mount_path?: string, subdir?: string}}
+ */
+export function adapterDelivery(target, targetsDir = TARGETS_D) {
+    const d = getDescriptor(target, targetsDir);
+    return d && d.adapter_delivery ? d.adapter_delivery : {};
+}
+/**
  * The status_var -> answer_key map across all targets, for building
  * SHELL_VAR_TO_ANSWER's per-target status entries.
  * @returns {Object<string,string>}

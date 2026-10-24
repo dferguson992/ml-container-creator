@@ -10,7 +10,7 @@
  * which is bash 3.2 on macOS — the shell the do/ scripts must support.
  */
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, rmSync, existsSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, rmSync, existsSync, readdirSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,7 +26,7 @@ export const BASH = existsSync('/bin/bash') ? '/bin/bash' : 'bash';
  * @param {string[]} [opts.scripts] do/ scripts to copy verbatim (e.g. ['adapter'])
  * @param {string} [opts.config] contents of do/config
  */
-export function makeSandbox({ scripts = [], config = '' } = {}) {
+export function makeSandbox({ scripts = [], config = '', pyHelpers = false } = {}) {
     const root = mkdtempSync(join(tmpdir(), 'mlcc-additive-'));
     const doDir = join(root, 'do');
     const libDir = join(doDir, 'lib');
@@ -44,6 +44,16 @@ export function makeSandbox({ scripts = [], config = '' } = {}) {
     writeFileSync(join(doDir, 'config'), config);
     for (const s of scripts) {
         writeFileSync(join(doDir, s), readFileSync(join(DO_SRC, s)), { mode: 0o755 });
+    }
+    // Wave 6.1: the real Python helpers do/adapter / do/deploy.d call for adapter
+    // delivery + right-sizing, plus the descriptors they read (targets.d under
+    // do/, serve.d under .mlcc/ — the generated-project layout).
+    if (pyHelpers) {
+        for (const py of ['adapter_delivery.py', 'right_sizing.py', 'serve_manifest.py', 'target_manifest.py', 'hyperpod_ops.py']) {
+            writeFileSync(join(pyDir, py), readFileSync(join(DO_SRC, 'lib/python', py)));
+        }
+        cpSync(join(DO_SRC, 'targets.d'), join(doDir, 'targets.d'), { recursive: true });
+        cpSync(join(REPO, 'templates/code/serve.d'), join(root, '.mlcc/serve.d'), { recursive: true });
     }
     const write = (rel, content, mode = 0o755) => {
         const p = join(root, rel);

@@ -125,6 +125,17 @@
               "description": "One AND-group: capability_map keys that must ALL resolve together."
             },
             "description": "Companion contract, OR of AND-groups: the capability is emittable if AT LEAST ONE inner group fully resolves (every key in that group resolves). Expresses engine rules like SGLang `--enable-lora` needs (max_lora_rank AND lora_target_modules) OR (lora_paths). When no group is fully satisfiable the capability is OMITTED (never emitted bare). The engine itself declares which groups it accepts; MLCC never branches on the engine name. Mutually exclusive with requires. An empty inner group [] means 'this group needs nothing' (always satisfiable)."
+          },
+          "default": {
+            "type": ["string", "integer"],
+            "description": "Wave 6.1 (BL188): the MLCC default value deploy fills for this capability when LoRA is on and the user set none (e.g. vLLM lora_max=4, lora_max_rank=16). The SINGLE source for that default: the deploy drivers, the generator resolver/prompt, the Dockerfile and the parameter-schema default all derive from it (drift-tested). Omit when MLCC supplies no default."
+          },
+          "allowed": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 1 },
+            "minItems": 1,
+            "uniqueItems": true,
+            "description": "Wave 6.1 (BL188): the discrete values the engine accepts for this capability, ascending (e.g. vLLM max_lora_rank ∈ {1,8,16,32,64,128,256,320,512}). A derived value is snapped UP to the next allowed entry. Omit when the engine accepts any positive integer."
           }
         }
       }

@@ -26,6 +26,7 @@
     "KUBECONFIG"
   ],
   "serving_config_source": "kubernetes",
+  "adapter_delivery": { "strategy": "model-prefix", "mount_path": "/opt/ml/model", "subdir": ".mlcc-adapters" },
   "verbs": {
     "optimize": true,
     "add-ic": false,
