@@ -68,6 +68,7 @@ def sandbox(tmp_path):
     (lib / "script-contract.sh").write_text("_require_python_env(){ :; }\n_require_guard(){ :; }\n"
                                             + _real_contract_function("_additive_upper"))
     (lib / "profile.sh").write_text(":\n")
+    shutil.copy2(os.path.join(_DO, "lib", "s3-layout.sh"), lib / "s3-layout.sh")  # bucket consolidation R3
     (lib / "resolve-instance.sh").write_text(":\n")
     (do / "config").write_text('PROJECT_NAME="p"\nAWS_REGION="us-west-2"\n'
                                'ROLE_ARN="arn:aws:iam::123456789012:role/r"\n')

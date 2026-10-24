@@ -46,7 +46,7 @@ case "$1 $2" in
     if [ "\${STUB_SOURCE:-s3}" = "huggingface" ]; then
       echo '{"spec":{"modelSourceConfig":{"modelSourceType":"huggingface","prefetchEnabled":true}}}'
     else
-      echo "{\\"spec\\":{\\"modelSourceConfig\\":{\\"modelSourceType\\":\\"s3\\",\\"s3Storage\\":{\\"bucketName\\":\\"core\\"},\\"modelLocation\\":\\"models/m\\",\\"prefetchEnabled\\":\${STUB_PREFETCH:-false}}}}"
+      echo "{\\"spec\\":{\\"modelSourceConfig\\":{\\"modelSourceType\\":\\"s3\\",\\"s3Storage\\":{\\"bucketName\\":\\"core\\"},\\"modelLocation\\":\\"\${STUB_MODEL_LOCATION:-models/m}\\",\\"prefetchEnabled\\":\${STUB_PREFETCH:-false}}}}"
     fi ;;
   "get pod")
     case " $* " in
@@ -89,6 +89,36 @@ if os.environ.get("STUB_KIND"):
     md["mlcc.artifact_kind"] = os.environ["STUB_KIND"]
 print(json.dumps({"arn": "x", "version": "3", "modelDataUrl": os.environ.get("STUB_URI", "s3://b/reg/adapter/"), "metadata": md}))
 `;
+// Fake boto3 (S3 only) for the promotion / serving-copy paths: objects live in the
+// JSON file FAKE_S3 as {"<bucket>/<key>": "<content>"}; no AWS call is made.
+const FAKE_BOTO3 = `import hashlib, io, json, os
+class _C:
+    def _l(self):
+        p = os.environ.get("FAKE_S3", "")
+        return json.load(open(p)) if p and os.path.exists(p) else {}
+    def _s(self, d):
+        json.dump(d, open(os.environ["FAKE_S3"], "w"))
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):
+        d = self._l(); pre = Bucket + "/" + Prefix
+        return {"Contents": [{"Key": k[len(Bucket) + 1:], "Size": len(v), "ETag": hashlib.md5(v.encode()).hexdigest()}
+                             for k, v in sorted(d.items()) if k.startswith(pre)], "IsTruncated": False}
+    def get_object(self, Bucket, Key):
+        d = self._l()
+        if Bucket + "/" + Key not in d:
+            raise KeyError(Key)
+        return {"Body": io.BytesIO(d[Bucket + "/" + Key].encode())}
+    def put_object(self, Bucket, Key, Body, ContentType=None):
+        d = self._l(); d[Bucket + "/" + Key] = Body.decode() if isinstance(Body, bytes) else Body; self._s(d)
+    def copy(self, src, bucket, key):
+        d = self._l(); d[bucket + "/" + key] = d[src["Bucket"] + "/" + src["Key"]]; self._s(d)
+    def delete_objects(self, Bucket, Delete):
+        d = self._l()
+        for o in Delete["Objects"]:
+            d.pop(Bucket + "/" + o["Key"], None)
+        self._s(d)
+def client(service, region_name=None):
+    return _C()
+`;
 function k8sConfig(extra = []) {
     return [
         ACTIVE_STATUS_CONFIG,
@@ -118,6 +148,7 @@ describe('Wave 6 / 6.1 — do/adapter on Kubernetes: --from-* sources, local-pat
         sb.write('bin/kubectl', KUBECTL_STUB);
         sb.write('do/lib/python/lora_vllm.py', LORA_STUB);
         sb.write('do/.register_helper.py', REGISTER_STUB);
+        sb.write('do/lib/python/boto3/__init__.py', FAKE_BOTO3, 0o644);
         log = join(sb.root, 'lora.log');
     });
     after(() => sb.cleanup());
@@ -140,15 +171,79 @@ describe('Wave 6 / 6.1 — do/adapter on Kubernetes: --from-* sources, local-pat
         assert.deepStrictEqual(r.calls, [`load ad1 ${POD}/ad1 ${URL}`]);
         assert.match(r.stderr, /--weights is deprecated; use --from-weights/);
     });
-    it('R1.3 (Part A): a source outside the model prefix is refused with the exact copy command, before any engine call', () => {
+    it('R1.3: a source outside the model prefix needs the core bucket to promote — refused before any engine call', () => {
         const r = run(['add', 'tuned', '--from-tune'], {
             config: ['export TUNE_OUTPUT_PATH_LATEST="s3://b/tune/out/"', 'export TUNE_OUTPUT_TYPE_LATEST="adapter"']
         });
         assert.strictEqual(r.code, 1, r.stdout + r.stderr);
         assert.deepStrictEqual(r.calls, [], 'no s3:// path may ever reach the engine');
-        assert.match(r.stdout, /outside this deployment's model prefix/);
-        assert.match(r.stdout, /aws s3 sync s3:\/\/b\/tune\/out\/ s3:\/\/core\/models\/m\/\.mlcc-adapters\/proj\/tuned\//);
+        assert.match(r.stdout, /coreS3Bucket/);
         assert.ok(!/Contract violation/.test(r.stdout), 'the k8s source-verb refusal must stay gone');
+    });
+    it('R1.3 / bucket R3: a raw tune output is promoted into the canonical prefix, then loaded by path (no copy)', () => {
+        const state = join(sb.root, 'fake-s3.json');
+        sb.write('fake-s3.json', JSON.stringify({
+            'zz-art/proj/tune/sft/j/hf/adapter_config.json': '{"r": 16}',
+            'zz-art/proj/tune/sft/j/hf/adapter_model.safetensors': 'w'
+        }), 0o644);
+        const r = run(['add', 'tuned', '--from-tune', 'sft'], {
+            config: ['export TUNE_ADAPTER_PATH_SFT="s3://zz-art/proj/tune/sft/j/hf/"', 'export MODEL_NAME="org/m"',
+                'export TUNE_MODEL_ID="org/m"', 'export CORE_S3_BUCKET="core"'],
+            env: { STUB_MODEL_LOCATION: 'models/org/m', FAKE_S3: state }
+        });
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        assert.deepStrictEqual(r.calls, [`load tuned ${POD}/tuned ${URL}`]);
+        const after = JSON.parse(readFileSync(state, 'utf8'));
+        assert.ok(after['core/models/org/m/.mlcc-adapters/proj/tuned/adapter_model.safetensors'], 'payload promoted');
+        const m = JSON.parse(after['core/models/org/m/.mlcc-adapters/proj/tuned/mlcc-adapter.json']);
+        assert.strictEqual(m.base_model, 'org/m');
+        assert.strictEqual(m.technique, 'sft');
+        assert.ok(!m.serving_copy_of, 'the canonical home is not a serving copy');
+        assert.match(r.stdout, /Promote: s3:\/\/zz-art\/proj\/tune\/sft\/j\/hf\/ → s3:\/\/core\/models\/org\/m\/\.mlcc-adapters\/proj\/tuned\//);
+    });
+    it('promote <name> --from-tune <t> --update-config backfills the canonical prefix and keeps the old value (bucket R3.7)', () => {
+        sb.write('do/lib/profile.sh', '_require_bucket() { eval "[ -n \\"\\${$1:-}\\" ]"; }\n', 0o644);
+        const state = join(sb.root, 'fake-s3.json');
+        sb.write('fake-s3.json', JSON.stringify({
+            'zz-art/proj/tune/dpo/j/hf/adapter_config.json': '{"r": 64}',
+            'zz-art/proj/tune/dpo/j/hf/adapter_model.safetensors': 'w'
+        }), 0o644);
+        const raw = 's3://zz-art/proj/tune/dpo/j/hf/';
+        const r = run(['promote', 'dpo-a', '--from-tune', 'dpo', '--update-config'], {
+            config: [`export TUNE_ADAPTER_PATH_DPO="${raw}"`, 'export TUNE_MODEL_ID="org/m"', 'export CORE_S3_BUCKET="core"'],
+            env: { FAKE_S3: state }
+        });
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        assert.deepStrictEqual(r.calls, [], 'promote never talks to the engine');
+        const canon = 's3://core/models/org/m/.mlcc-adapters/proj/dpo-a/';
+        assert.match(r.stdout, new RegExp(`Canonical: ${canon.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}`));
+        const cfg = readFileSync(join(sb.doDir, 'config'), 'utf8');
+        assert.match(cfg, new RegExp(`export TUNE_ADAPTER_PATH_DPO="${canon}"`));
+        assert.match(cfg, new RegExp(`export TUNE_ADAPTER_SOURCE_DPO="${raw}"`));
+        const after = JSON.parse(readFileSync(state, 'utf8'));
+        assert.strictEqual(JSON.parse(after['core/models/org/m/.mlcc-adapters/proj/dpo-a/mlcc-adapter.json']).rank, 64);
+        sb.write('do/lib/profile.sh', '# stub profile.sh\n', 0o644);
+    });
+    it('remove unloads and deletes ONLY a serving copy it made; a canonical adapter is kept', () => {
+        const state = join(sb.root, 'fake-s3.json');
+        const copy = 'core/models/org/m/.mlcc-adapters/proj/cp1/';
+        const canon = 'core/models/org/m/.mlcc-adapters/proj/keep/';
+        sb.write('fake-s3.json', JSON.stringify({
+            [`${copy}adapter_model.safetensors`]: 'w',
+            [`${copy}mlcc-adapter.json`]: JSON.stringify({ serving_copy_of: 's3://core/models/x/y/.mlcc-adapters/proj/cp1/' }),
+            [`${canon}adapter_model.safetensors`]: 'w',
+            [`${canon}mlcc-adapter.json`]: JSON.stringify({ content_hash: 'sha256:x' })
+        }), 0o644);
+        const env = { STUB_MODEL_LOCATION: 'models/org/m', FAKE_S3: state };
+        const r1 = run(['remove', 'cp1'], { env });
+        assert.strictEqual(r1.code, 0, r1.stdout + r1.stderr);
+        assert.deepStrictEqual(r1.calls, [`unload cp1 ${URL}`]);
+        assert.match(r1.stdout, /Deleted the serving copy/);
+        const r2 = run(['remove', 'keep'], { env });
+        assert.strictEqual(r2.code, 0, r2.stdout + r2.stderr);
+        const after = JSON.parse(readFileSync(state, 'utf8'));
+        assert.ok(!Object.keys(after).some(k => k.startsWith(copy)), 'serving copy deleted');
+        assert.ok(after[`${canon}adapter_model.safetensors`], 'canonical adapter kept');
     });
     it('add --from-tune whose output is under the model prefix hot-loads it', () => {
         const r = run(['add', 'tuned', '--from-tune'], {

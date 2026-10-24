@@ -26,6 +26,7 @@ source "${SCRIPT_DIR}/lib/script-contract.sh"
 _require_python_env
 source "${SCRIPT_DIR}/config"
 source "${SCRIPT_DIR}/lib/profile.sh"
+source "${SCRIPT_DIR}/lib/s3-layout.sh"
 source "${SCRIPT_DIR}/lib/resolve-instance.sh"
 
 # CORE_BUCKET (the core models bucket) backs the dataset sidecar registry used for
@@ -1411,18 +1412,35 @@ print(artifacts.get('S3ModelArtifacts', ''))
     _update_config_var "TRAIN_OUTPUT_PATH_LATEST" "${output_path}"
     _update_config_var "TRAIN_JOB_NAME" "${job_name}"
 
-    # Write technique-specific adapter path
-    # Key form shared with the --from-train reader (_additive_upper, script-contract.sh).
-    local technique_upper
-    technique_upper=$(_additive_upper "${TECHNIQUE:-custom}")
-    _update_config_var "TRAIN_ADAPTER_PATH_${technique_upper}" "${output_path}"
-    _update_config_var "TRAIN_TECHNIQUE" "${TECHNIQUE:-custom}"
-
     # Detect output type: check for adapter_config.json in output path
     local output_type="full-model"
     if aws s3 ls "${output_path}/adapter_config.json" &>/dev/null; then
         output_type="adapter"
     fi
+
+    # Write technique-specific paths
+    # Key form shared with the --from-train reader (_additive_upper, script-contract.sh).
+    local technique_upper technique_lc
+    technique_upper=$(_additive_upper "${TECHNIQUE:-custom}")
+    technique_lc=$(echo "${TECHNIQUE:-custom}" | tr '[:upper:]' '[:lower:]' | sed 's/_/-/g')
+
+    # Promotion (bucket consolidation R3.3): publish the servable output to its
+    # canonical prefix in the core bucket (adapter → <base prefix>/.mlcc-adapters/
+    # <project>/trained-<technique>/, full model → models/mlcc-<project>/
+    # trained-<technique>/; do/lib/s3-layout.sh). The raw output stays in the
+    # artifacts bucket and in TRAIN_OUTPUT_PATH_<T> / TRAIN_OUTPUT_PATH_LATEST.
+    local _promo_type="model"
+    [ "${output_type}" = "adapter" ] && _promo_type="adapter"
+    _s3_layout_promote "${output_path}" "${_promo_type}" "trained-${technique_lc}" "${technique_lc}" \
+        "${job_name}" "${MODEL_NAME:-}" "do/train"
+    _update_config_var "TRAIN_OUTPUT_PATH_${technique_upper}" "${output_path}"
+    if [ "${output_type}" = "adapter" ]; then
+        _update_config_var "TRAIN_ADAPTER_PATH_${technique_upper}" "${PROMOTED_URI:-${output_path}}"
+    else
+        _update_config_var "TRAIN_ADAPTER_PATH_${technique_upper}" "${output_path}"
+        [ -n "${PROMOTED_URI}" ] && _update_config_var "TRAIN_MODEL_PATH_${technique_upper}" "${PROMOTED_URI}"
+    fi
+    _update_config_var "TRAIN_TECHNIQUE" "${TECHNIQUE:-custom}"
 
     # Source feedback.sh and call print_completion_feedback
     source "${SCRIPT_DIR}/lib/feedback.sh"

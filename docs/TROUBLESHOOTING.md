@@ -373,6 +373,54 @@ aws sagemaker describe-inference-component \
 ./do/logs
 ```
 
+### Kubernetes: "No adapter found" when loading a LoRA adapter (hyperpod-eks / eks)
+
+**Symptoms:** `load_lora_adapter` fails with `No adapter found for <path>`, or vLLM tries to
+download the adapter from Hugging Face.
+
+**Root cause:** vLLM loads adapters from a LOCAL path. An `s3://` URI (or a path that is not on
+the pod's model mount) is treated as a Hub repo id. The pod has no AWS credentials.
+
+**Fix:** use `./do/adapter add <name> --from-tune <t>` (or `--from-weights`): it promotes the
+adapter to its canonical prefix `models/<org>/<base>/.mlcc-adapters/<project>/<name>/` in the
+core bucket and loads `/opt/ml/model/.mlcc-adapters/<project>/<name>`. If it refuses:
+
+- *model is not served from S3* — `./do/stage` and `./do/deploy --target hyperpod-eks --force`;
+- *prefetchEnabled: true* — redeploy so MLCC turns prefetch off for LoRA + S3:
+  `./do/deploy --target hyperpod-eks --force` (add `--surge-node` on a single-node group);
+- *no S3 model mount* (eks) — set `EKS_MODEL_MOUNT=s3` with a staged model and redeploy;
+- *incompatible base* — the adapter was trained on a different base than the deployment serves.
+
+See [LoRA delivery on Kubernetes](architecture/k8s-lora-delivery.md).
+
+### "rank X > max_lora_rank Y" when adding an adapter
+
+**Symptoms:** `./do/adapter add` refuses with the adapter's rank and the serving limit, or vLLM
+rejects the load with a rank error.
+
+**Root cause:** vLLM fixes `max_lora_rank` at start. Managed-tune adapters are often r32/r64; the
+engine default is 16.
+
+**Fix:** redeploy so the limit is derived from the recorded adapters
+(`./do/deploy --target <target> --force`), or, if `VLLM_MAX_LORA_RANK` is set explicitly in
+`do/config`, raise it to at least the adapter's rank (an allowed value: 1, 8, 16, 32, 64, 128,
+256, 320, 512) first. On realtime-inference the fix is the base IC's `IC_ENV_VLLM_MAX_LORA_RANK`
+and `./do/deploy --target realtime-inference --force-ic`. A rank whose LoRA buffer exceeds 10% of
+the free GPU memory is refused at deploy with the numbers.
+
+### hyperpod-eks: rollout stuck Pending / deploy stops with "rollout cannot schedule"
+
+**Symptoms:** after a pod-template change the new pod stays `Pending` (insufficient
+`nvidia.com/gpu`), or `./do/deploy --target hyperpod-eks --force` stops before applying.
+
+**Root cause:** the instance group has one node and the serving pod holds all its GPUs, so a
+surge pod cannot schedule. MLCC never scales to zero to make room.
+
+**Fix:** `./do/deploy --target hyperpod-eks --force --surge-node` adds one node for the rollout
+and removes the vacated one afterwards (the count is restored on any failure). Capacity errors
+(`InsufficientCapacity`) are printed verbatim — retry later. If nothing changed in the pod
+template, no rollout is needed and none happens.
+
 ## `do/stage` Processing Job fails for large models
 
 **Symptom:** Processing Job exits with code 1. CloudWatch logs may show `Killed` or out-of-memory errors during model download. No useful error message from `do/stage` itself.

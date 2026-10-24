@@ -112,10 +112,13 @@ class TestDeployRewardLambda:
         fake.client = _client
         monkeypatch.setitem(sys.modules, "boto3", fake)
 
-    def test_deploy_uses_training_bucket_handler_and_role(self, monkeypatch, tmp_path):
+    def test_deploy_uses_core_evaluators_prefix_handler_and_role(self, monkeypatch, tmp_path):
+        # Bucket consolidation R3.9: the backup goes to the CORE bucket under
+        # evaluators/<name>/ (key from s3_layout), not the frozen training bucket.
         captured = {}
         self._install_fake_boto3(monkeypatch, captured)
-        monkeypatch.setenv("S3_BUCKET", "mlcc-training-111122223333-us-west-2")
+        monkeypatch.setenv("CORE_S3_BUCKET", "zz-core-x")
+        monkeypatch.setenv("S3_BUCKET", "zz-legacy-training")
         f = tmp_path / "math-reward.py"
         f.write_text("def handler(e, c=None):\n    return []\nlambda_handler = handler\n")
 
@@ -124,25 +127,27 @@ class TestDeployRewardLambda:
             role_arn="arn:aws:iam::1:role/mlcc-reward-lambda-role-us-west-2",
             region="us-west-2",
         )
-        # Reused the training bucket for the backup (NOT a new/default bucket).
-        assert captured["s3"]["bucket"] == "mlcc-training-111122223333-us-west-2"
+        assert captured["s3"]["bucket"] == "zz-core-x"
+        assert captured["s3"]["key"] == "evaluators/math-reward/lambda_function.py"
         # Created with the dual-trust role and the standard handler name.
         assert captured["create"]["Role"].endswith("mlcc-reward-lambda-role-us-west-2")
         assert captured["create"]["Handler"] == "lambda_function.lambda_handler"
         assert arn.startswith("arn:aws:lambda:")
 
-    def test_training_bucket_never_derived_from_account(self, monkeypatch):
+    def test_evaluator_bucket_never_derived_from_account(self, monkeypatch):
         # Bucket consolidation R2.1: with no profile key there is NO convention-built
         # fallback name (formerly mlcc-training-<sts account>-<region>).
         captured = {}
         self._install_fake_boto3(monkeypatch, captured)
         monkeypatch.delenv("S3_BUCKET", raising=False)
         monkeypatch.delenv("TRAINING_S3_BUCKET", raising=False)
-        assert re_mod._resolve_training_bucket("us-west-2") is None
+        monkeypatch.delenv("CORE_S3_BUCKET", raising=False)
+        assert re_mod._resolve_evaluator_bucket("us-west-2") is None
 
     def test_deploy_skips_backup_without_profile_bucket(self, monkeypatch, tmp_path):
         captured = {}
         self._install_fake_boto3(monkeypatch, captured)
+        monkeypatch.delenv("CORE_S3_BUCKET", raising=False)
         monkeypatch.delenv("S3_BUCKET", raising=False)
         monkeypatch.delenv("TRAINING_S3_BUCKET", raising=False)
         f = tmp_path / "math-reward.py"

@@ -38,6 +38,8 @@ export function makeSandbox({ scripts = [], config = '', pyHelpers = false } = {
     writeFileSync(join(libDir, 'script-contract.sh'), readFileSync(join(DO_SRC, 'lib/script-contract.sh')));
     writeFileSync(join(libDir, 'wait.sh'), readFileSync(join(DO_SRC, 'lib/wait.sh')));
     writeFileSync(join(libDir, 'profile.sh'), '# stub profile.sh\n');
+    // Bucket consolidation R3: the thin shell wrapper over s3_layout.py.
+    writeFileSync(join(libDir, 's3-layout.sh'), readFileSync(join(DO_SRC, 'lib/s3-layout.sh')));
     // _require_python_env resolves <root>/.mlcc/hey-venv/bin/activate.
     mkdirSync(join(root, '.mlcc/hey-venv/bin'), { recursive: true });
     writeFileSync(join(root, '.mlcc/hey-venv/bin/activate'), '# stub venv\n');
@@ -49,7 +51,7 @@ export function makeSandbox({ scripts = [], config = '', pyHelpers = false } = {
     // delivery + right-sizing, plus the descriptors they read (targets.d under
     // do/, serve.d under .mlcc/ — the generated-project layout).
     if (pyHelpers) {
-        for (const py of ['adapter_delivery.py', 'right_sizing.py', 'serve_manifest.py', 'target_manifest.py', 'hyperpod_ops.py']) {
+        for (const py of ['adapter_delivery.py', 's3_layout.py', 'right_sizing.py', 'serve_manifest.py', 'target_manifest.py', 'hyperpod_ops.py']) {
             writeFileSync(join(pyDir, py), readFileSync(join(DO_SRC, 'lib/python', py)));
         }
         cpSync(join(DO_SRC, 'targets.d'), join(doDir, 'targets.d'), { recursive: true });

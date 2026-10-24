@@ -298,7 +298,7 @@ describe('Wave 6.1 R1.1 — adapter_delivery is declared in the descriptor and r
     });
     it('consumers read the descriptor instead of hardcoding the path', () => {
         const adapter = read('templates/do/adapter');
-        assert.match(adapter, /adapter_delivery\.py" local-path/);
+        assert.match(adapter, /adapter_delivery\.py" deliver/);
         assert.ok(!/\/opt\/ml\/model\/\.mlcc-adapters/.test(adapter.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n')),
             'do/adapter must not hardcode the in-pod adapter path');
         assert.match(read('templates/do/lib/python/adapter_delivery.py'), /target_manifest\.adapter_delivery\(/);

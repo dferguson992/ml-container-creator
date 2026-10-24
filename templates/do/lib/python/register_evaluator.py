@@ -60,19 +60,22 @@ def check_name_budget(name):
 # ── MLCC-owned reward-Lambda deploy (--finalize) ───────────────────────────────
 
 
-def _resolve_training_bucket(region):  # noqa: ARG001 — kept for call-site compatibility
-    """The bucket the reward-code backup is staged into — the profile's (legacy)
-    training bucket, which the reward-Lambda role can read. Comes ONLY from the
-    profile-resolved env (profile.sh maps trainingS3Bucket → S3_BUCKET; or an explicit
-    TRAINING_S3_BUCKET). Returns None when unset — the backup is best-effort, so the
-    caller skips it rather than guessing a bucket name (bucket consolidation R2.1)."""
+def _resolve_evaluator_bucket(region):  # noqa: ARG001 — kept for call-site compatibility
+    """The bucket the reward-code backup is staged into: the CORE bucket (bucket
+    consolidation R3.9 — evaluators are shared registered assets, like reward
+    prompts, at evaluators/<name>/; the reward-Lambda role can read that prefix).
+    Comes ONLY from the profile-resolved env (CORE_S3_BUCKET, passed by do/register
+    from the profile key coreS3Bucket). Returns None when unset — the backup is
+    best-effort, so the caller skips it rather than guessing a bucket name."""
     import os
-    return os.environ.get("S3_BUCKET") or os.environ.get("TRAINING_S3_BUCKET") or None
+    return os.environ.get("CORE_S3_BUCKET") or None
+
+
 def _deploy_reward_lambda(*, name, local_py, role_arn, region):
     """Deploy ``local_py`` as a reward-function Lambda MLCC owns, returning its ARN.
 
     Mirrors what the SDK's Evaluator.create would do for a local source, but fixes
-    its breakages: stages the code backup into the REUSED training bucket (not the
+    its breakages: stages the code backup into the core bucket evaluators/<name>/ (not the
     nonexistent default), zips the file AS ``lambda_function.py`` so the standard
     ``lambda_function.lambda_handler`` entrypoint resolves (the materialized sample
     defines ``handler`` with a ``lambda_handler`` alias), and uses the dual-trust
@@ -83,14 +86,15 @@ def _deploy_reward_lambda(*, name, local_py, role_arn, region):
     import zipfile
     import boto3
 
-    # (a) Stage a readable backup of the source into the reused training bucket.
-    bucket = _resolve_training_bucket(region)
-    key = f"evaluators/{name}/lambda_function.py"
+    # (a) Stage a readable backup of the source into the core bucket (evaluators/<name>/).
+    import s3_layout  # noqa: PLC0415 — the single layout module
+    bucket = _resolve_evaluator_bucket(region)
+    key = s3_layout.evaluator_key(name)
     try:
         if not bucket:
             raise RuntimeError(
-                "no training bucket in the active profile (trainingS3Bucket); "
-                "run: ml-container-creator bootstrap add-module training"
+                "no core bucket in the active profile (coreS3Bucket); "
+                "run: ml-container-creator bootstrap update --module core"
             )
         boto3.client("s3", region_name=region).upload_file(local_py, bucket, key)
     except (NameError, AttributeError):
@@ -307,7 +311,7 @@ def cmd_register_evaluator(args):
         # (MLCC-owned deploy, not the SDK's _create_lambda_function), then register
         # the resulting ARN via the reliable --arn path. This fixes the SDK path's
         # three breakages: (a) it uploaded to a nonexistent default bucket
-        # `sagemaker-<region>-<account>` → NoSuchBucket; we use the training bucket;
+        # `sagemaker-<region>-<account>` → NoSuchBucket; we use the core bucket evaluators prefix;
         # (b) it hardcodes handler `lambda_function.lambda_handler`; we zip the file
         # AS `lambda_function.py` so that handler resolves; (c) it needs the
         # dual-trust role, now provisioned by the training bootstrap module and

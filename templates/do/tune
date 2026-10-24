@@ -23,6 +23,7 @@ source "${SCRIPT_DIR}/lib/script-contract.sh"
 _require_python_env
 source "${SCRIPT_DIR}/config"
 source "${SCRIPT_DIR}/lib/profile.sh"
+source "${SCRIPT_DIR}/lib/s3-layout.sh"
 
 # ── Profile-resolved variables ────────────────────────────────────────────────
 # The output (artifacts) bucket is ARTIFACTS_S3_BUCKET, exported by do/lib/profile.sh
@@ -477,13 +478,21 @@ _show_status() {
                         local technique_upper
                         technique_upper=$(echo "${technique}" | tr '[:lower:]' '[:upper:]')
 
+                        # Promote the servable output to its canonical prefix
+                        # (bucket consolidation R3.3); the raw path stays in
+                        # TUNE_OUTPUT_PATH_<T> / TUNE_OUTPUT_PATH_LATEST.
+                        _promote_tune_output "${artifact_path}" "${output_type}" "tuned-${technique}" \
+                            "${technique}" "${job_name}" "${TUNE_MODEL_ID:-${MODEL_NAME:-}}"
+                        local servable_path="${PROMOTED_URI:-${artifact_path}}"
+                        _update_config_var "TUNE_OUTPUT_PATH_${technique_upper}" "${artifact_path}"
+
                         # Update config
                         if [ "${output_type}" = "adapter" ]; then
-                            _update_config_var "TUNE_ADAPTER_PATH_${technique_upper}" "${artifact_path}"
-                            echo "     Output (adapter): ${artifact_path}"
+                            _update_config_var "TUNE_ADAPTER_PATH_${technique_upper}" "${servable_path}"
+                            echo "     Output (adapter): ${servable_path}"
                         else
-                            _update_config_var "TUNE_MODEL_PATH_${technique_upper}" "${artifact_path}"
-                            echo "     Output (model): ${artifact_path}"
+                            _update_config_var "TUNE_MODEL_PATH_${technique_upper}" "${servable_path}"
+                            echo "     Output (model): ${servable_path}"
                         fi
                         _update_config_var "TUNE_OUTPUT_PATH_LATEST" "${artifact_path}"
                         _update_config_var "TUNE_OUTPUT_TYPE_LATEST" "${output_type}"
@@ -571,6 +580,14 @@ _update_config_var() {
         fi
         echo "export ${var_name}=\"${var_value}\"" >> "${config_file}"
     fi
+}
+
+# ── _promote_tune_output() ────────────────────────────────────────────────────
+# Bucket consolidation R3.3: publish the servable output to its canonical prefix
+# (do/lib/s3-layout.sh → s3_layout.py). Sets PROMOTED_URI ("" → keep the raw path).
+# Usage: _promote_tune_output <raw-uri> <adapter|model> <name> <technique> <job> <base-id>
+_promote_tune_output() {
+    _s3_layout_promote "$1" "$2" "$3" "$4" "$5" "$6" "do/tune"
 }
 
 # ── _check_catalog_staleness() ─────────────────────────────────────────────────
@@ -2013,19 +2030,32 @@ _handle_completion() {
     fi
     echo ""
 
+    # ── Promotion (bucket consolidation R3.3) ─────────────────────────────
+    # The raw job output stays in the artifacts bucket (TUNE_OUTPUT_PATH_<T> /
+    # TUNE_OUTPUT_PATH_LATEST); the canonical core URI is what TUNE_ADAPTER_PATH_*
+    # / TUNE_MODEL_PATH_* record. Name = the auto-registered adapter name.
+    local _promo_slug _promo_name
+    _promo_slug=$(_derive_dataset_slug "${ARG_DATASET:-}")
+    _promo_name="tuned-$(echo "${ARG_TECHNIQUE}" | tr '[:upper:]' '[:lower:]')${_promo_slug:+-${_promo_slug}}"
+    _promote_tune_output "${artifact_path}" "${output_type}" "${_promo_name}" \
+        "$(echo "${ARG_TECHNIQUE}" | tr '[:upper:]' '[:lower:]')" "${job_name}" \
+        "${RESOLVED_MODEL_ID:-${TUNE_MODEL_ID:-${MODEL_NAME:-}}}"
+    local servable_path="${PROMOTED_URI:-${artifact_path}}"
+    _update_config_var "TUNE_OUTPUT_PATH_${technique_upper}" "${artifact_path}"
+
     # Store output paths in config
     if [ "${output_type}" = "adapter" ]; then
-        _update_config_var "TUNE_ADAPTER_PATH_${technique_upper}" "${artifact_path}"
+        _update_config_var "TUNE_ADAPTER_PATH_${technique_upper}" "${servable_path}"
         # Write dataset-specific adapter path if dataset slug is available
         local dataset_slug
         dataset_slug=$(_derive_dataset_slug "${ARG_DATASET:-}")
         if [ -n "${dataset_slug}" ]; then
             local slug_upper
             slug_upper=$(echo "${dataset_slug}" | tr '[:lower:]' '[:upper:]' | sed 's/-/_/g')
-            _update_config_var "TUNE_ADAPTER_PATH_${technique_upper}_${slug_upper}" "${artifact_path}"
+            _update_config_var "TUNE_ADAPTER_PATH_${technique_upper}_${slug_upper}" "${servable_path}"
         fi
     else
-        _update_config_var "TUNE_MODEL_PATH_${technique_upper}" "${artifact_path}"
+        _update_config_var "TUNE_MODEL_PATH_${technique_upper}" "${servable_path}"
     fi
     _update_config_var "TUNE_OUTPUT_PATH_LATEST" "${artifact_path}"
     _update_config_var "TUNE_OUTPUT_TYPE_LATEST" "${output_type}"
@@ -2053,7 +2083,7 @@ _handle_completion() {
 # Auto-registered by do/tune (${ARG_TECHNIQUE})
 # Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 export ADAPTER_NAME="${adapter_name}"
-export ADAPTER_WEIGHTS_URI="${artifact_path}"
+export ADAPTER_WEIGHTS_URI="${servable_path}"
 export ADAPTER_TECHNIQUE="${ARG_TECHNIQUE}"
 export ADAPTER_SOURCE="tune"
 # BL176: record the base model this adapter was tuned FROM, so do/register can
@@ -2063,7 +2093,7 @@ export ADAPTER_SOURCE="tune"
 export ADAPTER_BASE_ID="${RESOLVED_MODEL_ID}"
 ADAPTER_CONF
         echo "   ✅ Adapter registered: ${adapter_name}"
-        echo "      Weights: ${artifact_path}"
+        echo "      Weights: ${servable_path}"
         echo ""
 
         # ── BL174: consolidate the tune output into the MLflow bridge catalog ─────
@@ -2098,15 +2128,15 @@ ADAPTER_CONF
         if [ -n "${dataset_slug}" ]; then
             echo "     ./do/adapter add tuned-${ARG_TECHNIQUE}-${dataset_slug} --from-tune ${ARG_TECHNIQUE}-${dataset_slug}"
         fi
-        echo "     ./do/adapter add tuned-${ARG_TECHNIQUE} --from-weights ${artifact_path}"
+        echo "     ./do/adapter add tuned-${ARG_TECHNIQUE} --from-weights ${servable_path}"
         echo ""
     else
         echo "📋 Next steps:"
         echo ""
         echo "   Deploy as new inference component:"
         echo "     ./do/add-ic tuned-v1 --from-tune"
-        echo "     ./do/add-ic tuned-v1 --from-weights ${artifact_path}"
-        echo "     ./do/add-ic default --update --from-weights ${artifact_path}   # swap the base IC in place"
+        echo "     ./do/add-ic tuned-v1 --from-weights ${servable_path}"
+        echo "     ./do/add-ic default --update --from-weights ${servable_path}   # swap the base IC in place"
         echo ""
     fi
 }

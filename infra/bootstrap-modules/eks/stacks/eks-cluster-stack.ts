@@ -10,6 +10,7 @@ import { KubectlV31Layer } from '@aws-cdk/lambda-layer-kubectl-v31';
 import { Construct } from 'constructs';
 import CORE_BUCKETS from '../../core/buckets.json';
 import INFERENCE_OPERATOR_BUCKETS from '../../hyperpod/stacks/buckets.json';
+import TRAINING_BUCKETS from '../../training/buckets.json';
 import { renderBucketName } from '../../bucket-declarations';
 
 export interface MlccEksClusterStackProps extends cdk.StackProps {
@@ -337,7 +338,10 @@ export class MlccEksClusterStack extends cdk.Stack {
             // ─── Dependency add-ons for Inference Operator ──────────────────
 
             // aws-mountpoint-s3-csi-driver ≥ v1.14.1-eksbuild.1 — DaemonSet, no toleration needed
-            new eks.CfnAddon(this, 'S3CsiDriverAddon', {
+            // Wave 6.1 R5.1: the add-on's controller SA is bound to S3CsiRole below
+            // (serviceAccountRoleArn is set once the role exists). addonVersion is
+            // deliberately unchanged — the v1→v2 bump is a separate change (D5).
+            const s3CsiDriverAddon = new eks.CfnAddon(this, 'S3CsiDriverAddon', {
                 clusterName: newCluster.clusterName,
                 addonName: 'aws-mountpoint-s3-csi-driver',
                 addonVersion: 'v1.14.1-eksbuild.1',
@@ -850,7 +854,15 @@ export class MlccEksClusterStack extends cdk.Stack {
                 [],
             );
 
+            // Wave 6.1 R5.2: TLS material in MLCC's REAL TLS bucket (the former
+            // 'hyperpod-tls-*' pattern never matched MLCC's own TLS bucket name),
+            // name rendered from its single declaration (hyperpod/stacks/buckets.json).
+            const csiTlsBucketName = renderBucketName(
+                INFERENCE_OPERATOR_BUCKETS.buckets.TlsBucket,
+                { account: this.account, region: this.region, profileName },
+            );
             (s3CsiRole as iam.Role).addToPolicy(new iam.PolicyStatement({
+                sid: 'S3CsiTlsBucketAccess',
                 effect: iam.Effect.ALLOW,
                 actions: [
                     's3:GetObject',
@@ -860,10 +872,32 @@ export class MlccEksClusterStack extends cdk.Stack {
                     's3:GetBucketLocation',
                 ],
                 resources: [
-                    'arn:aws:s3:::hyperpod-tls-*',
-                    'arn:aws:s3:::hyperpod-tls-*/*',
+                    `arn:aws:s3:::${csiTlsBucketName}`,
+                    `arn:aws:s3:::${csiTlsBucketName}/*`,
                 ],
             }));
+
+            // Wave 6.1 R5.2: READ the model mounts — the core models bucket (staged
+            // base models and, under Option D, their canonical .mlcc-adapters/) and
+            // the legacy training / adapters buckets (recorded URIs). Names rendered
+            // from core/buckets.json and training/buckets.json — never spelled here.
+            const csiReadBuckets = [
+                coreBucketName,
+                renderBucketName(TRAINING_BUCKETS.buckets.TrainingBucket,
+                    { account: this.account, region: this.region, profileName }),
+                renderBucketName(TRAINING_BUCKETS.buckets.AdaptersBucket,
+                    { account: this.account, region: this.region, profileName }),
+            ];
+            (s3CsiRole as iam.Role).addToPolicy(new iam.PolicyStatement({
+                sid: 'S3CsiModelBucketsRead',
+                effect: iam.Effect.ALLOW,
+                actions: ['s3:GetObject', 's3:ListBucket', 's3:GetBucketLocation'],
+                resources: csiReadBuckets.flatMap(b => [`arn:aws:s3:::${b}`, `arn:aws:s3:::${b}/*`]),
+            }));
+
+            // Wave 6.1 R5.1: attach the role to the add-on (an in-place
+            // AWS::EKS::Addon update — no replacement; R5.3).
+            s3CsiDriverAddon.serviceAccountRoleArn = s3CsiRole.roleArn;
 
             new ssm.StringParameter(this, 'S3CsiRoleArnParam', {
                 parameterName: `${ssmPrefix}/S3CsiRoleArn`,

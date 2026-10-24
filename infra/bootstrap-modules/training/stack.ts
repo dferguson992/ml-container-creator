@@ -6,6 +6,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 import TRAINING_BUCKETS from './buckets.json';
+import CORE_BUCKETS from '../core/buckets.json';
 import {
     StackBucketDeclarations, bucketDeclaration, declaredBucket, renderBucketName,
 } from '../bucket-declarations';
@@ -120,6 +121,23 @@ export class MlccTrainingStack extends cdk.Stack {
         rewardLambdaRole.addToPolicy(new iam.PolicyStatement({
             actions: ['s3:GetObject', 's3:ListBucket'],
             resources: [trainingBucket.bucketArn, `${trainingBucket.bucketArn}/*`],
+        }));
+
+        // Bucket consolidation R3.9: new reward-code backups go to the CORE bucket
+        // under evaluators/<name>/ (do/lib/python/s3_layout.py evaluator_key). Read
+        // only that prefix; the core bucket name is rendered from its single
+        // declaration (core/buckets.json), never spelled here.
+        const coreBucketName = renderBucketName(CORE_BUCKETS.buckets.ModelsBucketResource, nameVars);
+        rewardLambdaRole.addToPolicy(new iam.PolicyStatement({
+            sid: 'ReadCoreEvaluators',
+            actions: ['s3:GetObject'],
+            resources: [`arn:aws:s3:::${coreBucketName}/evaluators/*`],
+        }));
+        rewardLambdaRole.addToPolicy(new iam.PolicyStatement({
+            sid: 'ListCoreEvaluators',
+            actions: ['s3:ListBucket'],
+            resources: [`arn:aws:s3:::${coreBucketName}`],
+            conditions: { StringLike: { 's3:prefix': ['evaluators/*'] } },
         }));
 
         // (The former `MlccPassRewardLambdaRole` statement lived on the deleted,
