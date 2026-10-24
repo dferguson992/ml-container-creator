@@ -23,7 +23,8 @@
     "HP_GPU_COUNT",
     "HP_CPU_REQUEST",
     "HP_MEM_REQUEST",
-    "KUBECONFIG"
+    "KUBECONFIG",
+    "HP_BENCHMARK_METRICS_ENABLED"
   ],
   "serving_config_source": "kubernetes",
   "adapter_delivery": { "strategy": "model-prefix", "mount_path": "/opt/ml/model", "subdir": ".mlcc-adapters" },
