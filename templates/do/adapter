@@ -20,6 +20,7 @@
 #   ./do/adapter list
 #   ./do/adapter remove <name>
 #   ./do/adapter update <name> --from-weights <new-s3-uri>
+#   ./do/adapter promote <name> --from-tune <technique> | --from-weights <s3-uri> [--update-config]
 #   ./do/adapter --help
 #
 # Deprecated alias: --weights <s3-uri> == --from-weights <s3-uri> (prints a notice).
@@ -34,6 +35,7 @@ source "${SCRIPT_DIR}/lib/script-contract.sh"
 _require_python_env
 source "${SCRIPT_DIR}/config"
 source "${SCRIPT_DIR}/lib/profile.sh"
+source "${SCRIPT_DIR}/lib/s3-layout.sh"
 
 # ── Target guard: DERIVED from the additive-deploy contract (ADR-013) ─────────
 # do/adapter accepts lora_adapter artifacts and drives the vLLM hot-load (k8s:
@@ -125,14 +127,15 @@ _download_from_hub() {
     echo "📥 Downloading adapter from HuggingFace Hub: ${hf_repo_id}"
     echo ""
 
-    # ── Resolve S3 bucket ─────────────────────────────────────────────────
-    local s3_bucket
-    if [ -z "${ADAPTER_S3_BUCKET:-}" ]; then
-        echo "❌ Adapter staging requires the 'training' module, which is not provisioned."
-        echo "   Run: ml-container-creator bootstrap add-module training"
-        exit 1
-    fi
-    s3_bucket="${ADAPTER_S3_BUCKET}"
+    # ── Resolve the canonical destination (bucket consolidation R3.4) ──────
+    # A Hub adapter is published straight into its canonical home in the core
+    # bucket (s3_layout.py: <base prefix>/.mlcc-adapters/<project>/<name>/, base =
+    # this project's MODEL_NAME). The legacy adapters bucket is frozen for writes.
+    _require_bucket CORE_S3_BUCKET || exit 1
+    local _hub_dest_json _hub_dest
+    _hub_dest_json=$(python3 "${SCRIPT_DIR}/lib/python/s3_layout.py" adapter-uri --bucket "${CORE_S3_BUCKET}" \
+        --model "${MODEL_NAME:-}" --project "${PROJECT_NAME}" --name "${adapter_name}") || exit 1
+    _hub_dest=$(_adapter_json_get "${_hub_dest_json}" uri)
 
     # ── Create temp directory ─────────────────────────────────────────────
     mkdir -p "${tmp_dir}/adapter_files"
@@ -278,34 +281,27 @@ _download_from_hub() {
         fi
     fi
 
-    # ── Create adapter.tar.gz from downloaded files (flat, no subdirs) ────
-    echo "📦 Creating adapter.tar.gz..."
-    if ! tar -czf "${tmp_dir}/adapter.tar.gz" -C "${tmp_dir}/adapter_files" . 2>/dev/null; then
-        echo "❌ Failed to create adapter.tar.gz"
-        rm -rf "${tmp_dir}"
-        exit 1
-    fi
-
-    local tar_size
-    tar_size=$(du -h "${tmp_dir}/adapter.tar.gz" | cut -f1)
-    echo "   Archive size: ${tar_size}"
-
-    # ── Upload to S3 ─────────────────────────────────────────────────────
-    local s3_path="s3://${s3_bucket}/adapters/${PROJECT_NAME}/${adapter_name}/adapter.tar.gz"
-    echo "☁️  Uploading to S3: ${s3_path}"
-
-    if ! aws s3 cp "${tmp_dir}/adapter.tar.gz" "${s3_path}" --region "${AWS_REGION}"; then
-        echo "❌ Failed to upload adapter to S3."
+    # ── Publish the adapter files (flat PEFT layout + mlcc-adapter.json) ──
+    # Loose files, not a tarball: the same prefix serves the SMAI adapter IC
+    # (ArtifactUrl = prefix) and the k8s mount (load by path). Idempotent on the
+    # content hash.
+    local s3_path="${_hub_dest}"
+    echo "☁️  Publishing to the canonical adapter prefix: ${s3_path}"
+    local _pub_out
+    if ! _pub_out=$(python3 "${SCRIPT_DIR}/lib/python/s3_layout.py" publish-local \
+        --dir "${tmp_dir}/adapter_files" --dest "${s3_path}" --kind lora_adapter \
+        --project "${PROJECT_NAME}" --name "${adapter_name}" --base-model "${MODEL_NAME:-}" \
+        --source "hf://${hf_repo_id}" --created-by "do/adapter from-hub" --region "${AWS_REGION}"); then
+        echo "❌ Failed to publish adapter to S3."
         echo ""
         echo "   Check that:"
-        echo "   • The S3 bucket '${s3_bucket}' exists"
+        echo "   • The core bucket '${CORE_S3_BUCKET}' exists (ml-container-creator bootstrap update --module core)"
         echo "   • Your IAM credentials have s3:PutObject permission"
-        echo "   • Run bootstrap if the bucket doesn't exist: ./do/bootstrap"
         rm -rf "${tmp_dir}"
         exit 1
     fi
 
-    echo "✅ Uploaded to S3: ${s3_path}"
+    echo "✅ Published ($(_adapter_json_get "${_pub_out}" action)): ${s3_path}"
 
     # ── Clean up ──────────────────────────────────────────────────────────
     rm -rf "${tmp_dir}"
@@ -313,6 +309,136 @@ _download_from_hub() {
     # Set the weights_uri variable for the caller
     weights_uri="${s3_path}"
 }
+
+# ── Small JSON field reader for helper output (lists are comma-joined) ────────
+_adapter_json_get() {
+    printf '%s' "$1" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read() or "{}")
+except ValueError:
+    d = {}
+v = d.get(sys.argv[1], "") if isinstance(d, dict) else ""
+if isinstance(v, list):
+    v = ",".join(str(x) for x in v)
+print("" if v is None else v)
+' "$2"
+}
+
+# ── Write or update a variable in do/config (same contract as do/tune) ────────
+_adapter_update_config_var() {
+    local var_name="$1" var_value="$2" config_file="${SCRIPT_DIR}/config"
+    if grep -q "^export ${var_name}=" "${config_file}" 2>/dev/null; then
+        sed -i.bak "s|^export ${var_name}=.*|export ${var_name}=\"${var_value}\"|" "${config_file}"
+        rm -f "${config_file}.bak"
+    else
+        if [ -s "${config_file}" ] && [ -n "$(tail -c 1 "${config_file}")" ]; then
+            echo "" >> "${config_file}"
+        fi
+        echo "export ${var_name}=\"${var_value}\"" >> "${config_file}"
+    fi
+}
+
+# ── Promote a source into its canonical home (bucket consolidation R3) ────────
+# _adapter_promote_canonical <src-uri> <name> <base-model-id> <kind> [technique] [created-by]
+# Prints the canonical URI on stdout (progress on stderr). An already-canonical
+# source is returned as-is. kind: lora_adapter → <base prefix>/.mlcc-adapters/
+# <project>/<name>/; full_model → models/mlcc-<project>/<name>/ (s3_layout.py).
+_adapter_promote_canonical() {
+    local _src="$1" _name="$2" _base="$3" _kind="${4:-lora_adapter}" _tech="${5:-}" _by="${6:-do/adapter}"
+    local _layout="${SCRIPT_DIR}/lib/python/s3_layout.py" _parsed _dest_json _dest _out
+    _parsed=$(python3 "${_layout}" parse --uri "${_src}" 2>/dev/null || echo '{}')
+    if [ -n "$(_adapter_json_get "${_parsed}" adapter)" ] || [ -n "$(_adapter_json_get "${_parsed}" finetune)" ]; then
+        printf '%s\n' "${_src}"
+        return 0
+    fi
+    _require_bucket CORE_S3_BUCKET || return 1
+    if [ "${_kind}" = "full_model" ]; then
+        _dest_json=$(python3 "${_layout}" finetune-uri --bucket "${CORE_S3_BUCKET}" \
+            --project "${PROJECT_NAME}" --name "${_name}") || return 1
+    else
+        _dest_json=$(python3 "${_layout}" adapter-uri --bucket "${CORE_S3_BUCKET}" --model "${_base}" \
+            --project "${PROJECT_NAME}" --name "${_name}") || return 1
+    fi
+    _dest=$(_adapter_json_get "${_dest_json}" uri)
+    echo "📤 Promoting ${_src} → ${_dest}" >&2
+    if ! _out=$(python3 "${_layout}" promote --source "${_src}" --dest "${_dest}" --kind "${_kind}" \
+        --project "${PROJECT_NAME}" --name "${_name}" --base-model "${_base}" \
+        --technique "${_tech}" --created-by "${_by}" --region "${AWS_REGION:-}"); then
+        echo "❌ Promotion into ${_dest} failed (see the error above)." >&2
+        return 1
+    fi
+    echo "   ✅ Promotion $(_adapter_json_get "${_out}" action): ${_dest}" >&2
+    printf '%s\n' "${_dest}"
+}
+
+# ── do/adapter promote (bucket consolidation R3.7) — every target ─────────────
+# Backfill an already-finished job's output (or any S3 adapter) into the
+# canonical prefix. Rewrites the do/config path var ONLY with --update-config
+# (the old value is kept as TUNE_ADAPTER_SOURCE_<T> / TUNE_MODEL_SOURCE_<T>).
+_adapter_promote_cmd() {
+    shift  # 'promote'
+    local _name="${1:-}"
+    if [ -z "${_name}" ] || [[ "${_name}" == -* ]]; then
+        echo "❌ 'do/adapter promote' requires a name argument"
+        echo "   Usage: ./do/adapter promote <name> --from-tune <technique> | --from-weights <s3-uri> [--update-config]"
+        exit 1
+    fi
+    shift
+    local _verb="" _arg="" _update=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --from-tune) _verb="from-tune"; _arg="${2:-}"; shift; shift || true ;;
+            --from-weights) _verb="from-weights"; _arg="${2:-}"; shift; shift || true ;;
+            --update-config) _update="true"; shift ;;
+            --help|-h)
+                echo "Usage: ./do/adapter promote <name> --from-tune <technique> | --from-weights <s3-uri> [--update-config]"
+                exit 0
+                ;;
+            *) echo "❌ Unknown option: $1"; exit 1 ;;
+        esac
+    done
+    if [ -z "${_verb}" ] || [ -z "${_arg}" ]; then
+        echo "❌ promote needs --from-tune <technique> or --from-weights <s3-uri>"
+        exit 1
+    fi
+    if ! echo "${_name}" | grep -qE '^[a-z0-9][a-z0-9-]{0,49}$'; then
+        echo "❌ Invalid adapter name: ${_name} (lowercase alphanumeric + hyphens, 1-50 chars)"
+        exit 1
+    fi
+    local _resolved RESOLVED_SOURCE="" RESOLVED_URI="" RESOLVED_KIND="" RESOLVED_META_TECHNIQUE=""
+    _resolved=$(_resolve_additive_source "${_verb}" "${_arg}" "${_name}" "lora_adapter") || exit 1
+    eval "${_resolved}"
+    local _kind="${RESOLVED_KIND:-lora_adapter}" _base="${MODEL_NAME:-}"
+    [ "${_verb}" = "from-tune" ] && [ -n "${TUNE_MODEL_ID:-}" ] && _base="${TUNE_MODEL_ID}"
+    local _canonical
+    _canonical=$(_adapter_promote_canonical "${RESOLVED_URI}" "${_name}" "${_base}" "${_kind}" \
+        "${RESOLVED_META_TECHNIQUE:-}" "do/adapter promote") || exit 1
+    echo "✅ Canonical: ${_canonical}"
+    if [ "${_verb}" = "from-tune" ]; then
+        local _tu _pvar _svar
+        _tu="$(_additive_upper "${_arg}")"
+        if [ "${_kind}" = "full_model" ]; then
+            _pvar="TUNE_MODEL_PATH_${_tu}"; _svar="TUNE_MODEL_SOURCE_${_tu}"
+        else
+            _pvar="TUNE_ADAPTER_PATH_${_tu}"; _svar="TUNE_ADAPTER_SOURCE_${_tu}"
+        fi
+        if [ -n "${_update}" ]; then
+            if [ "${!_pvar:-}" != "${_canonical}" ]; then
+                _adapter_update_config_var "${_svar}" "${!_pvar:-${RESOLVED_URI}}"
+                _adapter_update_config_var "${_pvar}" "${_canonical}"
+                echo "📝 do/config: ${_pvar} → canonical (previous value kept in ${_svar})"
+            fi
+        else
+            echo "   do/config unchanged (pass --update-config to point ${_pvar} at the canonical prefix)."
+        fi
+    fi
+    echo "   Next: ./do/adapter add ${_name} --from-weights ${_canonical}"
+}
+if [ "${1:-}" = "promote" ]; then
+    _adapter_promote_cmd "$@"
+    exit $?
+fi
 
 
 # ── Kubernetes path (vllm-hotload mechanism: hyperpod-eks + plain eks) ────────
@@ -488,6 +614,14 @@ if [ -n "${_ADAPTER_USE_VLLM_HOTLOAD}" ]; then
                 echo "  list                                    List loaded LoRA adapters"
                 echo "  update <name> --from-weights s3://...   Replace a LoRA adapter's weights in place"
                 echo "                                          (update accepts every --from-* source too)"
+                echo "  promote <name> --from-tune <technique>  Publish a finished tune's adapter to its canonical"
+                echo "                                          prefix (no load; --update-config rewrites do/config)"
+                echo ""
+                echo "Delivery: the canonical adapter home is <base prefix>/.mlcc-adapters/<project>/<name>/"
+                echo "in the core bucket, which is on the pod's model mount. add promotes a source there"
+                echo "first, loads it by path, and copies it only when this deployment serves the same base"
+                echo "under a different prefix. remove unloads (and deletes only such a copy);"
+                echo "./do/clean adapters deletes this project's canonical adapters."
                 echo ""
                 echo "Examples:"
                 echo "  ./do/adapter add ectsum --from-weights s3://my-bucket/adapters/ectsum/"
@@ -567,18 +701,41 @@ if [ -n "${_ADAPTER_USE_VLLM_HOTLOAD}" ]; then
 
         # ── Delivery + rank pre-check (load/update only), before any engine call ──
         local _LORA_PATH=""
+        local _iec_json_f="" _base_json _src_type="" _bucket="" _prefix="" _prefetch=""
+        if [ "${ACTION}" = "unload" ]; then
+            # remove: the deployment's model base locates a serving copy this verb
+            # made on a base-prefix mismatch (deleted after a successful unload).
+            _iec_json_f="$(mktemp)"
+            if [ "${DEPLOYMENT_TARGET}" = "hyperpod-eks" ]; then
+                kubectl get inferenceendpointconfig "${PROJECT_NAME}" -n "${HP_NAMESPACE:-default}" \
+                    -o json >"${_iec_json_f}" 2>/dev/null || : >"${_iec_json_f}"
+            fi
+            _base_json=$(python3 "${SCRIPT_DIR}/lib/python/adapter_delivery.py" model-base \
+                --target "${DEPLOYMENT_TARGET}" --iec-json "${_iec_json_f}" 2>/dev/null || echo '{}')
+            rm -f "${_iec_json_f}"
+            eval "$(printf '%s' "${_base_json}" | python3 -c '
+import json, shlex, sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    d = {}
+for k, v in (("_src_type", "source_type"), ("_bucket", "bucket"), ("_prefix", "prefix"), ("_prefetch", "prefetch")):
+    print("%s=%s" % (k, shlex.quote(str(d.get(v) or ""))))
+')"
+        fi
         if [ "${ACTION}" = "load" ] || [ "${ACTION}" = "update" ]; then
-            # Wave 6.1 R1.1/R1.3 (Part A): vLLM loads adapters from a LOCAL path
-            # and the pod has no AWS credentials, so an s3:// source is mapped to
-            # its path under the pod's model mount, per the target descriptor's
-            # adapter_delivery (model-prefix: <model-prefix>/.mlcc-adapters/...).
-            # The model base comes from the live InferenceEndpointConfig
-            # (hyperpod-eks) or the S3 model mount config (eks). An adapter
-            # outside that prefix is refused with the exact copy command.
-            # TODO(W6.1 Part B): promote --from-tune / --from-hub / --from-weights
-            # sources into the canonical <model-prefix>/.mlcc-adapters/<project>/<name>/
-            # (s3_layout.py) here instead of refusing; never pass s3:// to vLLM.
-            local _iec_json_f _base_json _src_type="" _bucket="" _prefix="" _prefetch=""
+            # Wave 6.1 R1.1/R1.3 + bucket consolidation R3 (Option D): vLLM loads
+            # adapters from a LOCAL path and the pod has no AWS credentials. The
+            # canonical adapter home is <base prefix>/.mlcc-adapters/<project>/<name>/
+            # in the core bucket (s3_layout.py), which IS on the pod's model mount
+            # for a deployment of that base (target descriptor adapter_delivery).
+            # adapter_delivery.py deliver: a source not yet canonical (tune/train
+            # raw output, --from-weights, --from-hub, registry) is promoted there
+            # first; a canonical adapter under THIS deployment's prefix is loaded by
+            # path; one under a different prefix is copied here only when the base
+            # id (+ revision) matches, else refused. Refusals (HF source, prefetch
+            # on, no S3 mount) are decided from config / the live IEC before any
+            # copy. Never passes s3:// to vLLM.
             _iec_json_f="$(mktemp)"
             if [ "${DEPLOYMENT_TARGET}" = "hyperpod-eks" ]; then
                 kubectl get inferenceendpointconfig "${PROJECT_NAME}" -n "${HP_NAMESPACE:-default}" \
@@ -595,16 +752,41 @@ except ValueError:
 for k, v in (("_src_type", "source_type"), ("_bucket", "bucket"), ("_prefix", "prefix"), ("_prefetch", "prefetch")):
     print("%s=%s" % (k, shlex.quote(str(d.get(v) or ""))))
 ')"
-            local _map_rc=0
-            _LORA_PATH=$(python3 "${SCRIPT_DIR}/lib/python/adapter_delivery.py" local-path \
-                --target "${DEPLOYMENT_TARGET}" --uri "${WEIGHTS_URI}" --project "${PROJECT_NAME}" \
-                --name "${LORA_NAME}" --source-type "${_src_type}" --bucket "${_bucket}" \
-                --prefix "${_prefix}" --prefetch "${_prefetch}") || _map_rc=$?
+            # The base the ADAPTER was trained on (where a not-yet-canonical source is
+            # promoted): the tune's base for --from-tune (TUNE_MODEL_ID, catalog-mapped
+            # to its HF id by s3_layout), else the project's model. An unmapped id is
+            # refused, never guessed.
+            local _adapter_base="${MODEL_NAME:-}"
+            if [ "${_SRC_VERB}" = "from-tune" ] && [ -n "${TUNE_MODEL_ID:-}" ]; then
+                _adapter_base="${TUNE_MODEL_ID}"
+            elif [ "${_SRC_VERB}" = "from-registry" ] && [ -n "${RESOLVED_META_MODEL_NAME:-}" ]; then
+                _adapter_base="${RESOLVED_META_MODEL_NAME}"
+            fi
+            local _technique_meta=""
+            case "${_SRC_VERB}" in from-tune|from-train) _technique_meta="${_SRC_ARG%%-*}" ;; esac
+            local _adapter_deliver_args
+            _adapter_deliver_args=(
+                --target "${DEPLOYMENT_TARGET}" --uri "${WEIGHTS_URI}" --project "${PROJECT_NAME}"
+                --name "${LORA_NAME}" --source-type "${_src_type}" --bucket "${_bucket}"
+                --prefix "${_prefix}" --prefetch "${_prefetch}" --core-bucket "${CORE_S3_BUCKET:-}"
+                --adapter-base "${_adapter_base}" --deployment-model "${MODEL_NAME:-}"
+                --technique "${_technique_meta}" --created-by "do/adapter ${_SRC_VERB}"
+                --region "${AWS_REGION:-}"
+            )
+            local _plan_out _map_rc=0
+            _plan_out=$(python3 "${SCRIPT_DIR}/lib/python/adapter_delivery.py" deliver --dry-run \
+                "${_adapter_deliver_args[@]}") || _map_rc=$?
             if [ "${_map_rc}" -ne 0 ]; then
-                printf '%s\n' "${_LORA_PATH}"
+                printf '%s\n' "${_plan_out}"
                 rm -f "${_iec_json_f}"
                 exit 1
             fi
+            _LORA_PATH=$(_adapter_json_get "${_plan_out}" path)
+            local _plan_promote _plan_copy
+            _plan_promote=$(_adapter_json_get "${_plan_out}" promote_to)
+            _plan_copy=$(_adapter_json_get "${_plan_out}" copy_to)
+            [ -n "${_plan_promote}" ] && echo "📤 Promote: ${WEIGHTS_URI} → ${_plan_promote} (canonical)"
+            [ -n "${_plan_copy}" ] && echo "📋 Base-prefix mismatch: serving copy → ${_plan_copy}"
             echo "📍 Pod path: ${_LORA_PATH}"
 
             # Wave 6.1 R3.2: pre-check the adapter's rank (adapter_config.json r and
@@ -632,6 +814,20 @@ for k, v in (("_src_type", "source_type"), ("_bucket", "bucket"), ("_prefix", "p
                 fi
             else
                 echo "   ⚠️  Rank check skipped (adapter rank or serving limit unreadable); vLLM validates at load."
+            fi
+
+            # Execute the delivery plan (promote and/or serving copy) now that the
+            # refusals and the rank check passed. Idempotent on the content hash.
+            if [ -n "${_plan_promote}" ] || [ -n "${_plan_copy}" ]; then
+                local _deliver_out _deliver_rc=0
+                _deliver_out=$(python3 "${SCRIPT_DIR}/lib/python/adapter_delivery.py" deliver \
+                    "${_adapter_deliver_args[@]}") || _deliver_rc=$?
+                if [ "${_deliver_rc}" -ne 0 ]; then
+                    printf '%s\n' "${_deliver_out}"
+                    echo "❌ Adapter delivery failed (nothing was sent to the engine)."
+                    exit 1
+                fi
+                echo "✅ Delivered ($(_adapter_json_get "${_deliver_out}" actions)): $(_adapter_json_get "${_deliver_out}" canonical)"
             fi
         fi
 
@@ -832,6 +1028,21 @@ for l in loras:
         if [ "${_pod_failed}" -gt 0 ]; then
             exit 1
         fi
+        # remove (Wave 6.1 R1.3): delete the serving copy THIS verb made on a
+        # base-prefix mismatch (its manifest carries serving_copy_of). A canonical
+        # adapter is never deleted here — that is ./do/clean adapters.
+        if [ "${ACTION}" = "unload" ] && [ "${_src_type}" = "s3" ] && [ -n "${_bucket}" ]; then
+            local _rc_out
+            if _rc_out=$(python3 "${SCRIPT_DIR}/lib/python/adapter_delivery.py" remove-copy \
+                --bucket "${_bucket}" --prefix "${_prefix}" --project "${PROJECT_NAME}" \
+                --name "${LORA_NAME}" --region "${AWS_REGION:-}" 2>&1); then
+                if [ "$(_adapter_json_get "${_rc_out}" deleted)" != "0" ]; then
+                    echo "🗑️  Deleted the serving copy $(_adapter_json_get "${_rc_out}" uri) (canonical kept: $(_adapter_json_get "${_rc_out}" copy_of))"
+                fi
+            else
+                echo "⚠️  Could not check for a serving copy of '${LORA_NAME}': ${_rc_out}"
+            fi
+        fi
         return 0
     }
 
@@ -858,6 +1069,8 @@ _usage() {
     echo "  update <name> --from-weights <uri> Update adapter weights from S3"
     echo "  update <name> --from-hub <hf-repo-id> Update adapter weights from HuggingFace Hub"
     echo "  search [--limit N]                    Search HuggingFace Hub for compatible adapters"
+    echo "  promote <name> --from-tune <t> | --from-weights <uri> [--update-config]"
+    echo "                                        Publish an adapter to its canonical prefix (no IC)"
     echo ""
     echo "Options:"
     echo "  --help, -h    Show this help message"
@@ -1131,246 +1344,13 @@ _adapter_add() {
         echo "📦 Using tune adapter output (${RESOLVED_META_TECHNIQUE}): ${weights_uri}"
         echo ""
 
-        # ── Route to Processing Job helper (default) or local path ────────
-        if [ -z "${use_local}" ]; then
-            # Default: use Processing Job via .adapter_helper.py
-            echo "🚀 Submitting Processing Job to stage adapter..."
-            echo ""
-
-            # Resolve execution role
-            local exec_role="${EXECUTION_ROLE_ARN:-}"
-            if [ -z "${exec_role}" ]; then
-                exec_role="${ROLE_ARN:-}"
-            fi
-            if [ -z "${exec_role}" ]; then
-                exec_role="${SAGEMAKER_ROLE_ARN:-}"
-            fi
-            if [ -z "${exec_role}" ]; then
-                echo "❌ No execution role found."
-                echo ""
-                echo "   Run 'ml-container-creator bootstrap' to set up your profile,"
-                echo "   or set ROLE_ARN / EXECUTION_ROLE_ARN in do/config."
-                exit 1
-            fi
-
-            # Resolve S3 bucket
-            local adapter_bucket
-            if [ -z "${ADAPTER_S3_BUCKET:-}" ]; then
-                echo "❌ Adapter staging requires the 'training' module, which is not provisioned."
-                echo "   Run: ml-container-creator bootstrap add-module training"
-                exit 4
-            fi
-            adapter_bucket="${ADAPTER_S3_BUCKET}"
-
-            # Build helper args
-            local helper_args=(
-                "stage-from-tune"
-                "--training-output-s3-uri" "${weights_uri}"
-                "--adapter-name" "${adapter_name}"
-                "--bucket" "${adapter_bucket}"
-                "--project" "${PROJECT_NAME}"
-                "--role-arn" "${exec_role}"
-                "--region" "${AWS_REGION}"
-            )
-            if [ -n "${no_wait}" ]; then
-                helper_args+=("--no-wait")
-            fi
-
-            # Invoke the Python helper
-            local helper_output
-            local helper_stderr
-            helper_stderr="$(mktemp)"
-            # Capture stdout (JSON) and stderr (real error / traceback) separately.
-            # Previously stderr was sent to /dev/null, turning a clear error like
-            # "--bucket is required" into a useless "See error above".
-            if ! helper_output=$(python3 "${SCRIPT_DIR}/.adapter_helper.py" "${helper_args[@]}" 2>"${helper_stderr}"); then
-                echo "❌ Adapter staging failed."
-                if [ -s "${helper_stderr}" ]; then
-                    echo "   ── helper error output ──────────────────────────────"
-                    sed 's/^/   /' "${helper_stderr}"
-                    echo "   ─────────────────────────────────────────────────────"
-                fi
-                rm -f "${helper_stderr}"
-                exit 1
-            fi
-            rm -f "${helper_stderr}"
-
-            # Parse JSON output from helper (extract only the JSON line, skip any log noise)
-            local json_line
-            json_line=$(echo "${helper_output}" | grep -E '^\{' | tail -1)
-            local job_status
-            job_status=$(echo "${json_line}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',''))" 2>/dev/null || echo "")
-
-            if [ "${job_status}" = "Completed" ] || [ "${job_status}" = "InProgress" ]; then
-                echo "${json_line}"
-                # Extract adapter_s3_uri for downstream use
-                local staged_adapter_uri
-                staged_adapter_uri=$(echo "${json_line}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('adapter_s3_uri',''))" 2>/dev/null || echo "")
-
-                if [ -n "${no_wait}" ]; then
-                    echo ""
-                    echo "✅ Processing Job submitted. Check status with:"
-                    echo "   python3 ${SCRIPT_DIR}/.adapter_helper.py status --job-name <job-name>"
-                    echo ""
-                    echo "   Once complete, re-run without --no-wait to register the adapter."
-                    exit 0
-                fi
-
-                # Update weights_uri to point to the staged adapter
-                weights_uri="${staged_adapter_uri}"
-                echo ""
-                echo "✅ Adapter staged via Processing Job: ${weights_uri}"
-            else
-                echo "❌ Unexpected status from Processing Job helper: ${job_status}"
-                echo "   Output: ${helper_output}"
-                exit 1
-            fi
-        else
-            # ── --local flag: Package tune artifacts locally (original behavior) ──
-
-        # ── Package tune artifacts as tar.gz if needed ────────────────────
-        # Tune output is an S3 path that may be:
-        #   1. Already a tar.gz file (s3://...adapter.tar.gz) → use directly
-        #   2. An S3 directory prefix containing adapter files → download, validate, package, upload
-        if echo "${weights_uri}" | grep -qE '\.tar\.gz$'; then
-            echo "✅ Tune output is already a tar.gz archive."
-
-            # Validate adapter_config.json exists in the tar.gz
-            echo "🔍 Validating adapter_config.json in archive..."
-            local tar_validate_dir="/tmp/adapter_tar_validate_$$"
-            mkdir -p "${tar_validate_dir}"
-
-            if aws s3 cp "${weights_uri}" "${tar_validate_dir}/adapter.tar.gz" --region "${AWS_REGION}" --quiet 2>/dev/null; then
-                if ! tar -tzf "${tar_validate_dir}/adapter.tar.gz" 2>/dev/null | grep -q 'adapter_config\.json'; then
-                    echo "❌ adapter_config.json not found in tar.gz archive."
-                    echo ""
-                    echo "   Path: ${weights_uri}"
-                    echo ""
-                    echo "   The archive does not appear to contain a valid"
-                    echo "   PEFT/LoRA adapter. A valid adapter must include:"
-                    echo "   • adapter_config.json"
-                    echo "   • adapter_model.safetensors (or adapter_model.bin)"
-                    echo ""
-                    echo "   Check that the tune job completed successfully:"
-                    echo "   ./do/tune status"
-                    rm -rf "${tar_validate_dir}"
-                    exit 1
-                fi
-                echo "   ✅ adapter_config.json found in archive"
-            else
-                echo "   ⚠️  Could not download archive for validation. Proceeding anyway..."
-            fi
-
-            rm -rf "${tar_validate_dir}"
-            echo "   Using directly without re-packaging."
-        else
-            echo "📦 Tune output is a directory — packaging as tar.gz..."
-            local tune_tmp_dir="/tmp/adapter_tune_package_$$"
-            mkdir -p "${tune_tmp_dir}/adapter_files"
-
-            # Normalize S3 prefix (ensure trailing slash for directory listing)
-            local s3_prefix="${weights_uri}"
-            if [[ "${s3_prefix}" != */ ]]; then
-                s3_prefix="${s3_prefix}/"
-            fi
-
-            # Download all adapter files from S3 directory
-            echo "   Downloading adapter artifacts from: ${s3_prefix}"
-            if ! aws s3 cp "${s3_prefix}" "${tune_tmp_dir}/adapter_files/" --recursive --region "${AWS_REGION}" 2>/dev/null; then
-                echo "❌ Failed to download adapter artifacts from S3."
-                echo ""
-                echo "   Path: ${s3_prefix}"
-                echo "   Check that:"
-                echo "   • The S3 path exists and contains adapter files"
-                echo "   • Your IAM credentials have s3:GetObject and s3:ListBucket permission"
-                rm -rf "${tune_tmp_dir}"
-                exit 1
-            fi
-
-            # Validate adapter_config.json exists
-            if [ ! -f "${tune_tmp_dir}/adapter_files/adapter_config.json" ]; then
-                echo "❌ adapter_config.json not found in tune output."
-                echo ""
-                echo "   Path: ${s3_prefix}"
-                echo ""
-                echo "   The tune output does not appear to contain a valid"
-                echo "   PEFT/LoRA adapter. A valid adapter must include:"
-                echo "   • adapter_config.json"
-                echo "   • adapter_model.safetensors (or adapter_model.bin)"
-                echo ""
-                echo "   Check that the tune job completed successfully:"
-                echo "   ./do/tune status"
-                rm -rf "${tune_tmp_dir}"
-                exit 1
-            fi
-
-            echo "   ✅ adapter_config.json found"
-
-            # Optional: check base_model_name_or_path matches MODEL_NAME
-            if [ -n "${MODEL_NAME:-}" ]; then
-                local adapter_base_model=""
-                if command -v jq &>/dev/null; then
-                    adapter_base_model=$(jq -r '.base_model_name_or_path // empty' "${tune_tmp_dir}/adapter_files/adapter_config.json" 2>/dev/null)
-                else
-                    adapter_base_model=$(grep -o '"base_model_name_or_path"[[:space:]]*:[[:space:]]*"[^"]*"' "${tune_tmp_dir}/adapter_files/adapter_config.json" 2>/dev/null | sed 's/.*"base_model_name_or_path"[[:space:]]*:[[:space:]]*"//' | sed 's/"$//')
-                fi
-
-                if [ -n "${adapter_base_model}" ] && [ "${adapter_base_model}" != "${MODEL_NAME}" ]; then
-                    echo "   ⚠️  Adapter was trained on '${adapter_base_model}' but base model is '${MODEL_NAME}'. Adapter may not work correctly."
-                fi
-            fi
-
-            # Flatten: move any nested files to root level and remove subdirectories
-            find "${tune_tmp_dir}/adapter_files" -mindepth 2 -type f -exec mv {} "${tune_tmp_dir}/adapter_files/" \; 2>/dev/null || true
-            find "${tune_tmp_dir}/adapter_files" -mindepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
-
-            # Create flat tar.gz archive
-            echo "   Creating adapter.tar.gz..."
-            if ! tar -czf "${tune_tmp_dir}/adapter.tar.gz" -C "${tune_tmp_dir}/adapter_files" . 2>/dev/null; then
-                echo "❌ Failed to create adapter.tar.gz from tune output."
-                rm -rf "${tune_tmp_dir}"
-                exit 1
-            fi
-
-            local tar_size
-            tar_size=$(du -h "${tune_tmp_dir}/adapter.tar.gz" | cut -f1)
-            echo "   Archive size: ${tar_size}"
-
-            # Resolve S3 bucket for upload
-            local s3_bucket
-            if [ -z "${ADAPTER_S3_BUCKET:-}" ]; then
-                echo "❌ Adapter staging requires the 'training' module, which is not provisioned."
-                echo "   Run: ml-container-creator bootstrap add-module training"
-                rm -rf "${tune_tmp_dir}"
-                exit 1
-            fi
-            s3_bucket="${ADAPTER_S3_BUCKET}"
-
-            # Upload tar.gz to S3
-            local s3_tar_path="s3://${s3_bucket}/adapters/${PROJECT_NAME}/${adapter_name}/adapter.tar.gz"
-            echo "   ☁️  Uploading to S3: ${s3_tar_path}"
-
-            if ! aws s3 cp "${tune_tmp_dir}/adapter.tar.gz" "${s3_tar_path}" --region "${AWS_REGION}"; then
-                echo "❌ Failed to upload adapter tar.gz to S3."
-                echo ""
-                echo "   Check that:"
-                echo "   • The S3 bucket '${s3_bucket}' exists"
-                echo "   • Your IAM credentials have s3:PutObject permission"
-                echo "   • Run bootstrap if the bucket doesn't exist: ./do/bootstrap"
-                rm -rf "${tune_tmp_dir}"
-                exit 1
-            fi
-
-            echo "   ✅ Uploaded to S3: ${s3_tar_path}"
-
-            # Clean up temp directory
-            rm -rf "${tune_tmp_dir}"
-
-            # Update weights_uri to point to the uploaded tar.gz
-            weights_uri="${s3_tar_path}"
+        # Bucket consolidation R3 (Option D): the old Processing-Job / --local
+        # staging into the legacy adapters bucket is retired for new writes. The
+        # source is promoted into its canonical home below (server-side S3 copy,
+        # your credentials), which the adapter IC loads directly.
+        if [ -n "${use_local}" ] || [ -n "${no_wait}" ]; then
+            echo "ℹ️  --local / --no-wait no longer apply: the adapter is promoted with a server-side copy."
         fi
-        echo ""
-        fi  # end --local else branch
     fi
 
     # ── Resolve --from-train to weights_uri (shared resolver) ─────────────
@@ -1386,62 +1366,7 @@ _adapter_add() {
         echo "📦 Using train adapter output (${RESOLVED_META_TECHNIQUE}): ${weights_uri}"
         echo ""
 
-        # Use same staging path as --from-tune (Processing Job or local)
-        if [ -z "${use_local}" ]; then
-            echo "🚀 Submitting Processing Job to stage adapter from training output..."
-            echo ""
-
-            local exec_role="${EXECUTION_ROLE_ARN:-}"
-            if [ -z "${exec_role}" ]; then
-                exec_role="${ROLE_ARN:-}"
-            fi
-            if [ -z "${exec_role}" ]; then
-                exec_role="${SAGEMAKER_ROLE_ARN:-}"
-            fi
-            if [ -z "${exec_role}" ]; then
-                echo "❌ No execution role found."
-                echo "   Run 'ml-container-creator bootstrap' to set up your profile."
-                exit 1
-            fi
-
-            local adapter_bucket
-            if [ -z "${ADAPTER_S3_BUCKET:-}" ]; then
-                echo "❌ Adapter staging requires the 'training' module, which is not provisioned."
-                echo "   Run: ml-container-creator bootstrap add-module training"
-                exit 1
-            fi
-            adapter_bucket="${ADAPTER_S3_BUCKET}"
-
-            local adapter_s3_prefix="s3://${adapter_bucket}/adapters/${PROJECT_NAME}/${adapter_name}"
-
-            local stage_args=(
-                --source-uri "${weights_uri}"
-                --output-uri "${adapter_s3_prefix}/"
-                --role-arn "${exec_role}"
-                --region "${AWS_REGION}"
-            )
-            if [ -n "${no_wait}" ]; then
-                stage_args+=(--no-wait)
-            fi
-
-            local stage_result
-            local _stage_stderr
-            _stage_stderr=$(mktemp)
-            stage_result=$(python3 "${SCRIPT_DIR}/.adapter_helper.py" stage "${stage_args[@]}" 2>"${_stage_stderr}" | grep -E '^\{' | tail -1) || {
-                cat "${_stage_stderr}" >&2
-                rm -f "${_stage_stderr}"
-                echo "❌ Failed to submit adapter staging job"
-                exit 1
-            }
-            rm -f "${_stage_stderr}"
-
-            weights_uri=$(echo "${stage_result}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('adapter_s3_uri',''))" 2>/dev/null) || weights_uri=""
-            if [ -z "${weights_uri}" ]; then
-                echo "❌ Failed to extract staged adapter URI"
-                exit 1
-            fi
-            echo "   ✅ Adapter staged to: ${weights_uri}"
-        fi
+        # Promoted into the canonical prefix below (bucket consolidation R3).
         echo ""
     fi
 
@@ -1780,6 +1705,24 @@ _adapter_add() {
         fi
     fi
 
+    # ── Promote into the canonical adapter home (bucket consolidation R3.4) ──
+    # Every source (tune/train output, --from-weights, registry; --from-hub was
+    # published there already) lands in <base prefix>/.mlcc-adapters/<project>/
+    # <name>/ in the core bucket (s3_layout.py); the adapter IC loads that prefix.
+    # The base is the tune's base for --from-tune (TUNE_MODEL_ID, catalog-mapped),
+    # the registry's model for --from-registry, else this project's MODEL_NAME.
+    local _adapter_source_uri="${weights_uri}" _promote_base="${MODEL_NAME:-}" _promote_tech=""
+    if [ -n "${from_tune}" ]; then
+        [ -n "${TUNE_MODEL_ID:-}" ] && _promote_base="${TUNE_MODEL_ID}"
+        _promote_tech="${from_tune_technique%%-*}"
+    elif [ -n "${from_train}" ]; then
+        _promote_tech="${from_train_technique}"
+    elif [ -n "${from_registry}" ] && [ -n "${RESOLVED_META_MODEL_NAME:-}" ]; then
+        _promote_base="${RESOLVED_META_MODEL_NAME}"
+    fi
+    weights_uri=$(_adapter_promote_canonical "${weights_uri}" "${adapter_name}" "${_promote_base}" \
+        lora_adapter "${_promote_tech}" "do/adapter add") || exit 1
+
     # ── Rank pre-check vs the LIVE serving limit (Wave 6.1 R3.2) ─────────
     # The base IC's container env carries the engine's MAX_LORA_RANK when it is
     # overridden (IC_ENV_*); otherwise the engine default applies. Refuse with the
@@ -1846,6 +1789,7 @@ export ADAPTER_NAME="${adapter_name}"
 export ADAPTER_IC_NAME="${adapter_ic_name}"
 export ADAPTER_WEIGHTS_URI="${weights_uri}"
 export ADAPTER_CREATED_AT="${created_at}"
+export ADAPTER_SOURCE_URI="${_adapter_source_uri}"
 EOF
 
     # Add hub-specific metadata if --from-hub was used
@@ -2402,6 +2346,10 @@ _adapter_update() {
         weights_uri="${RESOLVED_URI}"
         echo ""
     fi
+
+    # ── Promote the new weights into the canonical home (bucket consolidation R3.4) ──
+    weights_uri=$(_adapter_promote_canonical "${weights_uri}" "${adapter_name}" "${MODEL_NAME:-}" \
+        lora_adapter "" "do/adapter update") || exit 1
 
     # ── Update the inference component ────────────────────────────────────
     echo "🚀 Updating inference component: ${adapter_ic_name}"

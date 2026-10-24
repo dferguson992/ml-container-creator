@@ -145,10 +145,12 @@ describe('Feature: managed-model-customization — --from-tune integration (Req 
             const addSection = getAdapterAddSection();
             assert.ok(/_kind_guidance="[^"]*do\/add-ic <name> --from-tune/.test(addSection));
         });
-        it('gates before any staging (kind check precedes the Processing Job)', () => {
+        it('gates before any staging (kind check precedes the canonical promotion)', () => {
+            // Bucket consolidation R3.4: the legacy Processing-Job staging was replaced
+            // by the promotion into the canonical prefix (_adapter_promote_canonical).
             const addSection = getAdapterAddSection();
             const gate = addSection.indexOf('_guard_artifact_kind "${_resolved_kind}"');
-            const stage = addSection.indexOf('Submitting Processing Job to stage adapter');
+            const stage = addSection.indexOf('_adapter_promote_canonical "${weights_uri}"');
             assert.ok(gate !== -1 && stage !== -1 && gate < stage);
         });
     });

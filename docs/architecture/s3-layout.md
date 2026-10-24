@@ -19,7 +19,7 @@ buckets under CloudFormation.
 | `mlcc-benchmark-results-<acct>-<region>` | `benchmark` | `benchmarkS3Bucket` (alias `ciBenchmarkResultsBucket`) | `BENCHMARK_S3_BUCKET` | `<project>/bmk-*/`, `results/` (Glue table), `athena-query-results/` |
 | `mlcc-codebuild-source-<acct>-<region>` | `ci` | `codebuildSourceS3Bucket` | `CODEBUILD_SOURCE_S3_BUCKET` | `do/submit` source archives (`<project>/…zip`) |
 | `mlcc-training-<acct>-<region>` (legacy, frozen) | `training` | `trainingS3Bucket` | `S3_BUCKET` | Reward-evaluator code backups; kept so recorded URIs stay valid |
-| `mlcc-training-adapters-<acct>-<region>` (legacy, frozen in Wave 6.1) | `training` | `adapterS3Bucket` | `ADAPTER_S3_BUCKET` | `do/adapter` staging for SageMaker inference components |
+| `mlcc-training-adapters-<acct>-<region>` (legacy, frozen) | `training` | `adapterS3Bucket` | `ADAPTER_S3_BUCKET` | none for new writes (recorded URIs stay readable) |
 | `mlcc-hyperpod-tls-<profile>` | `hyperpod` (inference-operator stack) | (none — passed to the add-on) | — | Inference-operator TLS material |
 
 The physical name of the artifacts bucket is `mlcc-tune-…` because it already holds every
@@ -183,11 +183,43 @@ Expected change-set contents for a typical account:
 The inference-operator stack's TLS bucket follows the same rule when the `hyperpod`
 module is updated. The EKS and HyperPod cluster stacks declare no buckets.
 
-## Prefix layout (coming in Wave 6.1)
+## Prefix layout (canonical, Option D)
 
-The canonical servable-artifact layout lands in Wave 6.1: adapters under
-`models/<org>/<base>/.mlcc-adapters/<project>/<name>/` and full fine-tunes under
-`models/mlcc-<project>/<name>/` in the core bucket, plus a promotion step and a single
-layout module. Until then, raw tune output stays at
-`<artifacts>/<project>/tune/<technique>/<job>/output/model/` and `do/train` defaults to
-`<artifacts>/<project>/train/`.
+`templates/do/lib/python/s3_layout.py` is the single module that composes these keys
+(shell callers use `do/lib/s3-layout.sh`); `test/unit/s3-layout-path-drift.test.js`
+fails when any other file assembles them. Bucket names come only from profile keys.
+
+| Bucket (profile key) | Prefix | What | Writer |
+|---|---|---|---|
+| core (`coreS3Bucket`) | `models/<org>/<base>/` | staged base weights | `do/stage` (adds only; never `--delete`) |
+| core | `models/<org>/<base>/.mlcc-adapters/<project>/<name>/` | canonical LoRA adapter + `mlcc-adapter.json` | promotion in `do/tune` / `do/train`; `do/adapter add` (`--from-hub`, `--from-weights`, `--from-registry`, `--from-tune`, `--from-train`); `do/adapter promote` |
+| core | `models/mlcc-<project>/<name>/` | full fine-tune + `mlcc-model.json` | promotion in `do/tune` / `do/train` |
+| core | `evaluators/<name>/` | reward-function code backups (the reward-Lambda role reads this prefix) | `do/register evaluator --finalize` |
+| artifacts (`artifactsS3Bucket`) | `<project>/tune\|train\|optimize/...` | raw job output, MLflow artifacts | the jobs |
+
+`<org>/<base>` is the model's Hugging Face id; a hub/JumpStart id maps through the tune
+catalog (`do/.tune_catalog.json`) and an unmapped id fails fast. The manifest records the
+source URI, source job, technique, rank, target modules, base model (+ revision), a
+content hash, the creator and a timestamp; promotion is idempotent on the hash and
+removes stale files of the previous version of the SAME artifact.
+
+Rules:
+
+- **Promotion.** Jobs keep writing raw output to the artifacts bucket; the promotion step
+  copies only the servable part (`checkpoints/hf/` for adapters, the merged/full model)
+  server-side with your credentials. `TUNE_ADAPTER_PATH_<T>` / `TUNE_MODEL_PATH_<T>` record
+  the canonical URI; `TUNE_OUTPUT_PATH_<T>` / `TUNE_OUTPUT_PATH_LATEST` keep the raw path. A
+  failed promotion keeps the raw path and never fails the tune.
+- **Backfill.** `./do/adapter promote <name> --from-tune <t>` (or `--from-weights <uri>`)
+  publishes an existing output; `--update-config` repoints the do/config var and keeps the
+  old value as `TUNE_ADAPTER_SOURCE_<T>` (or `TUNE_MODEL_SOURCE_<T>`).
+- **Serving.** Realtime adapter ICs load the canonical prefix directly; the realtime model
+  sync excludes `.mlcc-adapters/*`. On Kubernetes the canonical prefix is on the pod's model
+  mount (see [LoRA delivery on Kubernetes](k8s-lora-delivery.md)); a serving copy is made
+  only on a base-prefix mismatch with the same base and is deleted by `do/adapter remove`.
+- **Cleanup.** `./do/clean adapters` deletes only this project's `.mlcc-adapters/<project>/`
+  (under every base) and `models/mlcc-<project>/`. Never base weights, never other
+  projects' adapters, never the artifacts bucket.
+- **Legacy.** The frozen training / adapters buckets get no new writes; recorded URIs stay
+  valid (nothing is moved). Already-recorded raw `TUNE_ADAPTER_PATH_*` values keep working:
+  `do/adapter add` promotes them on first use.

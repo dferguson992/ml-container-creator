@@ -103,7 +103,7 @@ When `do/tune` completes, it stores the output artifact path in `do/config` and 
 
 The `--from-tune` flag reads the output path from `do/config` automatically — no need to copy S3 URIs manually.
 
-By default, `--from-tune` stages adapter weights via a **SageMaker Processing Job** (no local disk usage). Use `--local` to download and package locally instead.
+When a tune completes, `do/tune` **promotes** the servable output from the artifacts bucket to its canonical home in the core bucket (adapters: `models/<org>/<base>/.mlcc-adapters/<project>/<name>/`; full models: `models/mlcc-<project>/<name>/`) with a manifest, and records that URI in `TUNE_ADAPTER_PATH_<TECHNIQUE>` / `TUNE_MODEL_PATH_<TECHNIQUE>` (the raw job output stays in `TUNE_OUTPUT_PATH_<TECHNIQUE>`). `do/adapter add` loads the canonical prefix on every target; a source that is not canonical yet is promoted first (a server-side S3 copy with your credentials). For projects tuned before this change, backfill with `./do/adapter promote <name> --from-tune <technique> --update-config`. See [S3 buckets & layout](architecture/s3-layout.md).
 
 ### Adapter output (LoRA)
 
@@ -117,17 +117,19 @@ By default, `--from-tune` stages adapter weights via a **SageMaker Processing Jo
 # Or pass the S3 path explicitly (--weights still works as a deprecated alias)
 ./do/adapter add tuned-sft --from-weights s3://<artifacts-bucket>/<project>/tune/sft/<job>/output/model/checkpoints/hf/
 
-# Stage locally instead of via Processing Job
-./do/adapter add tuned-sft --from-tune --local
+# Backfill an adapter tuned before canonical promotion existed
+./do/adapter promote tuned-sft --from-tune sft --update-config
 ```
 
 !!! tip "Post-tune deploy-fit (rank/alpha)"
     When a LoRA tune completes, `do/tune` surfaces the adapter's effective rank and
-    alpha (read from its `adapter_config.json`). If the rank exceeds the serving
-    engine's `VLLM_MAX_LORA_RANK`, it **warns** — the engine will reject or truncate
-    the adapter at load, so raise `VLLM_MAX_LORA_RANK` in `do/config` (to at least
-    the adapter's rank) and redeploy before hot-loading. The warning never blocks the
-    tune.
+    alpha (read from its `adapter_config.json`) and compares the rank with the
+    EFFECTIVE serving `max_lora_rank` — the value the next deploy applies (an explicit
+    `VLLM_MAX_LORA_RANK`, else derived from the recorded adapters and the engine
+    default). Above it, the note says the next `./do/deploy` raises the limit
+    automatically (or, with an explicit value, that you must raise it); redeploy before
+    hot-loading. The note never blocks the tune or lowers its rank. See
+    [LoRA delivery and rank fit on Kubernetes](architecture/k8s-lora-delivery.md).
 
 ### Full model output
 

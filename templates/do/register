@@ -1228,7 +1228,9 @@ if [ "${SUBCOMMAND}" = "evaluator" ]; then
     echo ""
 
     # stderr is shown so the user sees skip/guidance messages from the helper.
-    if ev_output=$(python3 "${SCRIPT_DIR}/.register_helper.py" "${EV_ARGS[@]}"); then
+    # Reward-code backups go to the core bucket's evaluators/<name>/ (bucket
+    # consolidation R3.9; key composed by s3_layout.py) — passed explicitly.
+    if ev_output=$(CORE_S3_BUCKET="${CORE_BUCKET:-}" python3 "${SCRIPT_DIR}/.register_helper.py" "${EV_ARGS[@]}"); then
         ev_json=$(echo "${ev_output}" | grep -E '^\{' | tail -1)
         if [ -n "${ev_json}" ]; then
             echo "✅ Evaluator registered"

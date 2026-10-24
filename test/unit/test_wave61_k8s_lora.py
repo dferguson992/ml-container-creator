@@ -40,11 +40,50 @@ def test_model_prefix_uri_maps_to_the_in_pod_path():
     assert not got.startswith("s3://")
 
 
-def test_outside_prefix_is_refused_with_copy_command_and_never_passes_s3():
+def test_outside_prefix_local_path_never_passes_s3():
     with pytest.raises(ad.DeliveryRefused) as exc:
-        ad.local_path("hyperpod-eks", "s3://mlcc-tune/fresh-ai-ml/tune/dpo/hf/", "fresh-ai-ml", "dpo-w6", BASE)
-    assert "aws s3 sync s3://mlcc-tune/fresh-ai-ml/tune/dpo/hf/ " in exc.value.fix
-    assert ad.canonical_uri(BASE, DELIVERY, "fresh-ai-ml", "dpo-w6") in exc.value.fix
+        ad.local_path("hyperpod-eks", "s3://zz-art/fresh-ai-ml/tune/dpo/hf/", "fresh-ai-ml", "dpo-w6", BASE)
+    assert ad.deployment_adapter_uri(BASE, "fresh-ai-ml", "dpo-w6") in exc.value.fix
+
+
+# ── Part B: promote / load / copy-on-mismatch / refuse (R1.3, bucket R3) ─────
+
+def test_plan_promotes_a_raw_source_into_the_canonical_prefix_then_loads_by_path():
+    plan = ad.plan_delivery("hyperpod-eks", "s3://zz-art/fresh-ai-ml/tune/dpo/j/hf/", "fresh-ai-ml", "dpo-w6",
+                            BASE, core_bucket="core", adapter_base="huggingface-vlm-gemma-4-e4b-it")
+    assert plan["promote_to"] == "s3://core/models/google/gemma-4-E4B-it/.mlcc-adapters/fresh-ai-ml/dpo-w6/"
+    assert plan["copy_to"] == ""
+    assert plan["path"] == f"{DELIVERY['mount_path']}/.mlcc-adapters/fresh-ai-ml/dpo-w6"
+
+
+def test_plan_canonical_under_this_prefix_needs_no_copy():
+    uri = "s3://core/models/google/gemma-4-E4B-it/.mlcc-adapters/fresh-ai-ml/tuned-sft/"
+    plan = ad.plan_delivery("hyperpod-eks", uri, "fresh-ai-ml", "sft-w6", BASE)
+    assert plan["promote_to"] == "" and plan["copy_to"] == ""
+    assert plan["path"].endswith("/.mlcc-adapters/fresh-ai-ml/tuned-sft")
+
+
+def test_plan_copies_only_on_a_base_prefix_mismatch_with_the_same_base():
+    restaged = {**BASE, "prefix": "models/mlcc-fresh-ai-ml/gemma-restaged"}
+    uri = "s3://core/models/google/gemma-4-E4B-it/.mlcc-adapters/fresh-ai-ml/tuned-sft/"
+    plan = ad.plan_delivery("hyperpod-eks", uri, "fresh-ai-ml", "sft-w6", restaged,
+                            deployment_model="google/gemma-4-E4B-it")
+    assert plan["copy_to"] == "s3://core/models/mlcc-fresh-ai-ml/gemma-restaged/.mlcc-adapters/fresh-ai-ml/sft-w6/"
+    assert plan["path"] == f"{DELIVERY['mount_path']}/.mlcc-adapters/fresh-ai-ml/sft-w6"
+
+
+def test_plan_refuses_an_incompatible_base_before_any_copy():
+    qwen = {**BASE, "prefix": "models/Qwen/Qwen3-8B"}
+    uri = "s3://core/models/google/gemma-4-E4B-it/.mlcc-adapters/fresh-ai-ml/tuned-sft/"
+    with pytest.raises(ad.DeliveryRefused) as exc:
+        ad.plan_delivery("hyperpod-eks", uri, "fresh-ai-ml", "sft-w6", qwen)
+    assert "incompatible base" in str(exc.value)
+
+
+def test_plan_refuses_an_unmapped_tune_base_never_guesses():
+    with pytest.raises(ad.DeliveryRefused):
+        ad.plan_delivery("hyperpod-eks", "s3://zz-art/p/tune/x/", "p", "n", BASE, core_bucket="core",
+                         adapter_base="huggingface-llm-not-in-catalog")
 
 
 @pytest.mark.parametrize("base,needle", [

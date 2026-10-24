@@ -78,6 +78,20 @@ const summary: Record<string, unknown> = {};
     const rules = ((art.LifecycleConfiguration as { Rules: unknown[] }) || { Rules: [] }).Rules;
     if (rules.length !== 1) fail(`ArtifactsBucket must have exactly one lifecycle rule, got ${rules.length}`);
     t.hasOutput('ArtifactsBucketOutput', { Value: artifacts, Export: { Name: `mlcc-${PROFILE}-training-ArtifactsBucket` } });
+    // Bucket consolidation R3.9: the reward-Lambda role reads the core bucket's
+    // evaluators/ prefix (new reward-code backups live there).
+    const core = expectedName('core/ModelsBucketResource');
+    t.hasResourceProperties('AWS::IAM::Policy', {
+        PolicyDocument: {
+            Statement: Match.arrayWith([
+                Match.objectLike({ Sid: 'ReadCoreEvaluators', Action: 's3:GetObject', Resource: `arn:aws:s3:::${core}/evaluators/*` }),
+                Match.objectLike({
+                    Sid: 'ListCoreEvaluators', Action: 's3:ListBucket', Resource: `arn:aws:s3:::${core}`,
+                    Condition: { StringLike: { 's3:prefix': ['evaluators/*'] } },
+                }),
+            ]),
+        },
+    });
     // Legacy buckets keep their stable logical IDs and outputs.
     const trainingId = bucketLogicalIdByName(t, expectedName('training/TrainingBucket'));
     const adaptersId = bucketLogicalIdByName(t, expectedName('training/AdaptersBucket'));
