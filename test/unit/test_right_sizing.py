@@ -66,9 +66,12 @@ def test_dtype_bytes_from_config():
 
 
 def test_budget_is_ten_percent_of_post_weights_memory():
-    # 32 GiB x 0.9 - 8 GiB weights/GPU = 20.8 GiB → 10% = 2.08 GiB
+    # 10% of (usable per GPU - 8 GiB weights/GPU); usable = usable_bytes() for one
+    # GPU (visible fraction, utilization, runtime reserve — W8 calibration).
     b = rs.lora_buffer_budget_bytes(32, 0.9, int(16 * GIB), 2)
-    assert gib(b) == pytest.approx(2.08, abs=0.01)
+    assert b == pytest.approx(0.10 * (rs.usable_bytes(32, 1, 0.9) - 8 * GIB))
+    assert b < 0.10 * (32 * 0.9 - 8) * GIB  # the reserve / visible fraction tighten the raw figure
+    assert rs.lora_buffer_budget_bytes(32, 0.9, int(16 * GIB), 2, fraction=0.2) == pytest.approx(2 * b)
 
 
 # ── Rank helpers ──────────────────────────────────────────────────────────────
@@ -150,14 +153,29 @@ def test_required_rank_above_engine_max_blocks():
 
 # ── lora-buffer-memory cap (R2.4, D3) ─────────────────────────────────────────
 
+def _gpu_gib_with_cap_between(lo_rank, hi_rank, weights_per_gpu_gib=8.0):
+    """A per-GPU memory size whose LoRA cap holds r`lo_rank` but not r`hi_rank`
+    (derived from the module's own budget formula, so it tracks the constants)."""
+    lo = rs.lora_buffer_bytes_per_gpu(GEMMA, lo_rank, 4, 2)
+    hi = rs.lora_buffer_bytes_per_gpu(GEMMA, hi_rank, 4, 2)
+    for tenth in range(80, 400):
+        g = tenth / 10
+        cap = rs.lora_buffer_budget_bytes(g, 0.9, int(2 * weights_per_gpu_gib * GIB), 2)
+        if lo <= cap < hi:
+            return g, cap
+    raise AssertionError("no GPU size puts the cap between the two ranks")
+
+
 def test_auto_raise_over_cap_blocks_naming_adapter_and_numbers():
-    # A small GPU: 12 GiB x 0.9 - 8 GiB/GPU weights = 2.8 GiB → cap 0.28 GiB;
-    # r64 needs 0.73 GiB → refuse, naming the adapter and the numbers.
-    out = rs.effective_lora_rank(_ctx(gpu_memory_gib=12.0, adapters=[rs.AdapterRank("dpo-w6", 64)]))
+    # A small GPU whose cap holds r16 but not r32: r64 needs 0.73 GiB → refuse,
+    # naming the adapter and the numbers.
+    g, cap = _gpu_gib_with_cap_between(16, 32)
+    out = rs.effective_lora_rank(_ctx(gpu_memory_gib=g, gpu_memory_utilization=0.9,
+                                      adapters=[rs.AdapterRank("dpo-w6", 64)]))
     blocks = [f for f in out["findings"] if f["severity"] == "block"]
     assert blocks, out
     msg = blocks[0]["message"]
-    assert "dpo-w6 (r64)" in msg and "0.73 GiB" in msg and "0.28 GiB" in msg
+    assert "dpo-w6 (r64)" in msg and "0.73 GiB" in msg and f"{cap / GIB:.2f} GiB" in msg
     assert blocks[0]["data"]["max_rank_within_budget"] == 16
     assert rs.exit_code([rs.Finding(**f) for f in out["findings"]]) == 2
 

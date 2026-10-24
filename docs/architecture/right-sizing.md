@@ -75,8 +75,14 @@ best-effort warning in `do/adapter`).
 ```
 KV bytes / token = sum over layers that own a KV cache of 2 x kv_heads x head_dim x kv_dtype_bytes
 need            = weights x (1 + OVERHEAD_FACTOR) + KV(max_model_len) + LoRA buffer + draft weights
-usable          = per-GPU memory x TP GPUs x gpu_memory_utilization
+usable          = TP GPUs x (per-GPU memory x GPU_VISIBLE_MEMORY_FRACTION x gpu_memory_utilization
+                             - GPU_RUNTIME_RESERVE_GIB)
 ```
+
+`usable` is computed in one place (`usable_bytes()`) and feeds every memory
+check: `context-memory`, its largest-fitting `MAX_MODEL_LEN` and
+smallest-fitting-instance fixes, `concurrency-kv`, and the `lora-buffer-memory`
+budget.
 
 - `head_dim` falls back to `hidden_size / num_attention_heads`; multimodal
   models read the language model from `text_config`.
@@ -85,9 +91,20 @@ usable          = per-GPU memory x TP GPUs x gpu_memory_utilization
   models cache `kv_lora_rank + qk_rope_head_dim` once per layer.
 - **Sliding-window / hybrid models** (`layer_types`, or `sliding_window` +
   `sliding_window_pattern`) get two bounds. Upper: every layer holds
-  `max_model_len`. Lower (window-aware): sliding layers hold only the window. The
-  check blocks when the lower bound is over usable memory, and warns when only the
-  upper bound is.
+  `max_model_len`. Lower (window-aware): sliding layers hold the window plus the
+  engine's in-flight tokens (`max_num_batched_tokens` x `in_flight_batches` from
+  the serve manifest's `sizing_map`; vLLM v0.31 keeps the window plus every
+  scheduled-but-unsettled token during chunked prefill). The check blocks when
+  the lower bound is over usable memory, and warns when only the upper bound is.
+- **KV capacity in tokens** (`concurrency-kv`, and `data.kv_capacity_tokens` on
+  `context-memory`) uses vLLM's definition of its `GPU KV cache size: N tokens`
+  line: how many `max_model_len` requests fit the KV memory, times
+  `max_model_len`.
+- **Weights vs vLLM's own figure.** vLLM's `Model loading took X GiB` is measured
+  around model load, which also allocates the LoRA buffer, so it is weights +
+  LoRA. The estimate keeps the two as separate terms, each counted once. vLLM's
+  `weights + non-torch` figure adds NCCL / cuBLAS workspaces that do not scale
+  with the model; those are in `GPU_RUNTIME_RESERVE_GIB`.
 - **Weights** are the measured `*.safetensors` bytes under `STAGED_MODEL_PATH`
   when the model is staged; otherwise an estimate of parameters x dtype bytes
   using `instance_sizer.py`'s `BYTES_PER_PARAM`. `OVERHEAD_FACTOR` (10%) is
@@ -99,12 +116,37 @@ usable          = per-GPU memory x TP GPUs x gpu_memory_utilization
   declared default (`serve.d/<engine>/manifest.json` `sizing_map`), else the
   module default.
 
-The formula ignores activation peaks and CUDA-graph memory; the warn band absorbs
-them. Calibrated against a live vLLM v0.31 pod (Gemma-4-E4B, 2 x 32 GB, TP 2):
-the window-aware KV capacity estimate was about 22% above vLLM's own
-`GPU KV cache size` line, because vLLM also reserves about 1.2 GiB per GPU for
-activations plus CUDA-graph memory and sees 31.4 GiB per device, not the
-catalogued 32.
+## Calibration
+
+Reference deployment: a live vLLM v0.31.0 pod serving `google/gemma-4-E4B-it` on
+2 x 32 GB GPUs (TP 2), `max_model_len` 131,072, LoRA `max_loras` 4 /
+`max_lora_rank` 64, `gpu_memory_utilization` 0.92, `max_num_batched_tokens`
+2048. The recorded log values are in
+`test/fixtures/right-sizing/vllm-0.31-gemma-4-e4b-capacity.json`.
+`test_right_sizing_w8.py` checks that the estimate stays at or below them and
+within 10%.
+
+What vLLM logged per GPU: 31.38 GiB visible (the catalog says 32); 28.87 GiB
+requested (31.38 x 0.92); model loading 9.0 GiB (weights + LoRA buffer);
+9.33 GiB weights + non-torch; 1.23 GiB peak activation; 0.36 GiB CUDA graphs;
+18.3 GiB available for the KV cache; `GPU KV cache size: 2,203,985 tokens`.
+
+| Quantity (per GPU unless noted) | Before | After | vLLM |
+|---|---|---|---|
+| usable | 29.44 GiB (32 x 0.92) | 26.95 GiB (32 x 0.98 x 0.92 - 1.9) | 28.87 requested, less 1.92 runtime = 26.95 |
+| weights + LoRA buffer | 8.92 GiB | 8.92 GiB (unchanged; each counted once) | 9.0 |
+| KV memory | 20.5 GiB | 18.03 GiB | 18.3 |
+| KV capacity, tokens (window-aware) | 2,689,838 (+22%) | 2,172,668 (-1.4%) | 2,203,985 |
+
+Where the gap closed (tokens vs vLLM): the visible fraction alone gives +17%,
+plus the runtime reserve +6%, plus sliding layers holding the in-flight tokens
+-1.4%. With a 1.6 GiB reserve (activation + CUDA graphs, leaving out
+non-torch) the estimate is +0.2%, slightly over vLLM, which is why non-torch
+memory is part of the reserve.
+
+The constants are physical quantities read from the log, not fitted to the
+token count. The activation peak grows with `max_num_batched_tokens`, so raise
+`MLCC_SIZING_GPU_RUNTIME_RESERVE_GIB` for much larger scheduler batches.
 
 ## Thresholds
 
@@ -116,8 +158,10 @@ environment variable:
 | `BLOCK_OVER` | 1.00 | `MLCC_SIZING_BLOCK_OVER` | block when need > usable x this |
 | `WARN_FROM` | 0.90 | `MLCC_SIZING_WARN_FROM` | warn when need >= usable x this |
 | `DEFAULT_GPU_MEMORY_UTILIZATION` | 0.9 | `MLCC_SIZING_DEFAULT_GPU_MEMORY_UTILIZATION` | used only when the engine manifest declares no default |
-| `LORA_BUFFER_BUDGET_FRACTION` | 0.10 | `MLCC_SIZING_LORA_BUDGET_FRACTION` | LoRA buffer cap, fraction of post-weights GPU memory |
+| `LORA_BUFFER_BUDGET_FRACTION` | 0.10 | `MLCC_SIZING_LORA_BUDGET_FRACTION` | LoRA buffer cap, fraction of post-weights usable GPU memory |
 | `FETCH_TIMEOUT_S` | 10 | `MLCC_SIZING_FETCH_TIMEOUT` | seconds to wait for a Hugging Face config.json |
+| `GPU_VISIBLE_MEMORY_FRACTION` | 0.98 | `MLCC_SIZING_GPU_VISIBLE_FRACTION` | share of the catalogued per-GPU memory the driver exposes (31.38 / 32 measured) |
+| `GPU_RUNTIME_RESERVE_GIB` | 1.9 | `MLCC_SIZING_GPU_RUNTIME_RESERVE_GIB` | per-GPU runtime memory outside weights, LoRA and KV: activation peak 1.23 + CUDA graphs 0.36 + non-torch 0.33 GiB (measured) |
 
 ## Where each input comes from
 
@@ -125,8 +169,9 @@ Nothing per-target or per-engine is hardcoded in the module (ADR-008):
 
 - Engine setting names: `serve.d/<engine>/manifest.json` `env_var_prefix` +
   `dimension_map` (max_model_len, kv_cache_dtype, quantization, TP) + `sizing_map`
-  (gpu_memory_utilization, max_num_seqs, dtype, TP default) + `capability_map`
-  (LoRA). `quantization_methods` is optional.
+  (gpu_memory_utilization, max_num_seqs, max_num_batched_tokens with its
+  per-GPU-memory default tiers and `in_flight_batches`, dtype, TP default) +
+  `capability_map` (LoRA). `quantization_methods` is optional.
 - Target facts: `targets.d/<target>/manifest.json` `serving_config_source`
   (`sagemaker-ic` targets read `IC_ENV_<var>` first), `verbs.add-ic` (the model
   runs on `IC_GPU_COUNT` GPUs and `ic-packing` applies), `service_quota_usage`,

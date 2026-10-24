@@ -116,12 +116,35 @@ WARN_FROM = 0.90
 FETCH_TIMEOUT_S = 10.0
 # Computed MAX_MODEL_LEN fixes round down to a multiple of this.
 FIX_ROUND_TOKENS = 1024
+# ── Usable GPU memory (W8 calibration) ────────────────────────────────────────
+# Every memory check goes through usable_bytes():
+#   per-GPU usable = catalog GiB x GPU_VISIBLE_MEMORY_FRACTION x gpu_memory_utilization
+#                    - GPU_RUNTIME_RESERVE_GIB
+# Calibrated against a live vLLM v0.31 pod (gemma-4-E4B-it, ml.g7.12xlarge,
+# TP 2, max_model_len 131072, LoRA 4 x r64, utilization 0.92); see
+# docs/architecture/right-sizing.md "Calibration".
+#
+# GPU_VISIBLE_MEMORY_FRACTION: the catalog's gpuMemoryGb is the marketed size;
+# the driver exposes less (ECC / reserved pages). vLLM logged 31.38 GiB total
+# per device for a catalogued 32 -> 0.9806; 0.98 rounds that down.
+GPU_VISIBLE_MEMORY_FRACTION = 0.98
+# GPU_RUNTIME_RESERVE_GIB: per-GPU memory the engine needs at run time that is
+# neither weights, LoRA buffer nor KV cache. Measured (vLLM v0.31 "Actual
+# usage" line): peak activation 1.23 GiB + CUDA-graph pool 0.36 GiB + non-torch
+# 0.33 GiB (the gap between "Model loading took 9.0 GiB" and "9.33 GiB for
+# consumed memory (weights + non-torch)": NCCL / cuBLAS workspaces, which do
+# not scale with the model) = 1.92 GiB -> 1.9. Activation peak grows with
+# max_num_batched_tokens, so a larger scheduler batch may need a larger reserve
+# (override it below).
+GPU_RUNTIME_RESERVE_GIB = 1.9
 THRESHOLD_ENV = {
     "BLOCK_OVER": "MLCC_SIZING_BLOCK_OVER",
     "WARN_FROM": "MLCC_SIZING_WARN_FROM",
     "DEFAULT_GPU_MEMORY_UTILIZATION": "MLCC_SIZING_DEFAULT_GPU_MEMORY_UTILIZATION",
     "LORA_BUFFER_BUDGET_FRACTION": "MLCC_SIZING_LORA_BUDGET_FRACTION",
     "FETCH_TIMEOUT_S": "MLCC_SIZING_FETCH_TIMEOUT",
+    "GPU_VISIBLE_MEMORY_FRACTION": "MLCC_SIZING_GPU_VISIBLE_FRACTION",
+    "GPU_RUNTIME_RESERVE_GIB": "MLCC_SIZING_GPU_RUNTIME_RESERVE_GIB",
 }
 
 
@@ -241,6 +264,11 @@ class SizingContext:
     gpu_memory_utilization_source: str = "module default"
     max_num_seqs: int | None = None
     max_num_seqs_var: str = ""
+    # Scheduler batch (tokens) and its sizing_map entry (default,
+    # default_by_gpu_memory_gib, in_flight_batches); see inflight_tokens().
+    # Empty / None = the engine declares nothing: sliding layers hold only the window.
+    max_num_batched_tokens: int | None = None
+    batched_tokens_spec: dict = field(default_factory=dict)
     typical_context: int | None = None
     typical_context_source: str = ""
     engine_version: str | None = None
@@ -402,9 +430,10 @@ def lora_buffer_bytes_per_gpu(cfg: dict, rank: int, max_loras: int, tp: int,
 
 def lora_buffer_budget_bytes(gpu_memory_gib: float, utilization: float, weights_bytes: int,
                              tp: int, fraction: float = LORA_BUFFER_BUDGET_FRACTION) -> float:
-    """fraction x (per-GPU memory x utilization - per-GPU weights)."""
+    """fraction x (per-GPU usable memory - per-GPU weights); usable is
+    usable_bytes() for one GPU (visible fraction, utilization, runtime reserve)."""
     tp = max(int(tp or 1), 1)
-    left = gpu_memory_gib * GIB * utilization - float(weights_bytes) / tp
+    left = usable_bytes(gpu_memory_gib, 1, utilization) - float(weights_bytes) / tp
     return max(left, 0.0) * fraction
 
 
@@ -497,16 +526,18 @@ def check_lora_buffer_memory(ctx: SizingContext) -> list[Finding]:
     need = lora_buffer_bytes_per_gpu(ctx.model_config, rank, ctx.max_loras, ctx.tp, ctx.dtype_bytes)
     budget = lora_buffer_budget_bytes(ctx.gpu_memory_gib, ctx.gpu_memory_utilization,
                                       ctx.weights_bytes, ctx.tp, ctx.budget_fraction)
+    per_gpu_usable = usable_bytes(ctx.gpu_memory_gib, 1, ctx.gpu_memory_utilization)
     data = {
         "rank": rank, "max_loras": ctx.max_loras, "tp": ctx.tp,
         "buffer_bytes_per_gpu": int(need), "budget_bytes_per_gpu": int(budget),
         "gpu_memory_gib": ctx.gpu_memory_gib, "utilization": ctx.gpu_memory_utilization,
+        "usable_bytes_per_gpu": int(per_gpu_usable),
         "weights_bytes_per_gpu": int(ctx.weights_bytes / max(ctx.tp, 1)),
     }
     summary = (
         f"LoRA buffer at max_lora_rank {rank} (max_loras {ctx.max_loras}, TP {ctx.tp}) is "
         f"{_fmt_gib(need)} per GPU; the cap is {int(ctx.budget_fraction * 100)}% of "
-        f"({ctx.gpu_memory_gib:g} GiB x {ctx.gpu_memory_utilization:g} - {_fmt_gib(data['weights_bytes_per_gpu'])} weights) "
+        f"({_fmt_gib(per_gpu_usable)} usable per GPU - {_fmt_gib(data['weights_bytes_per_gpu'])} weights) "
         f"= {_fmt_gib(budget)}"
     )
     if need <= budget:
@@ -683,10 +714,16 @@ def kv_layout(cfg: dict) -> dict:
             "sliding": any(lay["kind"] != "full" for lay in layers)}
 
 
-def kv_cache_bytes(layout: dict, tokens: int, kv_bytes: int, tp: int = 1, window_aware: bool = False) -> float:
+def kv_cache_bytes(layout: dict, tokens: int, kv_bytes: int, tp: int = 1, window_aware: bool = False,
+                   inflight_tokens: int = 0) -> float:
     """Total KV bytes (all GPUs) for one sequence of `tokens`. TP shards KV heads;
     when TP exceeds a layer's KV heads each GPU still holds one head (replicated),
-    and an MLA latent cache is replicated on every GPU."""
+    and an MLA latent cache is replicated on every GPU.
+
+    Window-aware, a sliding layer holds window + `inflight_tokens` tokens: during
+    chunked prefill the engine keeps the window plus every scheduled-but-unsettled
+    token (vLLM v0.31 SlidingWindowSpec: window - 1 + max_in_flight_tokens, +1
+    block). See inflight_tokens()."""
     tp = max(int(tp or 1), 1)
     window = layout.get("window") or 0
     total = 0.0
@@ -694,7 +731,7 @@ def kv_cache_bytes(layout: dict, tokens: int, kv_bytes: int, tp: int = 1, window
         n = tokens
         if window_aware:
             if lay["kind"] == "sliding" and window:
-                n = min(tokens, window)
+                n = min(tokens, window + max(int(inflight_tokens or 0), 0))
             elif lay["kind"] == "other":
                 n = 0
         if lay.get("mla"):
@@ -808,9 +845,40 @@ def _lora_total_bytes(ctx: SizingContext, tp: int) -> float:
         return 0.0
 
 
-def memory_terms(ctx: SizingContext, tokens: int, tp: int | None = None) -> dict:
-    """Every term of the context-memory sum for `tokens` of context at TP `tp`.
-    Bytes are totals across the TP GPUs."""
+def inflight_tokens(ctx: SizingContext, gpu_memory_gib: float | None = None) -> int:
+    """Tokens a sliding-window layer holds beyond the window (scheduled, not yet
+    settled): max_num_batched_tokens x in_flight_batches. The batch is the engine
+    setting, else the engine manifest's sizing_map default for this GPU size
+    (default_by_gpu_memory_gib: the largest floor <= the GPU's memory wins).
+    0 when the engine declares nothing (sliding layers then hold only the window)."""
+    spec = ctx.batched_tokens_spec or {}
+    batches = _int(spec.get("in_flight_batches")) or 1
+    per = ctx.max_num_batched_tokens
+    if not per:
+        per = _int(spec.get("default")) or 0
+        mem = float(gpu_memory_gib if gpu_memory_gib is not None else (ctx.gpu_memory_gib or 0))
+        tiers = spec.get("default_by_gpu_memory_gib") or {}
+        for floor, val in sorted((float(k), v) for k, v in tiers.items()):
+            if mem >= floor and _int(val):
+                per = _int(val)
+    return int(per) * batches
+
+
+def memory_terms(ctx: SizingContext, tokens: int, tp: int | None = None,
+                 gpu_memory_gib: float | None = None) -> dict:
+    """Every term of the context-memory sum for `tokens` of context at TP `tp`
+    (on GPUs of `gpu_memory_gib`, default this instance's). Bytes are totals
+    across the TP GPUs.
+
+    Weights vs what vLLM v0.31 reports (W8 calibration): "Model loading took
+    9.0 GiB" is measured around load_model(), which also creates the LoRA A/B
+    stacks (v1/worker/gpu/model_runner.py: load_lora_model runs inside the same
+    DeviceMemoryProfiler) — so vLLM's figure is weights + LoRA buffer. Here the
+    two stay separate terms, each counted once: weights x (1 + OVERHEAD_FACTOR)
+    (7.45 GiB measured per GPU -> 8.19, covering TP-replicated tensors) + LoRA
+    0.73 GiB = 8.92 GiB vs vLLM's 9.0. The rest of vLLM's 9.33 GiB "weights +
+    non-torch" (0.33 GiB NCCL / cuBLAS workspaces) is per-GPU and size-
+    independent, so it sits in GPU_RUNTIME_RESERVE_GIB, not here."""
     tp = max(int(tp or ctx.tp or 1), 1)
     layout = kv_layout(ctx.model_config)
     model_bytes = ctx.dtype_bytes or model_dtype_bytes(ctx.model_config)
@@ -819,8 +887,9 @@ def memory_terms(ctx: SizingContext, tokens: int, tp: int | None = None) -> dict
     weights = float(ctx.weights_bytes or 0) * (1 + overhead)
     draft = float((ctx.draft or {}).get("weights_bytes") or 0) * (1 + overhead)
     lora = _lora_total_bytes(ctx, tp)
+    inflight = inflight_tokens(ctx, gpu_memory_gib)
     kv_upper = kv_cache_bytes(layout, tokens, kvb, tp, window_aware=False)
-    kv_lower = kv_cache_bytes(layout, tokens, kvb, tp, window_aware=True)
+    kv_lower = kv_cache_bytes(layout, tokens, kvb, tp, window_aware=True, inflight_tokens=inflight)
     fixed = weights + draft + lora
     return {
         "tokens": tokens, "tp": tp, "kv_bytes_per_element": kvb,
@@ -830,12 +899,41 @@ def memory_terms(ctx: SizingContext, tokens: int, tp: int | None = None) -> dict
         "kv_upper_bytes_per_token": int(kv_upper / tokens) if tokens else 0,
         "need_upper_bytes": int(fixed + kv_upper), "need_lower_bytes": int(fixed + kv_lower),
         "sliding": layout["sliding"], "window": layout["window"], "kv_shared_layers": layout["shared"],
+        "sliding_inflight_tokens": inflight if layout["sliding"] else 0,
         "uncertain": layout["uncertain"],
     }
 
 
 def usable_bytes(gpu_memory_gib: float, gpus: int, utilization: float) -> float:
-    return float(gpu_memory_gib) * GIB * max(int(gpus or 1), 1) * float(utilization)
+    """Usable GPU memory (bytes, all `gpus`) — the single figure every memory
+    check compares against: per GPU, catalog GiB x GPU_VISIBLE_MEMORY_FRACTION x
+    utilization - GPU_RUNTIME_RESERVE_GIB (both MLCC_SIZING_* overridable)."""
+    visible = threshold("GPU_VISIBLE_MEMORY_FRACTION")
+    reserve = threshold("GPU_RUNTIME_RESERVE_GIB")
+    per_gpu = float(gpu_memory_gib) * visible * float(utilization) - reserve
+    return max(per_gpu, 0.0) * GIB * max(int(gpus or 1), 1)
+
+
+def kv_capacity(ctx: SizingContext) -> dict | None:
+    """KV-cache capacity left after the fixed terms, in vLLM's own terms. Returns
+    {free_bytes, full_attention_tokens, window_aware_tokens?, seq_len?} or None
+    when nothing is left. Window-aware (sliding / hybrid models) follows vLLM's
+    "GPU KV cache size: N tokens" = max concurrency x max_model_len, where one
+    max_model_len request holds every full layer for all its tokens and every
+    sliding layer for window + in-flight tokens."""
+    one = memory_terms(ctx, 1)
+    usable = usable_bytes(ctx.gpu_memory_gib, one["tp"], ctx.gpu_memory_utilization)
+    free = usable - (one["need_lower_bytes"] - one["kv_lower_bytes"])
+    per_tok = one["kv_upper_bytes"]
+    if free <= 0 or not per_tok:
+        return None
+    out = {"free_bytes": free, "full_attention_tokens": int(free // per_tok)}
+    seq_len = ctx.max_model_len or derived_max_model_len(ctx.model_config)[0]
+    if one["sliding"] and one["window"] and seq_len:
+        per_seq = memory_terms(ctx, seq_len)["kv_lower_bytes"]
+        if per_seq > 0:
+            out.update({"window_aware_tokens": int(free / per_seq * seq_len), "seq_len": seq_len})
+    return out
 
 
 def max_fitting_len(ctx: SizingContext, usable: float, window_aware: bool, ceiling: int) -> int | None:
@@ -878,7 +976,7 @@ def smallest_fitting_instance(ctx: SizingContext, tokens: int, window_aware: boo
         gpus, mem = _int(entry.get("gpus")), entry.get("gpuMemoryGb")
         if not gpus or not mem or not _divides_heads(ctx.model_config, gpus):
             continue
-        need = memory_terms(ctx, tokens, gpus)[key]
+        need = memory_terms(ctx, tokens, gpus, float(mem))[key]
         if need > usable_bytes(mem, gpus, util) * blk:
             continue
         total = float(mem) * gpus
@@ -1084,7 +1182,11 @@ def check_context_memory(ctx: SizingContext) -> list[Finding]:
     usable = usable_bytes(ctx.gpu_memory_gib, tp, ctx.gpu_memory_utilization)
     blk, warn_from = threshold("BLOCK_OVER"), threshold("WARN_FROM")
     lower, upper = terms["need_lower_bytes"], terms["need_upper_bytes"]
+    visible, reserve = threshold("GPU_VISIBLE_MEMORY_FRACTION"), threshold("GPU_RUNTIME_RESERVE_GIB")
+    cap = kv_capacity(ctx)
     data = {**terms, "usable_bytes": int(usable), "gpu_memory_gib": ctx.gpu_memory_gib,
+            "gpu_visible_memory_fraction": visible, "gpu_runtime_reserve_gib": reserve,
+            "kv_capacity_tokens": (cap.get("window_aware_tokens") or cap["full_attention_tokens"]) if cap else 0,
             "gpu_memory_utilization": ctx.gpu_memory_utilization,
             "gpu_memory_utilization_source": ctx.gpu_memory_utilization_source,
             "weights_source": ctx.weights_source, "max_model_len_source": ctx.max_model_len_source or "model default",
@@ -1102,7 +1204,8 @@ def check_context_memory(ctx: SizingContext) -> list[Finding]:
     head = (f"max_model_len {tokens:,} needs ~{_gib(lower)}"
             + (f" (up to {_gib(upper)})" if terms["sliding"] else "")
             + f" = weights {_gib(terms['weights_bytes'])} ({ctx.weights_source}){lora}{draft} + {kv}; usable "
-            f"{_gib(usable)} = {tp} GPU x {ctx.gpu_memory_gib:g} GiB x {ctx.gpu_memory_utilization:g}")
+            f"{_gib(usable)} = {tp} GPU x ({ctx.gpu_memory_gib:g} GiB x {visible:g} visible x "
+            f"{ctx.gpu_memory_utilization:g} - {reserve:g} GiB runtime reserve)")
     if lower > usable * blk:
         sev = "block"
     elif upper > usable * blk or lower >= usable * warn_from:
@@ -1151,28 +1254,20 @@ def check_concurrency_kv(ctx: SizingContext) -> list[Finding]:
     if why or not isinstance(ctx.model_config, dict) or not ctx.weights_bytes:
         return _skip("concurrency-kv", why or "model config.json / weight size unavailable")
     try:
-        one = memory_terms(ctx, 1)
+        cap = kv_capacity(ctx)
     except (KeyError, TypeError, ValueError) as exc:
         return _skip("concurrency-kv", f"config.json lacks the attention dims ({exc})")
-    usable = usable_bytes(ctx.gpu_memory_gib, one["tp"], ctx.gpu_memory_utilization)
-    free = usable - (one["need_lower_bytes"] - one["kv_lower_bytes"])
-    per_tok = one["kv_upper_bytes"]
-    if free <= 0 or not per_tok:
+    if not cap:
         return _skip("concurrency-kv", "no KV memory left after weights (see context-memory)")
-    capacity = int(free // per_tok)
-    data = {"kv_capacity_tokens_full_attention": capacity, "kv_free_bytes": int(free)}
+    capacity = cap["full_attention_tokens"]
+    data = {"kv_capacity_tokens_full_attention": capacity, "kv_free_bytes": int(cap["free_bytes"])}
     msg = f"KV capacity ~{capacity:,} tokens (full-attention estimate)"
-    if one["sliding"] and one["window"]:
-        # Hybrid allocator: past the window only the full-attention layers grow,
-        # which is what vLLM's "GPU KV cache size: N tokens" line counts.
-        w = int(one["window"])
-        layout = kv_layout(ctx.model_config)
-        grow = (kv_cache_bytes(layout, w + 1024, one["kv_bytes_per_element"], one["tp"], True)
-                - kv_cache_bytes(layout, w, one["kv_bytes_per_element"], one["tp"], True)) / 1024.0
-        if grow > 0:
-            hybrid = int(free // grow)
-            data["kv_capacity_tokens_window_aware"] = hybrid
-            msg = f"KV capacity ~{hybrid:,} tokens window-aware (~{capacity:,} full-attention)"
+    if cap.get("window_aware_tokens"):
+        # Hybrid allocator: the figure vLLM's "GPU KV cache size: N tokens" line
+        # reports (max concurrency at max_model_len x max_model_len).
+        hybrid = cap["window_aware_tokens"]
+        data["kv_capacity_tokens_window_aware"] = hybrid
+        msg = f"KV capacity ~{hybrid:,} tokens window-aware (~{capacity:,} full-attention)"
     ctx_len = ctx.typical_context or ctx.max_model_len
     if ctx_len:
         data["concurrent_at_context"] = round(capacity / ctx_len, 2)
@@ -1739,6 +1834,9 @@ def context_from_env(env: dict | None = None, *, rank_only: bool = False,
     seqs, seqs_var, seqs_names = setting("max_num_seqs", sizing)
     ctx.max_num_seqs = _int_or_none(seqs)
     ctx.max_num_seqs_var = seqs_var or (seqs_names[0] if seqs_names else "max_num_seqs")
+    batched, _, _ = setting("max_num_batched_tokens", sizing)
+    ctx.max_num_batched_tokens = _int_or_none(batched)
+    ctx.batched_tokens_spec = dict(sizing.get("max_num_batched_tokens") or {})
     tin, tout = _int_or_none(env.get("BENCHMARK_INPUT_TOKENS_MEAN")), _int_or_none(env.get("BENCHMARK_OUTPUT_TOKENS_MEAN"))
     if tin and tout:
         ctx.typical_context, ctx.typical_context_source = tin + tout, "benchmark profile mean input + output"
