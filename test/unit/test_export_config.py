@@ -35,7 +35,9 @@ def _run(tmp_path, monkeypatch, lines, env=None, fmt="json", target=None):
     """Run main() with a clean env (only the given vars) and return (stdout, stderr)."""
     cfg = _write_config(tmp_path, lines)
     for key in list(os.environ):
-        if key in BY_VAR or key.startswith(("IC_ENV_", "VLLM_", "MLCC_")) or key == "DEPLOYMENT_TARGET":
+        # FRAMEWORK is derived (not in BY_VAR) but export_config reads it for the
+        # architecture filter, so an ambient value (e.g. a sourced do/config) must not leak in.
+        if key in BY_VAR or key.startswith(("IC_ENV_", "VLLM_", "MLCC_")) or key in ("DEPLOYMENT_TARGET", "FRAMEWORK"):
             monkeypatch.delenv(key, raising=False)
     for key, value in (env or {}).items():
         monkeypatch.setenv(key, value)
