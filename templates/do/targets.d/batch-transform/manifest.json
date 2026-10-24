@@ -15,6 +15,7 @@
   },
   "runtime_owned_vars": ["DEPLOYMENT_TARGET_BATCH_STATUS"],
   "serving_config_source": "sagemaker-ic",
+  "service_quota_usage": "transform job usage",
   "verbs": {
     "optimize": false,
     "add-ic": false,

@@ -890,6 +890,14 @@ function _writeGenerationParams(destDir, answers) {
             fs.copyFileSync(draftCatalogSrc, draftCatalogDest);
         }
 
+        // Copy the model-architecture support floor (architecture -> minimum
+        // engine version) so the right-sizing arch-engine-version check
+        // (do/lib/python/right_sizing.py) can run without the MLCC source tree.
+        const archSupportSrc = path.join(GENERATOR_ROOT, 'servers', 'lib', 'catalogs', 'model-arch-support.json');
+        if (fs.existsSync(archSupportSrc)) {
+            fs.copyFileSync(archSupportSrc, path.join(mlccDir, 'model-arch-support.json'));
+        }
+
         // Copy serve-engine plugin manifests to .mlcc/serve.d/ so do/draft and
         // do/deploy can read engine capabilities (supported_algorithms,
         // env_var_prefix, dimension_map) at generation and deploy time. The

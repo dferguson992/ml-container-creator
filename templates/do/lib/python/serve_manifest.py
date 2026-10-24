@@ -156,6 +156,20 @@ def dimension_map(engine: str, serve_dir: str | None = None) -> dict[str, str]:
     return dict(read_manifest(engine, serve_dir).get("dimension_map", {}))
 
 
+def sizing_map(engine: str, serve_dir: str | None = None) -> dict[str, dict]:
+    """Return the engine's sizing_map (Wave 8 right-sizing inputs that are not
+    benchmark dimensions): {name: {suffix, default?}}. {} when not declared."""
+    raw = read_manifest(engine, serve_dir).get("sizing_map", {})
+    return {k: dict(v) for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
+
+
+def quantization_methods(engine: str, serve_dir: str | None = None) -> list[str] | None:
+    """Return the engine's declared quantization_methods, or None when the
+    manifest does not declare them (the quant-engine check then skips)."""
+    raw = read_manifest(engine, serve_dir).get("quantization_methods")
+    return [str(m) for m in raw] if isinstance(raw, list) else None
+
+
 def metrics_endpoint(engine: str, serve_dir: str | None = None) -> dict | None:
     """Return the engine's metrics_endpoint dict, or None if not declared."""
     return read_manifest(engine, serve_dir).get("metrics_endpoint")

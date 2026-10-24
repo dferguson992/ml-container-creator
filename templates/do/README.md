@@ -33,7 +33,7 @@ All settings centralized in `do/config`. Override via environment variables.
 | `./do/register` | Register model in SageMaker Model Registry |
 | `./do/manifest` | Generate deployment manifest (multi-model, multi-region) |
 | `./do/export` | Export project configuration as portable archive |
-| `./do/validate` | Validate project structure and configuration |
+| `./do/validate` | Target-aware pre-deploy checks (right-sizing, config, cluster contract, SageMaker payloads); `--format json` for CI |
 | `./do/run` | Run container locally (docker run) |
 | `./do/logs` | Tail CloudWatch logs for endpoint |
 | `./do/status` | Show endpoint/IC status and health |

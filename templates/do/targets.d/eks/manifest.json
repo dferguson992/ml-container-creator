@@ -28,6 +28,7 @@
     "EKS_INFERENCE_ROLE_ARN"
   ],
   "serving_config_source": "kubernetes",
+  "cluster_contract": { "script": "lib/eks-contract.sh", "entry": "_eks_contract_preflight" },
   "adapter_delivery": { "strategy": "model-prefix", "mount_path": "/opt/ml/model", "subdir": ".mlcc-adapters" },
   "verbs": {
     "optimize": false,

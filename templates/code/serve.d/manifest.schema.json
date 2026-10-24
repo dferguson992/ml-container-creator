@@ -87,6 +87,25 @@
       "additionalProperties": { "type": "string", "minLength": 1 },
       "description": "Maps a benchmark dimension to an engine config key / flag suffix. Combined with env_var_prefix to yield the full config key."
     },
+    "sizing_map": {
+      "type": "object",
+      "description": "Wave 8 (right-sizing, R1.3): engine settings the deploy-fit checks (do/lib/python/right_sizing.py) read that are NOT benchmark dimensions (so they stay out of dimension_map and its regenerate / optimize consumers). Keyed by an MLCC-stable sizing input name (e.g. gpu_memory_utilization, max_num_seqs, dtype, tensor_parallel_degree); `suffix` composes the env var with env_var_prefix, `default` is the value the engine uses when the var is unset (omit when it varies by engine version / hardware, so the check reports it as unknown rather than guessing).",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "suffix": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+          "default": { "type": ["number", "string"] },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "quantization_methods": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "description": "Wave 8 (right-sizing quant-engine check): quantization methods this engine accepts for its quantization setting. Optional: when absent, the quant-engine check reports `skip` (MLCC never guesses an engine's support list)."
+    },
     "capability_map": {
       "type": "object",
       "description": "ADR-010 Tier-1 config contract: how THIS engine expresses each capability MLCC computes and injects (model, tensor-parallel degree, LoRA + companions). Keyed by an MLCC-stable snake_case capability name; the KEY SET IS OPEN by design (plugin-first) — the schema governs each ENTRY's shape, not a closed list of allowed capabilities, so a custom serve.d/<engine>/ plugin can declare its own capability/companion contract without this schema growing a new key. Everything OUTSIDE this map is Tier-2 prefix pass-through and needs no declaration. The full env var is env_var_prefix + suffix.",

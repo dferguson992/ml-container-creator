@@ -24,6 +24,12 @@
     "max_model_len": "MAX_MODEL_LEN",
     "kv_cache_dtype": "KV_CACHE_DTYPE"
   },
+  "sizing_map": {
+    "gpu_memory_utilization": { "suffix": "GPU_MEMORY_UTILIZATION", "default": 0.92, "description": "vLLM v0.31 (MLCC's pinned image) logs --gpu-memory-utilization=0.92 when unset; older releases used 0.9" },
+    "max_num_seqs": { "suffix": "MAX_NUM_SEQS", "description": "no default: vLLM picks it by release and GPU" },
+    "dtype": { "suffix": "DTYPE", "default": "auto" },
+    "tensor_parallel_degree": { "suffix": "TENSOR_PARALLEL_SIZE", "default": 1 }
+  },
   "capability_map": {
     "model": { "suffix": "MODEL", "value_type": "valued" },
     "tensor_parallel_degree": { "suffix": "TENSOR_PARALLEL_SIZE", "value_type": "valued" },
