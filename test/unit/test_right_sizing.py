@@ -170,7 +170,8 @@ def test_explicit_rank_over_cap_only_warns():
 
 def test_memory_check_skips_without_inputs():
     findings = rs.check_lora_buffer_memory(_ctx(model_config=None, serving_rank_limit=64))
-    assert [f.severity for f in findings] == ["info"]
+    # Wave 8: missing inputs report the dedicated `skip` severity (6.1 used info).
+    assert [f.severity for f in findings] == ["skip"]
     assert "model config.json" in findings[0].message
 
 

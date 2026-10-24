@@ -298,8 +298,8 @@ All generated projects include these `do/` scripts:
 | `./do/push` | Push image to Amazon ECR |
 | `./do/run` | Run container locally on port 8080 |
 | `./do/test` | Test local container or deployed endpoint |
-| `./do/validate` | Validate configuration against AWS service models (requires schema sync) |
-| `./do/deploy` | Deploy to the configured deployment target. Flags: `--optimize` (run `do/benchmark --recommend --apply` before deploying), `--no-optimize` (skip optimization), `--force-ic` (force new IC even if one exists), `--dry-run` (validate only) |
+| `./do/validate` | Target-aware pre-deploy checks: right-sizing (GPU memory fit), config consistency, the cluster contract on `hyperpod-eks` / `eks`, and SageMaker payload shapes on SageMaker targets (after `bootstrap sync-schemas`) |
+| `./do/deploy` | Deploy to the configured deployment target. Flags: `--optimize` (run `do/benchmark --recommend --apply` before deploying), `--no-optimize` (skip optimization), `--force-ic` (force new IC even if one exists), `--force` (redeploy an already-deployed target), `--ignore-sizing` (proceed past a right-sizing block), `--dry-run` (validate only) |
 | `./do/tune` | Fine-tune using SageMaker AI Managed Model Customization (serverless) |
 | `./do/train` | Custom training jobs with your own scripts and hyperparameters |
 | `./do/adapter` | LoRA adapter lifecycle (add, list, remove, update) |
@@ -376,17 +376,44 @@ For the full contract behind these codes, see the developer guide:
 
 ### Pre-Deploy Validation
 
-Run `./do/validate` before deploying to catch configuration issues that would cause AWS API failures:
+Run `./do/validate` before deploying. It reads the configured `DEPLOYMENT_TARGET`
+and runs every check that applies to it (derived from the target's descriptor in
+`do/targets.d/`), then prints one report:
+
+| Section | Targets | What it checks |
+|---|---|---|
+| Right-sizing | all | KV cache + weights (+ LoRA buffer, draft model) vs GPU memory, context limit, TP vs GPUs and heads, dtype vs GPU architecture, LoRA rank, IC packing, disk, Service Quota. See [Right-Sizing Checks](architecture/right-sizing.md). |
+| Config consistency | all | required `do/config` settings for the target (an empty one warns: `do/deploy` prompts for it), `do/ic/*.conf` values |
+| Cluster contract | `hyperpod-eks`, `eks` | the same read-only cluster checks the deploy driver runs (CSI driver, pod identity, storage backing). Needs kubectl access to the cluster; skipped with the reason otherwise. |
+| SageMaker payloads | `realtime-inference`, `async-inference`, `batch-transform` | request shapes against the AWS service models. Skipped (not an error) until you run `ml-container-creator bootstrap sync-schemas`. |
 
 ```bash
-./do/validate                # Text output, exit 1 on errors
-./do/validate --format=json  # JSON output for CI pipelines
-./do/validate --smart        # Include smart-mode advisory findings
+./do/validate                # Text report
+./do/validate --format json  # JSON report for CI (--format=json also works)
+./do/validate --smart        # Include smart-mode advisory findings (live AWS lookups)
+./do/validate --offline      # Skip network-only checks (Service Quota lookup)
 ```
 
-This validates your `do/config` values against the AWS service model, checking enum constraints, type correctness, required fields, and cross-cutting consistency (GPU counts, tensor parallelism, CUDA compatibility). See [Configuration — Schema-Driven Validation](configuration.md#schema-driven-validation) for setup instructions.
+Exit codes: `0` no errors, `1` errors (including a right-sizing block or a
+cluster-contract miss), `2` could not run (no `DEPLOYMENT_TARGET`, unknown target).
 
-The `./do/deploy --dry-run` flag also runs schema validation as part of its pre-flight checks and blocks deployment if errors are found.
+#### Right-sizing preflight in `do/deploy`
+
+`./do/deploy` runs the same right-sizing checks before it creates or applies
+anything. When the configuration clearly cannot fit (for example a 131,072-token
+context whose KV cache plus weights exceed GPU memory), the deploy stops in
+seconds with the numbers and a computed fix, instead of failing a health check
+many minutes later:
+
+```
+❌ [context-memory] max_model_len 131,072 needs ~32.9 GiB ... usable 28.8 GiB ... — over usable memory.
+   Fix: set VLLM_MAX_MODEL_LEN=63488 or lower ...; use <larger instance> for 131,072 tokens
+```
+
+To proceed anyway, pass `--ignore-sizing` (a warning line is printed). It also
+overrides the LoRA rank / buffer refusal in the `eks` and `hyperpod-eks` drivers.
+`--force` does not bypass right-sizing; it only redeploys a target that is already
+deployed.
 
 ### Pre-Deploy Optimization
 

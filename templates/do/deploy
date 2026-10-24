@@ -202,6 +202,13 @@ while [ $# -gt 0 ]; do
             FLAG_DRY_RUN=1
             shift
             ;;
+        --ignore-sizing)
+            # Wave 8 (OQ-8.7): override a right-sizing BLOCK (preflight + the
+            # eks / hyperpod-eks LoRA rank refusal). Parsed here, never a schema
+            # parameter; --force keeps its own meaning and does NOT bypass sizing.
+            FLAG_IGNORE_SIZING=1
+            shift
+            ;;
         --help|-h)
             echo "Usage: ./do/deploy [--target <mode>] [OPTIONS]"
             echo ""
@@ -223,6 +230,12 @@ while [ $# -gt 0 ]; do
             echo "  --status                Show deployment state for all targets; no deployment"
             echo "  --dry-run               Show resolved config without deploying"
             echo "  --reconfigure           Re-prompt all deployment settings for active target"
+            echo "  --force                 Redeploy a target that is already deployed (right-sizing"
+            echo "                          checks still run)"
+            echo "  --ignore-sizing         Proceed even when the right-sizing preflight blocks"
+            echo "                          (KV cache + weights over GPU memory, context limit, TP,"
+            echo "                          dtype vs GPU, LoRA rank/buffer, ...). Prints a warning."
+            echo "                          See docs/architecture/right-sizing.md"
             echo ""
             echo "Managed / Async Inference flags:"
             echo "  --endpoint-name <name>      Endpoint name (default: \${PROJECT_NAME}-ep)"
@@ -877,6 +890,40 @@ case "${DEPLOYMENT_TARGET}" in
         export INSTANCE_TYPE="${HP_INSTANCE_TYPE:-${INSTANCE_TYPE:-}}"
         ;;
 esac
+
+# ── Right-sizing preflight (Wave 8 R3.1, OQ-8.1 / OQ-8.7) ─────────────────────
+# One shared module (do/lib/python/right_sizing.py `check`) decides whether this
+# serving configuration fits BEFORE any per-target create/apply: KV cache +
+# weights (+ LoRA buffer, + draft) vs usable GPU memory, context limit, TP vs
+# GPUs/heads, dtype vs GPU architecture, LoRA rank / buffer, IC packing, ...
+# Applies to every target with a targets.d descriptor; the module itself skips
+# (exit 0) when the instance is not a catalogued GPU instance. Exit 2 = block:
+# stop (exit 1) unless --ignore-sizing. --force does NOT bypass it. stderr is
+# never swallowed. The k8s drivers then only ask for the rank VALUE (--quiet).
+if python3 "${SCRIPT_DIR}/lib/python/target_manifest.py" family "${DEPLOYMENT_TARGET}" >/dev/null 2>&1; then
+    echo "📏 Right-sizing preflight (${DEPLOYMENT_TARGET}, ${INSTANCE_TYPE:-no instance type})..."
+    _SIZING_RC=0
+    DEPLOYMENT_TARGET="${DEPLOYMENT_TARGET}" INSTANCE_TYPE="${INSTANCE_TYPE:-}" \
+        python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" check || _SIZING_RC=$?
+    case "${_SIZING_RC}" in
+        0) echo "✅ Right-sizing: fits." ;;
+        1) echo "⚠️  Right-sizing: warnings above; proceeding." ;;
+        2)
+            if [ "${FLAG_IGNORE_SIZING:-0}" -eq 1 ]; then
+                echo "⚠️  --ignore-sizing: proceeding despite the right-sizing block above (the deploy may fail at start)."
+            else
+                echo "❌ Right-sizing blocked this deploy (see the findings above). Nothing was created or applied." >&2
+                echo "   Apply a fix above, or override at your own risk: ./do/deploy --ignore-sizing" >&2
+                exit 1
+            fi
+            ;;
+        *) echo "⚠️  Right-sizing check could not run (exit ${_SIZING_RC}); proceeding without it." >&2 ;;
+    esac
+    export MLCC_SIZING_PREFLIGHT_DONE=1
+fi
+if [ "${FLAG_IGNORE_SIZING:-0}" -eq 1 ]; then
+    export MLCC_IGNORE_SIZING=1
+fi
 
 # ── BL166: ensure the per-project MLflow experiment exists at first touch ──
 # Deploy is a lifecycle entry point too (OQ-1): a deploy-a-pre-existing-model flow

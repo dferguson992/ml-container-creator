@@ -14,6 +14,7 @@
   },
   "runtime_owned_vars": ["DEPLOYMENT_TARGET_ASYNC_STATUS"],
   "serving_config_source": "sagemaker-ic",
+  "service_quota_usage": "endpoint usage",
   "verbs": {
     "optimize": false,
     "add-ic": false,

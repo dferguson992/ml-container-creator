@@ -39,6 +39,7 @@ Subcommands (all print one JSON object on stdout; human notes on stderr):
       pod down — R4.2). If the surge instance never joined, UpdateCluster sets the
       target back to N instead. Never goes below N; never scales to zero.
 
+  preflight-env   (same preflight; inputs from do/config env — do/validate)
   preflight --cluster C --namespace NS --project P --model-source S
             [--model-bucket B] [--lora-delivery true|false] [--eks-cluster E]
       R6, read-only: S3 CSI driver present; the model source is S3 when LoRA
@@ -471,6 +472,20 @@ def preflight(cluster: str, namespace: str, project: str, model_source: str,
     return {"findings": findings}
 
 
+def preflight_from_env(env: dict | None = None) -> dict:
+    """The same read-only R6 preflight, with its inputs read from do/config-style
+    env (Wave 8 R5.3: do/validate calls it through the hyperpod-eks descriptor's
+    cluster_contract). The model source follows the driver's resolution: an
+    explicit HP_MODEL_SOURCE, else s3 for an S3-staged model, else huggingface."""
+    env = dict(os.environ) if env is None else env
+    staged = (env.get("STAGED_MODEL_PATH") or "").strip()
+    source = (env.get("HP_MODEL_SOURCE") or "").strip() or ("s3" if staged.startswith("s3://") else "huggingface")
+    bucket = staged[len("s3://"):].split("/", 1)[0] if source == "s3" and staged.startswith("s3://") else ""
+    return preflight(env.get("HP_CLUSTER_NAME", ""), env.get("HP_NAMESPACE") or "default",
+                     env.get("PROJECT_NAME", ""), source, bucket,
+                     (env.get("HP_LORA_ENABLED") or "").lower() == "true", env.get("EKS_CLUSTER_NAME", ""))
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 
@@ -512,6 +527,7 @@ def _cli(argv: list[str]) -> int:
     f.add_argument("--model-bucket", default="")
     f.add_argument("--lora-delivery", default="false")
     f.add_argument("--eks-cluster", default="")
+    sub.add_parser("preflight-env")
     args = p.parse_args(argv)
 
     if args.cmd == "rollout-capacity":
@@ -524,6 +540,8 @@ def _cli(argv: list[str]) -> int:
         rc, out = rollout_wait(args.namespace, args.project, args.replicas, args.timeout, args.interval)
     elif args.cmd == "surge-restore":
         rc, out = surge_restore(args.cluster, args.group, args.original_count, args.namespace, args.project)
+    elif args.cmd == "preflight-env":
+        rc, out = 0, preflight_from_env()
     else:
         rc, out = 0, preflight(args.cluster, args.namespace, args.project, args.model_source,
                                args.model_bucket, args.lora_delivery == "true", args.eks_cluster)

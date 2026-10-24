@@ -51,7 +51,8 @@ export function makeSandbox({ scripts = [], config = '', pyHelpers = false } = {
     // delivery + right-sizing, plus the descriptors they read (targets.d under
     // do/, serve.d under .mlcc/ — the generated-project layout).
     if (pyHelpers) {
-        for (const py of ['adapter_delivery.py', 's3_layout.py', 'right_sizing.py', 'serve_manifest.py', 'target_manifest.py', 'hyperpod_ops.py']) {
+        // instance_sizer.py: right_sizing.py imports its weights-estimate constants (Wave 8, OQ-8.9).
+        for (const py of ['adapter_delivery.py', 's3_layout.py', 'right_sizing.py', 'serve_manifest.py', 'target_manifest.py', 'hyperpod_ops.py', 'instance_sizer.py']) {
             writeFileSync(join(pyDir, py), readFileSync(join(DO_SRC, 'lib/python', py)));
         }
         cpSync(join(DO_SRC, 'targets.d'), join(doDir, 'targets.d'), { recursive: true });

@@ -28,6 +28,8 @@ CLI (one-shot, for bash callers):
     aliases | required_vars | runtime_owned_vars — prints a JSON array
     optional_vars | verbs — prints a JSON object
     adapter_delivery  — prints the JSON object (or {} when the target declares none)
+    cluster_contract  — prints the JSON object (or {} when the target declares none)
+    service_quota_usage — prints the Service Quotas usage suffix (or "")
     resolve           — resolves an alias to its canonical target name
 
   <target> accepts a canonical name OR an alias (resolved via `aliases`).
@@ -197,10 +199,18 @@ def adapter_delivery(target: str, targets_dir: str | None = None) -> dict:
     return dict(read_manifest(target, targets_dir).get("adapter_delivery") or {})
 
 
+def cluster_contract(target: str, targets_dir: str | None = None) -> dict:
+    """Return the target's read-only cluster-contract preflight declaration
+    (Wave 8 R5.3: {script, entry}), or {} when the target has none."""
+    return dict(read_manifest(target, targets_dir).get("cluster_contract") or {})
+def service_quota_usage(target: str, targets_dir: str | None = None) -> str:
+    """Return the SageMaker Service Quotas usage suffix for the target's
+    instances (e.g. 'endpoint usage'), or '' when capacity is cluster-provided."""
+    return str(read_manifest(target, targets_dir).get("service_quota_usage") or "")
 # ── CLI one-shot for bash callers ──────────────────────────────────────────────
 
 _ARRAY_FIELDS = {"aliases", "required_vars", "runtime_owned_vars"}
-_OBJECT_FIELDS = {"optional_vars", "verbs", "adapter_delivery"}
+_OBJECT_FIELDS = {"optional_vars", "verbs", "adapter_delivery", "cluster_contract"}
 _STRING_FIELDS = {
     "target",
     "status_var",
@@ -210,6 +220,7 @@ _STRING_FIELDS = {
     "deploy_script",
     "clean_script",
     "serving_config_source",
+    "service_quota_usage",
 }
 
 

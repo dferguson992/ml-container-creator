@@ -666,12 +666,24 @@ _HP_CAP_DEFAULTS="$(python3 "${SCRIPT_DIR}/lib/python/serve_manifest.py" capabil
 _HP_EFFECTIVE_RANK=""
 if [ "${_HP_LORA_ON:-false}" = "true" ]; then
     _HP_RANK_RC=0
-    _HP_RANK_JSON="$(python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" effective-lora-rank)" || _HP_RANK_RC=$?
+    # Wave 8: the do/deploy preflight already ran `right_sizing.py check` and
+    # printed every finding (incl. these), so ask only for the rank VALUE
+    # (--quiet) instead of re-reporting. A block is still honored here (a
+    # driver sourced without the preflight), and --ignore-sizing (OQ-8.7,
+    # MLCC_IGNORE_SIZING=1 from do/deploy) overrides it like every sizing block.
+    _HP_RANK_QUIET=""
+    [ "${MLCC_SIZING_PREFLIGHT_DONE:-0}" = "1" ] && _HP_RANK_QUIET="--quiet"
+    _HP_RANK_JSON="$(python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" effective-lora-rank ${_HP_RANK_QUIET})" || _HP_RANK_RC=$?
     if [ "${_HP_RANK_RC}" -eq 2 ]; then
-        echo "❌ LoRA right-sizing refused this deploy (see the finding above)." >&2
-        echo "   Nothing was applied; the running deployment is unchanged." >&2
+        if [ "${MLCC_IGNORE_SIZING:-0}" = "1" ]; then
+            echo "⚠️  --ignore-sizing: proceeding despite the LoRA right-sizing block." >&2
+        else
+            echo "❌ LoRA right-sizing refused this deploy (see the finding above)." >&2
+            echo "   Nothing was applied; the running deployment is unchanged." >&2
+            echo "   Override (at your own risk): ./do/deploy --target hyperpod-eks --ignore-sizing" >&2
         _update_config "DEPLOYMENT_TARGET_HP_STATUS" "Failed" 2>/dev/null || true
-        exit 1
+            exit 1
+        fi
     fi
     _HP_EFFECTIVE_RANK="$(printf '%s' "${_HP_RANK_JSON}" | python3 -c 'import json,sys; r=json.load(sys.stdin).get("rank"); print("" if r is None else r)' 2>/dev/null || echo "")"
     if [ -n "${_HP_EFFECTIVE_RANK}" ]; then

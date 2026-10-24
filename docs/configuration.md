@@ -460,14 +460,14 @@ Schema validation runs at two points:
 
 **At generation time (non-blocking):** After the generator produces deploy scripts, it validates the constructed payloads and prints any issues as warnings. Generation still completes — this is informational.
 
-**At pre-deploy time (blocking):** Run `./do/validate` before deploying to catch all issues, including those introduced by manual edits to `do/config` after generation.
+**At pre-deploy time (blocking):** Run `./do/validate` before deploying to catch all issues, including those introduced by manual edits to `do/config` after generation. The service-model payload check runs only on SageMaker targets (`realtime-inference`, `async-inference`, `batch-transform`); `do/validate` also runs the right-sizing, config and (on `hyperpod-eks` / `eks`) cluster-contract checks on every target. See [Pre-Deploy Validation](deployments.md#pre-deploy-validation).
 
 ```bash
 # Run full schema validation
 ./do/validate
 
 # JSON output for CI integration
-./do/validate --format=json
+./do/validate --format json
 
 # Include smart-mode validators (future MCP integration)
 ./do/validate --smart
