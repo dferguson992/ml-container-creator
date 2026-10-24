@@ -6,7 +6,9 @@
  * kubectl / lora_vllm.py / .register_helper.py.
  *
  *   R5 / BL169  the k8s path ACCEPTS --from-* (was refused), resolves through the
- *               shared resolver, and hot-loads RESOLVED_URI via lora_vllm.py
+ *               shared resolver, and hot-loads it via lora_vllm.py — Wave 6.1
+ *               (BL189): by its IN-POD path under the model mount, never s3://;
+ *               every Running pod (R1.6); rank pre-check vs the live limit (R3.2)
  *   R5.3 / R8.5 a full_model is refused on do/adapter; a lora_adapter on do/add-ic
  *   R2 / R8.3   --weights / --model-data are deprecated aliases of --from-weights
  *               (same resolved source + the notice); --model-data-url is untouched
@@ -20,35 +22,63 @@ import { join } from 'node:path';
 import { makeSandbox, runBash, sandboxEnv, ACTIVE_STATUS_CONFIG, REPO } from '../helpers/additive-sandbox.js';
 
 const AWS_STUB = `#!/bin/bash
-# Stub aws CLI: cluster lookups succeed, every S3 probe fails (advisory sniff → unknown).
+# Stub aws CLI: cluster lookups succeed. S3 reads fail (advisory sniff → unknown)
+# unless STUB_RANK is set, in which case adapter_config.json reads return r=STUB_RANK.
 case "$1 $2" in
   "sagemaker describe-cluster") echo "arn:aws:eks:us-west-2:111122223333:cluster/hp-eks" ;;
   "eks update-kubeconfig") exit 0 ;;
+  "s3 cp")
+    if [ -n "\${STUB_RANK:-}" ] && [[ "$3" == */adapter_config.json ]]; then
+      echo "{\\"r\\": \${STUB_RANK}, \\"rank_pattern\\": {}}"; exit 0
+    fi
+    echo "stub aws: $*" >&2; exit 1 ;;
   *) echo "stub aws: $*" >&2; exit 1 ;;
 esac
 `;
+// kubectl stub (Wave 6.1): Running pod names (STUB_PODS), pod JSON carrying the
+// live VLLM_MAX_LORA_RANK (STUB_LIVE_RANK), and the live InferenceEndpointConfig
+// (S3 model source s3://core/models/m, prefetch STUB_PREFETCH; STUB_SOURCE=huggingface
+// for an HF-sourced deployment).
 const KUBECTL_STUB = `#!/bin/bash
-case "$1" in
-  get) echo "proj-pod-0" ;;
-  port-forward) exec sleep 30 ;;
-  *) exit 1 ;;
+pods="\${STUB_PODS:-proj-pod-0}"
+case "$1 $2" in
+  "get inferenceendpointconfig")
+    if [ "\${STUB_SOURCE:-s3}" = "huggingface" ]; then
+      echo '{"spec":{"modelSourceConfig":{"modelSourceType":"huggingface","prefetchEnabled":true}}}'
+    else
+      echo "{\\"spec\\":{\\"modelSourceConfig\\":{\\"modelSourceType\\":\\"s3\\",\\"s3Storage\\":{\\"bucketName\\":\\"core\\"},\\"modelLocation\\":\\"models/m\\",\\"prefetchEnabled\\":\${STUB_PREFETCH:-false}}}}"
+    fi ;;
+  "get pod")
+    case " $* " in
+      *" -o json "*)
+        echo "{\\"items\\":[{\\"spec\\":{\\"containers\\":[{\\"env\\":[{\\"name\\":\\"VLLM_MAX_LORA_RANK\\",\\"value\\":\\"\${STUB_LIVE_RANK:-64}\\"}]}]}}]}" ;;
+      *) for p in $pods; do echo "$p"; done ;;
+    esac ;;
+  port-forward*) exec sleep 30 ;;
+  *) case "$1" in port-forward) exec sleep 30 ;; *) exit 1 ;; esac ;;
 esac
 `;
-// lora_vllm.py stub: records every call; LORA_STUB selects the outcome.
+// lora_vllm.py stub: records every call; LORA_STUB selects the outcome;
+// LORA_FAIL_CALL=<n> fails the n-th load (multi-pod partial failure).
 const LORA_STUB = `#!/usr/bin/env python3
 import json, os, sys
 with open(os.environ["LORA_LOG"], "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\\n")
+with open(os.environ["LORA_LOG"]) as f:
+    n_loads = sum(1 for line in f if line.startswith("load "))
 mode = os.environ.get("LORA_STUB", "ok")
 cmd = sys.argv[1]
 if mode == "crash":
     print("Traceback (most recent call last):\\nModuleNotFoundError: No module named 'requests'", file=sys.stderr)
     sys.exit(1)
 if cmd == "list":
-    print(json.dumps([{"name": "a1", "path": "s3://b/a1/"}]))
+    print(json.dumps([{"name": "a1", "path": "/opt/ml/model/.mlcc-adapters/proj/a1"}]))
     sys.exit(0)
 if mode == "409" and cmd == "load":
     print(json.dumps({"success": False, "error": "adapter exists", "status_code": 409}))
+    sys.exit(1)
+if cmd == "load" and str(n_loads) == os.environ.get("LORA_FAIL_CALL", ""):
+    print(json.dumps({"success": False, "error": "boom", "status_code": 500}))
     sys.exit(1)
 print(json.dumps({"success": True}))
 `;
@@ -59,7 +89,6 @@ if os.environ.get("STUB_KIND"):
     md["mlcc.artifact_kind"] = os.environ["STUB_KIND"]
 print(json.dumps({"arn": "x", "version": "3", "modelDataUrl": os.environ.get("STUB_URI", "s3://b/reg/adapter/"), "metadata": md}))
 `;
-
 function k8sConfig(extra = []) {
     return [
         ACTIVE_STATUS_CONFIG,
@@ -69,17 +98,22 @@ function k8sConfig(extra = []) {
         'export HP_LORA_ENABLED="true"',
         'export HP_CLUSTER_NAME="hp"',
         'export HP_LOCAL_PORT="18080"',
+        'export HP_PF_WAIT="0"',
         ...extra,
         ''
     ].join('\n');
 }
-
-describe('Wave 6 — do/adapter on Kubernetes: --from-* hot-load (BL169 / R5)', function () {
+// The deployment's canonical adapter home (model prefix + .mlcc-adapters, from the
+// target descriptor) and the in-pod path it maps to.
+const PFX = 's3://core/models/m/.mlcc-adapters/proj';
+const POD = '/opt/ml/model/.mlcc-adapters/proj';
+const URL = 'http://localhost:18080';
+describe('Wave 6 / 6.1 — do/adapter on Kubernetes: --from-* sources, local-path hot-load (BL169 / BL189)', function () {
     this.timeout(120000);
     let sb;
     let log;
     before(() => {
-        sb = makeSandbox({ scripts: ['adapter'] });
+        sb = makeSandbox({ scripts: ['adapter'], pyHelpers: true });
         sb.write('bin/aws', AWS_STUB);
         sb.write('bin/kubectl', KUBECTL_STUB);
         sb.write('do/lib/python/lora_vllm.py', LORA_STUB);
@@ -87,7 +121,6 @@ describe('Wave 6 — do/adapter on Kubernetes: --from-* hot-load (BL169 / R5)', 
         log = join(sb.root, 'lora.log');
     });
     after(() => sb.cleanup());
-
     const run = (args, { config = [], env = {} } = {}) => {
         sb.write('do/config', k8sConfig(config), 0o644);
         sb.write('lora.log', '', 0o644);
@@ -95,37 +128,41 @@ describe('Wave 6 — do/adapter on Kubernetes: --from-* hot-load (BL169 / R5)', 
             sandboxEnv(sb, { HOME: sb.root, LORA_LOG: log, ...env }), { timeout: 30000 });
         return { ...r, calls: readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) };
     };
-
-    it('add --from-weights hot-loads the S3 URI straight through', () => {
-        const r = run(['add', 'ad1', '--from-weights', 's3://b/w/']);
+    it('add --from-weights under the model prefix hot-loads the IN-POD path (never s3://)', () => {
+        const r = run(['add', 'ad1', '--from-weights', `${PFX}/ad1/`]);
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
-        assert.deepStrictEqual(r.calls, ['load ad1 s3://b/w/ http://localhost:18080']);
-        assert.match(r.stdout, /loaded from s3:\/\/b\/w\//);
+        assert.deepStrictEqual(r.calls, [`load ad1 ${POD}/ad1 ${URL}`]);
+        assert.match(r.stdout, /Pod path: \/opt\/ml\/model\/\.mlcc-adapters\/proj\/ad1/);
     });
-
     it('--weights is a deprecated alias: same hot-load + the notice on stderr', () => {
-        const r = run(['add', 'ad1', '--weights', 's3://b/w/']);
+        const r = run(['add', 'ad1', '--weights', `${PFX}/ad1/`]);
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
-        assert.deepStrictEqual(r.calls, ['load ad1 s3://b/w/ http://localhost:18080']);
+        assert.deepStrictEqual(r.calls, [`load ad1 ${POD}/ad1 ${URL}`]);
         assert.match(r.stderr, /--weights is deprecated; use --from-weights/);
     });
-
-    it('headline: add --from-tune hot-loads the tuned LoRA (no hand-copied URI)', () => {
+    it('R1.3 (Part A): a source outside the model prefix is refused with the exact copy command, before any engine call', () => {
         const r = run(['add', 'tuned', '--from-tune'], {
             config: ['export TUNE_OUTPUT_PATH_LATEST="s3://b/tune/out/"', 'export TUNE_OUTPUT_TYPE_LATEST="adapter"']
         });
-        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
-        assert.deepStrictEqual(r.calls, ['load tuned s3://b/tune/out/ http://localhost:18080']);
-        assert.ok(!/Contract violation/.test(r.stdout), 'the k8s source-verb refusal must be gone');
+        assert.strictEqual(r.code, 1, r.stdout + r.stderr);
+        assert.deepStrictEqual(r.calls, [], 'no s3:// path may ever reach the engine');
+        assert.match(r.stdout, /outside this deployment's model prefix/);
+        assert.match(r.stdout, /aws s3 sync s3:\/\/b\/tune\/out\/ s3:\/\/core\/models\/m\/\.mlcc-adapters\/proj\/tuned\//);
+        assert.ok(!/Contract violation/.test(r.stdout), 'the k8s source-verb refusal must stay gone');
     });
-
-    it('add --from-registry hot-loads the registered adapter version', () => {
+    it('add --from-tune whose output is under the model prefix hot-loads it', () => {
+        const r = run(['add', 'tuned', '--from-tune'], {
+            config: [`export TUNE_OUTPUT_PATH_LATEST="${PFX}/tuned/"`, 'export TUNE_OUTPUT_TYPE_LATEST="adapter"']
+        });
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        assert.deepStrictEqual(r.calls, [`load tuned ${POD}/tuned ${URL}`]);
+    });
+    it('add --from-registry hot-loads the registered adapter version (mapped to the pod path)', () => {
         const r = run(['add', 'reg', '--from-registry', 'arn:aws:sagemaker:us-west-2:1:model-package/proj/3'],
-            { env: { STUB_KIND: 'lora_adapter' } });
+            { env: { STUB_KIND: 'lora_adapter', STUB_URI: `${PFX}/reg/` } });
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
-        assert.deepStrictEqual(r.calls, ['load reg s3://b/reg/adapter/ http://localhost:18080']);
+        assert.deepStrictEqual(r.calls, [`load reg ${POD}/reg ${URL}`]);
     });
-
     it('a full_model source is refused BEFORE any cluster call (kind gate, exit 3)', () => {
         const r = run(['add', 'full', '--from-tune'], {
             config: ['export TUNE_OUTPUT_PATH_LATEST="s3://b/tune/m/"', 'export TUNE_OUTPUT_TYPE_LATEST="model"']
@@ -137,34 +174,30 @@ describe('Wave 6 — do/adapter on Kubernetes: --from-* hot-load (BL169 / R5)', 
         assert.deepStrictEqual(r.calls, [], 'nothing may be hot-loaded');
         assert.ok(!/Port-forward/.test(r.stdout), 'refusal precedes the port-forward');
     });
-
     it('a registry full_model is refused too (any source)', () => {
         const r = run(['add', 'full', '--from-registry', 'arn:aws:sagemaker:us-west-2:1:model-package/proj/4'],
             { env: { STUB_KIND: 'full_model' } });
         assert.strictEqual(r.code, 3);
         assert.match(r.stdout, /Contract violation: artifact-kind/);
     });
-
     it('an unknown kind (raw S3) degrades to the content check and still loads', () => {
-        const r = run(['add', 'legacy', '--from-weights', 's3://b/legacy/']);
+        const r = run(['add', 'legacy', '--from-weights', `${PFX}/legacy/`]);
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
         assert.match(r.stderr, /artifact_kind unknown/);
         assert.match(r.stdout, /Content check/);
         assert.strictEqual(r.calls.length, 1);
     });
-
     it('update --from-weights unloads then loads; remove and list still work', () => {
-        const u = run(['update', 'ad1', '--from-weights', 's3://b/v2/']);
+        const u = run(['update', 'ad1', '--from-weights', `${PFX}/v2/`]);
         assert.strictEqual(u.code, 0, u.stdout + u.stderr);
-        assert.deepStrictEqual(u.calls, ['unload ad1 http://localhost:18080', 'load ad1 s3://b/v2/ http://localhost:18080']);
+        assert.deepStrictEqual(u.calls, [`unload ad1 ${URL}`, `load ad1 ${POD}/v2 ${URL}`]);
         const rm = run(['remove', 'ad1']);
         assert.strictEqual(rm.code, 0);
-        assert.deepStrictEqual(rm.calls, ['unload ad1 http://localhost:18080']);
+        assert.deepStrictEqual(rm.calls, [`unload ad1 ${URL}`]);
         const ls = run(['list']);
         assert.strictEqual(ls.code, 0);
-        assert.match(ls.stdout, /a1\s+s3:\/\/b\/a1\//);
+        assert.match(ls.stdout, /a1\s+\/opt\/ml\/model\/\.mlcc-adapters\/proj\/a1/);
     });
-
     it('rejects two sources at once and a missing source', () => {
         const both = run(['add', 'x', '--from-weights', 's3://b/w/', '--from-tune']);
         assert.strictEqual(both.code, 1);
@@ -173,30 +206,95 @@ describe('Wave 6 — do/adapter on Kubernetes: --from-* hot-load (BL169 / R5)', 
         assert.strictEqual(none.code, 1);
         assert.match(none.stdout, /requires a source/);
     });
-
     it('a failed resolution stops before the cluster with the resolver error', () => {
         const r = run(['add', 'x', '--from-tune', 'dpo']);
         assert.strictEqual(r.code, 1);
         assert.match(r.stderr, /Could not resolve --from-tune/);
         assert.deepStrictEqual(r.calls, []);
     });
-
+    describe('Wave 6.1 R1.4 — deployments that cannot take mounted adapters refuse with the fix', () => {
+        it('an HF-sourced hyperpod-eks deployment points at do/stage + redeploy', () => {
+            const r = run(['add', 'ad1', '--from-weights', `${PFX}/ad1/`], { env: { STUB_SOURCE: 'huggingface' } });
+            assert.strictEqual(r.code, 1, r.stdout + r.stderr);
+            assert.match(r.stdout, /not served from S3/);
+            assert.match(r.stdout, /\.\/do\/stage/);
+            assert.deepStrictEqual(r.calls, []);
+        });
+        it('a deployment still on prefetch points at the LoRA redeploy (and --surge-node)', () => {
+            const r = run(['add', 'ad1', '--from-weights', `${PFX}/ad1/`], { env: { STUB_PREFETCH: 'true' } });
+            assert.strictEqual(r.code, 1, r.stdout + r.stderr);
+            assert.match(r.stdout, /prefetchEnabled: true/);
+            assert.match(r.stdout, /--surge-node/);
+            assert.deepStrictEqual(r.calls, []);
+        });
+        it('plain eks without the S3 model mount names EKS_MODEL_MOUNT=s3', () => {
+            const r = run(['add', 'ad1', '--from-weights', `${PFX}/ad1/`], {
+                config: ['export DEPLOYMENT_TARGET="eks"', 'export DEPLOYMENT_TARGET_EKS_STATUS="Running"']
+            });
+            assert.strictEqual(r.code, 1, r.stdout + r.stderr);
+            assert.match(r.stdout, /EKS_MODEL_MOUNT=s3/);
+            assert.deepStrictEqual(r.calls, []);
+        });
+        it('plain eks WITH the S3 model mount maps under STAGED_MODEL_PATH', () => {
+            const r = run(['add', 'ad1', '--from-weights', `${PFX}/ad1/`], {
+                config: ['export DEPLOYMENT_TARGET="eks"', 'export DEPLOYMENT_TARGET_EKS_STATUS="Running"',
+                    'export EKS_MODEL_MOUNT="s3"', 'export STAGED_MODEL_PATH="s3://core/models/m/"']
+            });
+            assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+            assert.deepStrictEqual(r.calls, [`load ad1 ${POD}/ad1 ${URL}`]);
+        });
+    });
+    describe('Wave 6.1 R1.6 — every Running pod', () => {
+        it('loads on each pod and reports per pod', () => {
+            const r = run(['add', 'ad1', '--from-weights', `${PFX}/ad1/`], { env: { STUB_PODS: 'p0 p1' } });
+            assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+            assert.deepStrictEqual(r.calls, [`load ad1 ${POD}/ad1 ${URL}`, `load ad1 ${POD}/ad1 ${URL}`]);
+            assert.match(r.stdout, /pod\/p0/);
+            assert.match(r.stdout, /pod\/p1/);
+            assert.match(r.stdout, /2\/2 succeeded/);
+        });
+        it('a failure on any pod exits non-zero and names the pod', () => {
+            const r = run(['add', 'ad1', '--from-weights', `${PFX}/ad1/`], { env: { STUB_PODS: 'p0 p1', LORA_FAIL_CALL: '2' } });
+            assert.strictEqual(r.code, 1, r.stdout + r.stderr);
+            assert.strictEqual(r.calls.length, 2, 'the second pod is still attempted');
+            assert.match(r.stdout, /1\/2 succeeded/);
+            assert.match(r.stdout, /✗ pod\/p1/);
+        });
+        it('remove unloads from every pod', () => {
+            const r = run(['remove', 'ad1'], { env: { STUB_PODS: 'p0 p1 p2' } });
+            assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+            assert.strictEqual(r.calls.length, 3);
+        });
+    });
+    describe('Wave 6.1 R3.2 — rank pre-check against the LIVE limit, before any engine call', () => {
+        it('an adapter above the live max_lora_rank is refused with the exact fix', () => {
+            const r = run(['add', 'big', '--from-weights', `${PFX}/big/`], { env: { STUB_RANK: '128', STUB_LIVE_RANK: '64' } });
+            assert.strictEqual(r.code, 1, r.stdout + r.stderr);
+            assert.deepStrictEqual(r.calls, [], 'the engine is never called');
+            assert.match(r.stdout, /Rank check: adapter r128 vs serving max_lora_rank 64 \(pod env\)/);
+            assert.match(r.stdout, /VLLM_MAX_LORA_RANK=128/);
+            assert.match(r.stdout, /\.\/do\/deploy --target hyperpod-eks --force/);
+        });
+        it('an adapter within the live limit loads', () => {
+            const r = run(['add', 'ok', '--from-weights', `${PFX}/ok/`], { env: { STUB_RANK: '32', STUB_LIVE_RANK: '64' } });
+            assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+            assert.strictEqual(r.calls.length, 1);
+        });
+    });
     describe('BL165 — hot-load helper failures are surfaced (R9.1 / R8.6)', () => {
         it('a crashing lora_vllm.py shows its traceback + guidance (no silent exit)', () => {
-            const r = run(['add', 'ad1', '--from-weights', 's3://b/w/'], { env: { LORA_STUB: 'crash' } });
+            const r = run(['add', 'ad1', '--from-weights', `${PFX}/ad1/`], { env: { LORA_STUB: 'crash' } });
             assert.strictEqual(r.code, 1);
             assert.match(r.stdout, /lora_vllm\.py load failed/);
             assert.match(r.stdout, /No module named 'requests'/);
             assert.match(r.stdout, /Failed to load LoRA adapter 'ad1'/);
         });
-
         it('a vLLM 409 is reported as already-exists (previously aborted by set -e before the message)', () => {
-            const r = run(['add', 'ad1', '--from-weights', 's3://b/w/'], { env: { LORA_STUB: '409' } });
+            const r = run(['add', 'ad1', '--from-weights', `${PFX}/ad1/`], { env: { LORA_STUB: '409' } });
             assert.strictEqual(r.code, 1);
             assert.match(r.stdout, /already exists/);
             assert.match(r.stdout, /do\/adapter remove ad1/);
         });
-
         it('a crashing list helper is an error, not "No LoRA adapters loaded"', () => {
             const r = run(['list'], { env: { LORA_STUB: 'crash' } });
             assert.strictEqual(r.code, 1);
@@ -205,7 +303,6 @@ describe('Wave 6 — do/adapter on Kubernetes: --from-* hot-load (BL169 / R5)', 
         });
     });
 });
-
 describe('Wave 6 — do/adapter (SMAI) --weights deprecated alias (R2.2)', function () {
     this.timeout(60000);
     it('add --weights prints the notice and parses as --from-weights', () => {

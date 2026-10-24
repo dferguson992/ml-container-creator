@@ -83,6 +83,11 @@ def derive_served_model() -> str:
     source serves under its ``MODEL_NAME``. The served-model name is the routing
     key the pod matches, so it must equal what the serving container registered.
     """
+    # Wave 6.1 R7c: do/benchmark --adapter <name> exports BENCHMARK_SERVED_MODEL so
+    # every request names the LoRA adapter (vLLM routes by model name).
+    adapter = _env("BENCHMARK_SERVED_MODEL")
+    if adapter:
+        return adapter
     model_name = _env("MODEL_NAME")
     if model_name.startswith("s3://") or model_name.startswith("/opt/ml/"):
         return "/opt/ml/model"

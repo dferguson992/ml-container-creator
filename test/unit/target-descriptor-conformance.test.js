@@ -33,10 +33,13 @@ import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import Ajv from 'ajv/dist/2020.js';
 import {
     listTargets,
     allDescriptors,
-    statusVarToAnswerKey
+    statusVarToAnswerKey,
+    adapterDelivery
 } from '../../src/lib/target-manifest-reader.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -263,5 +266,42 @@ describe('target-descriptor conformance (ADR-008 T3 — safety net)', () => {
                 }
             }
         }
+    });
+});
+
+describe('Wave 6.1 R1.1 — adapter_delivery is declared in the descriptor and read by every consumer', () => {
+    const schema = JSON.parse(read('templates/do/targets.d/manifest.schema.json'));
+    const validate = new Ajv({ allErrors: true, strict: false }).compile(schema);
+    for (const d of descriptors) {
+        it(`${d.target} descriptor validates against targets.d/manifest.schema.json`, () => {
+            assert.ok(validate(d), JSON.stringify(validate.errors));
+        });
+    }
+    const k8sAdapterTargets = descriptors.filter((d) => d.family === 'kubernetes' && d.verbs && d.verbs.adapter);
+    it('every kubernetes target that supports do/adapter declares a model-prefix delivery', () => {
+        assert.ok(k8sAdapterTargets.length >= 2, 'hyperpod-eks and eks');
+        for (const d of k8sAdapterTargets) {
+            const ad = adapterDelivery(d.target);
+            assert.strictEqual(ad.strategy, 'model-prefix', d.target);
+            assert.match(ad.mount_path, /^\//);
+            assert.ok(ad.subdir, d.target);
+        }
+    });
+    it('the Python reader (target_manifest.py adapter_delivery) agrees with the Node reader', () => {
+        const py = process.env.MLCC_PYTHON || 'python3';
+        for (const d of descriptors) {
+            const r = spawnSync(py, [join(ROOT, 'templates/do/lib/python/target_manifest.py'), 'adapter_delivery', d.target],
+                { encoding: 'utf8' });
+            assert.strictEqual(r.status, 0, r.stderr);
+            assert.deepStrictEqual(JSON.parse(r.stdout), adapterDelivery(d.target), d.target);
+        }
+    });
+    it('consumers read the descriptor instead of hardcoding the path', () => {
+        const adapter = read('templates/do/adapter');
+        assert.match(adapter, /adapter_delivery\.py" local-path/);
+        assert.ok(!/\/opt\/ml\/model\/\.mlcc-adapters/.test(adapter.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n')),
+            'do/adapter must not hardcode the in-pod adapter path');
+        assert.match(read('templates/do/lib/python/adapter_delivery.py'), /target_manifest\.adapter_delivery\(/);
+        assert.match(read('templates/do/deploy.d/hyperpod-eks'), /target_manifest\.py" adapter_delivery hyperpod-eks/);
     });
 });

@@ -400,6 +400,20 @@ _run_eks_aiperf_benchmark() {
         exit 1
     fi
 
+    # Wave 6.1 R7c.1/R7c.2: --adapter sends "model": "<adapter>" in every AIPerf
+    # request (vLLM routes by model name), after confirming the adapter is loaded.
+    if [ -n "${ADAPTER_ARG:-}" ]; then
+        local _eks_models
+        _eks_models=$(curl -s -m 30 "http://localhost:${_EKS_LOCAL_PORT}/v1/models" 2>/dev/null || echo "")
+        if ! printf '%s' "${_eks_models}" | ADAPTER="${ADAPTER_ARG}" python3 -c 'import json,os,sys; ids=[m.get("id") for m in json.load(sys.stdin).get("data",[])]; sys.exit(0 if os.environ["ADAPTER"] in ids else 1)' 2>/dev/null; then
+            echo "❌ do/benchmark: adapter '${ADAPTER_ARG}' is not loaded on pod/${_EKS_POD} (/v1/models)."
+            echo "   Load it first: ./do/adapter add ${ADAPTER_ARG} --from-weights s3://..."
+            kill "${_EKS_PF_PID}" 2>/dev/null || true
+            exit 1
+        fi
+        echo "✅ Adapter '${ADAPTER_ARG}' is loaded — requests will name it"
+        export BENCHMARK_SERVED_MODEL="${ADAPTER_ARG}"
+    fi
     # Per-run output dir mirrors the SageMaker path's benchmarks/<job>/output/
     # layout so the multi-level sweep + aggregator find the jsonl unchanged.
     local _EKS_JOB_DIR="${SCRIPT_DIR}/../benchmarks/${BENCHMARK_JOB_NAME}"
@@ -684,6 +698,19 @@ while [ $# -gt 0 ]; do
 done
 
 
+# ── Wave 6.1 R7c: --adapter on hyperpod-eks must target the adapter, or refuse ──
+# hyperpod-eks runs the MANAGED SageMaker AI benchmark against the operator's
+# endpoint. Its workload spec has no request model-name parameter (the documented
+# `parameters` set has tokenizer/concurrency/... but no model field, and unknown
+# keys are rejected), so requests would hit the BASE model while the Athena row
+# said adapter_name=<adapter> (seen live, job fresh-ai-ml-benchmark-20261023-152219).
+# Refuse instead of mislabeling (R7c.1/R7c.3). eks runs AIPerf locally and does
+# send "model": "<adapter>" (see _run_eks_aiperf_benchmark).
+if [ -n "${ADAPTER_ARG}" ] && [ "${DEPLOYMENT_TARGET:-}" = "hyperpod-eks" ] && [ "${ARG_STATUS}" != true ]; then
+    _contract_violation "target" \
+        "do/benchmark --adapter is not supported on hyperpod-eks: the managed benchmark's workload spec cannot set the request model name, so requests would go to the base model and the result would be mislabeled '${ADAPTER_ARG}'." \
+        "Benchmark the base model (drop --adapter), verify the adapter with ./do/test --adapter ${ADAPTER_ARG} --compare-base, or benchmark adapters on eks / realtime-inference."
+fi
 # ── Handle --status (early exit) ─────────────────────────────────────────────
 # Query the tracked benchmark job, display status, and if completed:
 # download results, display metrics, and write to Athena (if not already done).

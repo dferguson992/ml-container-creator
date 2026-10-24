@@ -371,12 +371,42 @@ _EKS_CAP_MAP="$(python3 "${SCRIPT_DIR}/lib/python/serve_manifest.py" capability_
 # did not set (e.g. SGLang needs max_lora_rank + lora_target_modules for a
 # no-initial-adapters start); vLLM requires no companions and stays bare. Users
 # override any companion via Tier-2 SGLANG_*/VLLM_* pass-through.
+# ── LoRA sizing (Wave 6.1 R2, BL188) ───────────────────────────────────────────
+# derive-dont-hardcode: the LoRA sizing defaults (e.g. vLLM lora_max=4,
+# lora_max_rank=16) are each capability's `default` in serve.d/<engine>/
+# manifest.json — the single source the generator, Dockerfile and schema also
+# derive from (drift-tested). max_lora_rank is then DERIVED by the shared
+# right_sizing.effective_lora_rank: snap_up(max(recorded tune adapters'
+# adapter_config.json r / rank_pattern, TUNE_LORA_RANK_*, manifest default),
+# the engine's allowed set). Tuning techniques drive the rank; an explicit
+# <engine>_MAX_LORA_RANK wins (with a warning when below what recorded adapters
+# need). The LoRA buffer must fit 10% of the post-weights GPU memory; an
+# auto-raise over that cap refuses the deploy naming the adapters (never a
+# silent cap). vLLM's own defaults are max_loras=1 / max_lora_rank=16.
+_EKS_CAP_DEFAULTS="$(python3 "${SCRIPT_DIR}/lib/python/serve_manifest.py" capability_defaults "${_EKS_ENGINE}" 2>/dev/null || echo '{}')"
+_EKS_EFFECTIVE_RANK=""
+if [ "${HP_LORA_ENABLED:-false}" = "true" ]; then
+    _EKS_RANK_RC=0
+    _EKS_RANK_JSON="$(python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" effective-lora-rank)" || _EKS_RANK_RC=$?
+    if [ "${_EKS_RANK_RC}" -eq 2 ]; then
+        echo "❌ LoRA right-sizing refused this deploy (see the finding above)." >&2
+        echo "   Nothing was applied; the running deployment is unchanged." >&2
+        exit 1
+    fi
+    _EKS_EFFECTIVE_RANK="$(printf '%s' "${_EKS_RANK_JSON}" | python3 -c 'import json,sys; r=json.load(sys.stdin).get("rank"); print("" if r is None else r)' 2>/dev/null || echo "")"
+    if [ -n "${_EKS_EFFECTIVE_RANK}" ]; then
+        echo "   LoRA max_lora_rank: ${_EKS_EFFECTIVE_RANK} (derived from recorded tune adapters + engine default; explicit override wins)"
+    else
+        echo "   ⚠️  Could not derive max_lora_rank (right_sizing.py unavailable); using the engine manifest default." >&2
+    fi
+fi
 _EKS_TIER1_VALUES=$(
     MODEL_ID="${HP_MODEL_ID:-${MODEL_NAME:-}}" \
     TP_DEGREE="${VLLM_TENSOR_PARALLEL_SIZE:-${HP_GPU_COUNT}}" \
     QUANT="${VLLM_QUANTIZATION:-}" \
     LORA_ON="$([ "${HP_LORA_ENABLED:-false}" = "true" ] && echo true || echo false)" \
-    LORA_MAX_RANK="${VLLM_MAX_LORA_RANK:-}" \
+    LORA_MAX_RANK="${_EKS_EFFECTIVE_RANK:-${VLLM_MAX_LORA_RANK:-}}" \
+    CAP_DEFAULTS="${_EKS_CAP_DEFAULTS}" \
     LORA_MAX="${VLLM_MAX_LORAS:-}" \
     LORA_TARGET_MODULES="${VLLM_LORA_TARGET_MODULES:-}" \
     CAP_MAP="${_EKS_CAP_MAP}" \
@@ -400,29 +430,28 @@ if os.environ.get("LORA_ON") == "true":
     for k, val in user.items():
         if val:
             v[k] = val
-    # MLCC pure-dynamic LoRA defaults, keyed by CAPABILITY (not engine name).
-    # lora_max=4 / lora_max_rank=16 are memory-safe sizing defaults: vLLM's own
-    # defaults (max_loras=30, max_lora_rank=64) pre-allocate a large LoRA buffer
-    # that OOMs big models on tight VRAM (validated remediation in the capability
-    # matrix: "reduce max_loras 30→4, max_lora_rank 64→16"). 4 covers 2–3 adapters
-    # plus hot-swap headroom; override via VLLM_MAX_LORAS / VLLM_MAX_LORA_RANK.
-    MLCC_LORA_DEFAULTS = {"lora_max": "4", "lora_max_rank": "16", "lora_target_modules": "all"}
+    # LoRA sizing/companion defaults, keyed by CAPABILITY (not engine name) and
+    # READ from the active engine's manifest (capability_map `default`, passed in
+    # as CAP_DEFAULTS) — never a literal here. max_lora_rank arrives already
+    # derived (LORA_MAX_RANK = right_sizing.effective_lora_rank). Fill a default
+    # for every capability the ACTIVE engine DECLARES (not only ones gated as
+    # "required"): vLLM gets lora_max; SGLang (no lora_max) gets its
+    # lora_target_modules companion. Explicit user values (above) always win.
     try:
         caps = json.loads(os.environ.get("CAP_MAP") or "{}")
-    except Exception:
+    except ValueError:
         caps = {}
+    try:
+        cap_defaults = json.loads(os.environ.get("CAP_DEFAULTS") or "{}")
+    except ValueError:
+        cap_defaults = {}
     lora_decl = caps.get("lora_enable") or {}
-    # Fill a default for every sizing/companion capability the ACTIVE engine
-    # DECLARES in its capability_map (not only ones gated as "required"): a plugin
-    # that declares lora_max gets the memory-safe count; one that doesn't (e.g.
-    # SGLang) silently skips it. Each manifest maps the capability to its own env
-    # suffix (vLLM lora_max→MAX_LORAS), so this is the per-engine translation.
     declared = set(k for k in caps.keys())
     for group in (lora_decl.get("requiresAnyOf") or [lora_decl.get("requires") or []]):
         declared.update(group)
-    for comp, default in MLCC_LORA_DEFAULTS.items():
+    for comp, default in cap_defaults.items():
         if comp in declared and not v.get(comp):
-            v[comp] = default
+            v[comp] = str(default)
 print(json.dumps(v))
 _PYEOF
 )

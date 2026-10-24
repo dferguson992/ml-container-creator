@@ -66,7 +66,9 @@ function hyperpodBody(rendered) {
 
 /** The router-classification portion (first arg -> ACTION), before dispatch. */
 function routerClassification(body) {
-    const end = body.indexOf('# ── Direct-pod port-forward setup');
+    // Wave 6.1: the router ends where the cluster connection begins (the
+    // delivery mapping, rank pre-check and per-pod port-forwards follow it).
+    const end = body.indexOf('# ── Cluster connection (kubeconfig)');
     assert.ok(end !== -1, 'router must precede the port-forward setup');
     return body.slice(0, end);
 }
@@ -110,10 +112,14 @@ describe('Feature: v18-w4-01-bl112 — do/adapter hyperpod-eks verb routing', ()
                 assert.ok(/--weights\)/.test(router), 'add must parse --weights');
 
                 // ACTION=load dispatches through the load helper -> lora_vllm.py load.
+                // Wave 6.1 R1.5: the load helper receives the IN-POD path the
+                // s3:// source maps to (adapter_delivery.py), never the s3:// URI.
                 assert.ok(
-                    /load\)\s*\n\s*_lora_do_load "\$\{LORA_NAME\}" "\$\{WEIGHTS_URI\}"/.test(dispatch),
-                    'ACTION=load must invoke the load helper with name + weights'
+                    /load\)\s*\n\s*_lora_do_load "\$\{LORA_NAME\}" "\$\{_LORA_PATH\}"/.test(dispatch),
+                    'ACTION=load must invoke the load helper with name + the mapped in-pod path'
                 );
+                assert.ok(/adapter_delivery\.py" local-path/.test(body) && /--uri "\$\{WEIGHTS_URI\}"/.test(body),
+                    'WEIGHTS_URI must be mapped through adapter_delivery.py local-path');
                 assert.ok(
                     /_lora_helper_call RESULT load "\$\{_name\}" "\$\{_uri\}" "\$\{BASE_URL\}"/.test(dispatch) &&
                         LORA_HELPER_CALL_RE.test(dispatch),
@@ -206,18 +212,16 @@ describe('Feature: v18-w4-01-bl112 — do/adapter hyperpod-eks verb routing', ()
                 assert.ok(/--weights\)/.test(router), 'update must parse --weights');
 
                 // ACTION=update: unload THEN load, in that order, both via POST helpers.
-                const updateArm = dispatch.slice(
-                    dispatch.indexOf('update)'),
-                    dispatch.indexOf('list)')
-                );
+                const updateStart = dispatch.indexOf('update)');
+                const updateArm = dispatch.slice(updateStart, dispatch.indexOf('list)', updateStart));
                 const unloadPos = updateArm.indexOf('_lora_do_unload "${LORA_NAME}"');
-                const loadPos = updateArm.indexOf('_lora_do_load "${LORA_NAME}" "${WEIGHTS_URI}"');
+                const loadPos = updateArm.indexOf('_lora_do_load "${LORA_NAME}" "${_LORA_PATH}"');
                 assert.ok(unloadPos !== -1, 'update must unload');
                 assert.ok(loadPos !== -1, 'update must load');
                 assert.ok(unloadPos < loadPos, 'update must unload BEFORE load (remove-then-add)');
                 // A failed unload aborts before load.
                 assert.ok(
-                    /_lora_do_unload "\$\{LORA_NAME\}" \|\| exit 1\s*\n\s*_lora_do_load/.test(updateArm),
+                    /_lora_do_unload "\$\{LORA_NAME\}" \|\| return 1\s*\n\s*_lora_do_load/.test(updateArm),
                     'a failed unload must abort before load'
                 );
                 // Neither helper uses DELETE.

@@ -29,8 +29,8 @@
     "tensor_parallel_degree": { "suffix": "TENSOR_PARALLEL_SIZE", "value_type": "valued" },
     "quantization": { "suffix": "QUANTIZATION", "value_type": "valued" },
     "lora_enable": { "suffix": "ENABLE_LORA", "value_type": "boolean", "requires": [] },
-    "lora_max": { "suffix": "MAX_LORAS", "value_type": "valued" },
-    "lora_max_rank": { "suffix": "MAX_LORA_RANK", "value_type": "valued" }
+    "lora_max": { "suffix": "MAX_LORAS", "value_type": "valued", "default": 4 },
+    "lora_max_rank": { "suffix": "MAX_LORA_RANK", "value_type": "valued", "default": 16, "allowed": [1, 8, 16, 32, 64, 128, 256, 320, 512] }
   },
   "min_version": "0.6.0",
   "version_features": [
