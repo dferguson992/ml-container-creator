@@ -133,7 +133,10 @@ def test_gemma3_findings_doc_case_blocks_with_computed_fixes():
     fixed = rs.check_context_memory(gemma3_on_one_32gb_gpu(max_model_len=d["max_fit_len_window_aware"]))
     assert fixed[0].severity != "block"
     fixed_full = rs.check_context_memory(gemma3_on_one_32gb_gpu(max_model_len=d["max_fit_len_full_attention"]))
-    assert fixed_full[0].severity == "info"
+    # Fits even with full attention on every layer (it may sit in the margin band:
+    # 24 GB of weights leave little room on one 32 GB GPU).
+    assert fixed_full[0].severity != "block"
+    assert fixed_full[0].data["need_upper_bytes"] <= fixed_full[0].data["usable_bytes"]
 
 
 def test_smallest_fitting_instance_fix_is_the_least_gpu_memory_that_fits():
@@ -150,7 +153,7 @@ def test_smallest_fitting_instance_fix_is_the_least_gpu_memory_that_fits():
 
 def test_only_upper_bound_over_warns_for_sliding_window_model():
     # 2 x 32 GB: window-aware fits, full-attention-on-every-layer would not.
-    c = gemma3_on_one_32gb_gpu(instance_type="test.gpu32x2", tp=2, serving_gpus=2, weights_bytes=int(40e9))
+    c = gemma3_on_one_32gb_gpu(instance_type="test.gpu32x2", tp=2, serving_gpus=2, weights_bytes=int(36e9))
     f = rs.check_context_memory(c)[0]
     assert f.data["need_lower_bytes"] < f.data["usable_bytes"] * rs.WARN_FROM
     assert f.data["need_upper_bytes"] > f.data["usable_bytes"]
@@ -164,7 +167,7 @@ def test_only_upper_bound_over_warns_for_sliding_window_model():
 
 def test_margin_band_warns_dense():
     # weights chosen so the estimate lands between WARN_FROM and BLOCK_OVER
-    usable = 48 * GIB * 0.9
+    usable = rs.usable_bytes(48, 1, 0.9)
     kv = rs.kv_cache_bytes(rs.kv_layout(DENSE), 8192, 2)
     w = int((usable * 0.95 - kv) / (1 + instance_sizer.OVERHEAD_FACTOR))
     f = rs.check_context_memory(ctx(weights_bytes=w))[0]
@@ -205,6 +208,108 @@ def test_thresholds_are_overridable_by_env(monkeypatch):
     monkeypatch.setenv("MLCC_SIZING_BLOCK_OVER", "2.0")
     assert rs.threshold("BLOCK_OVER") == 2.0
     assert rs.check_context_memory(gemma3_on_one_32gb_gpu())[0].severity != "block"
+
+
+# ── usable memory calibration (visible fraction + runtime reserve) ───────────
+
+with open(os.path.join(_FIX, "vllm-0.31-gemma-4-e4b-capacity.json"), encoding="utf-8") as _f:
+    VLLM_CAPACITY = json.load(_f)
+
+
+def test_usable_applies_visible_fraction_and_per_gpu_reserve():
+    vis, res = rs.threshold("GPU_VISIBLE_MEMORY_FRACTION"), rs.threshold("GPU_RUNTIME_RESERVE_GIB")
+    assert 0 < vis < 1 and res > 0
+    assert rs.usable_bytes(32, 1, 0.9) == pytest.approx((32 * vis * 0.9 - res) * GIB)
+    # The reserve is per GPU: two GPUs give exactly twice one.
+    assert rs.usable_bytes(32, 2, 0.9) == pytest.approx(2 * rs.usable_bytes(32, 1, 0.9))
+    # Both make usable strictly smaller than the raw catalog x utilization figure.
+    assert rs.usable_bytes(32, 1, 0.9) < 32 * GIB * 0.9
+    assert rs.usable_bytes(0.5, 1, 0.9) == 0.0       # never negative
+
+
+def test_reserve_and_visible_fraction_are_overridable_by_env(monkeypatch):
+    base = rs.usable_bytes(32, 1, 0.9)
+    monkeypatch.setenv("MLCC_SIZING_GPU_RUNTIME_RESERVE_GIB", "0")
+    monkeypatch.setenv("MLCC_SIZING_GPU_VISIBLE_FRACTION", "1")
+    assert rs.usable_bytes(32, 1, 0.9) == pytest.approx(32 * GIB * 0.9)
+    monkeypatch.setenv("MLCC_SIZING_GPU_RUNTIME_RESERVE_GIB", "5")
+    assert rs.usable_bytes(32, 1, 0.9) == pytest.approx((32 * 0.9 - 5) * GIB)
+    assert rs.usable_bytes(32, 1, 0.9) < base
+
+
+def test_reserve_reduces_every_memory_check(monkeypatch):
+    """The reserve feeds context-memory, its max-fitting-len fix and the LoRA budget."""
+    loose, tight = {}, {}
+    for store, reserve in ((loose, "0"), (tight, "1")):
+        monkeypatch.setenv("MLCC_SIZING_GPU_RUNTIME_RESERVE_GIB", reserve)
+        f = rs.check_context_memory(gemma3_on_one_32gb_gpu())[0]
+        store.update(usable=f.data["usable_bytes"], fit=f.data["max_fit_len_window_aware"],
+                     budget=rs.lora_buffer_budget_bytes(32, 0.9, int(8 * GIB), 1))
+    assert tight["usable"] < loose["usable"]
+    assert tight["fit"] < loose["fit"]
+    assert tight["budget"] < loose["budget"]
+
+
+def test_inflight_tokens_tier_by_gpu_memory_and_explicit_batch_wins():
+    spec = serve_manifest.sizing_map("vllm")["max_num_batched_tokens"]
+    batches = spec["in_flight_batches"]
+    small, big = ctx(batched_tokens_spec=spec, gpu_memory_gib=24.0), ctx(batched_tokens_spec=spec, gpu_memory_gib=80.0)
+    assert rs.inflight_tokens(small) == spec["default"] * batches
+    assert rs.inflight_tokens(big) > rs.inflight_tokens(small)            # larger GPUs batch more
+    assert rs.inflight_tokens(small, gpu_memory_gib=80.0) == rs.inflight_tokens(big)
+    assert rs.inflight_tokens(ctx(batched_tokens_spec=spec, max_num_batched_tokens=512)) == 512 * batches
+    assert rs.inflight_tokens(ctx()) == 0                                 # engine declares nothing
+
+
+def test_sliding_layers_hold_window_plus_inflight_tokens():
+    lay = rs.kv_layout(GEMMA3)
+    plain = rs.kv_cache_bytes(lay, 131072, 2, window_aware=True)
+    held = rs.kv_cache_bytes(lay, 131072, 2, window_aware=True, inflight_tokens=4096)
+    assert held == 8 * 8192 * 131072 + 40 * 8192 * (1024 + 4096)
+    assert held > plain
+    # Never more than the sequence itself, and the full-attention bound is unchanged.
+    assert rs.kv_cache_bytes(lay, 2048, 2, window_aware=True, inflight_tokens=1 << 20) == \
+        rs.kv_cache_bytes(lay, 2048, 2)
+
+
+def _recorded_vllm_ctx():
+    """The recorded live deployment, rebuilt from its inputs (no SKU: a synthetic
+    2 x 32 GiB catalog entry carries the catalog figure the pod's instance has)."""
+    i = VLLM_CAPACITY["inputs"]
+    return ctx(model_config=GEMMA4, weights_bytes=i["measured_safetensors_bytes"], instance_type="test.gpu32x2",
+               gpu_memory_gib=float(i["catalog_gpu_memory_gib"]), tp=i["tp"], serving_gpus=i["gpus"],
+               gpu_memory_utilization=i["gpu_memory_utilization"], max_model_len=i["max_model_len"],
+               lora_enabled=True, serving_rank_limit=i["max_lora_rank"], max_loras=i["max_loras"],
+               batched_tokens_spec=serve_manifest.sizing_map("vllm")["max_num_batched_tokens"])
+
+
+def test_kv_estimate_is_not_above_recorded_vllm_capacity():
+    """W8 calibration: the window-aware KV token estimate must be conservative
+    (<= what vLLM v0.31 actually allocated) and close (within 10%)."""
+    obs = VLLM_CAPACITY["observed"]
+    c = _recorded_vllm_ctx()
+    assert rs.inflight_tokens(c) == VLLM_CAPACITY["inputs"]["max_num_batched_tokens"] * 2
+    cap = rs.kv_capacity(c)
+    tokens = cap["window_aware_tokens"]
+    assert 0.9 * obs["gpu_kv_cache_tokens"] <= tokens <= obs["gpu_kv_cache_tokens"]
+    kv_gib_per_gpu = cap["free_bytes"] / c.tp / GIB
+    assert 0.9 * obs["available_kv_cache_gib"] <= kv_gib_per_gpu <= obs["available_kv_cache_gib"]
+    # Per-GPU usable is at most what vLLM requested (visible x utilization).
+    assert rs.usable_bytes(c.gpu_memory_gib, 1, c.gpu_memory_utilization) / GIB <= obs["requested_memory_gib"]
+    f = rs.check_context_memory(c)[0]
+    assert f.data["kv_capacity_tokens"] == tokens and f.severity == "info"
+    k = rs.check_concurrency_kv(c)[0]
+    assert k.data["kv_capacity_tokens_window_aware"] == tokens
+
+
+def test_weights_plus_lora_terms_match_vllm_model_loading_without_double_counting():
+    """vLLM's "Model loading took" includes the LoRA buffer; the module's weights
+    (with overhead) + LoRA terms, each counted once, land within 5% of it."""
+    c = _recorded_vllm_ctx()
+    t = rs.memory_terms(c, 1)
+    per_gpu = (t["weights_bytes"] + t["lora_buffer_bytes"]) / c.tp / GIB
+    assert per_gpu == pytest.approx(VLLM_CAPACITY["observed"]["model_loading_gib"], rel=0.05)
+    assert t["need_lower_bytes"] - t["kv_lower_bytes"] == t["weights_bytes"] + t["lora_buffer_bytes"]
 
 
 # ── weights (OQ-8.9) ──────────────────────────────────────────────────────────

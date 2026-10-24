@@ -96,6 +96,17 @@
         "properties": {
           "suffix": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
           "default": { "type": ["number", "string"] },
+          "default_by_gpu_memory_gib": {
+            "type": "object",
+            "description": "Hardware-tiered default: keys are per-GPU memory floors in GiB (numeric strings), values the default from that floor up (the largest floor <= the GPU's memory wins; below every floor, `default` applies).",
+            "propertyNames": { "pattern": "^[0-9]+(\\.[0-9]+)?$" },
+            "additionalProperties": { "type": "number" }
+          },
+          "in_flight_batches": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "max_num_batched_tokens only: scheduler batches the engine keeps in flight at once (async scheduling), so sliding-window KV holds window + this x the batch."
+          },
           "description": { "type": "string" }
         }
       }
