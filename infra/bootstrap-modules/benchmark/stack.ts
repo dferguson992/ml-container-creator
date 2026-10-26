@@ -129,7 +129,7 @@ export class MlccBenchmarkStack extends cdk.Stack {
                         { name: 'output_sequence_length_avg', type: 'double' },
                         { name: 'input_sequence_length_avg', type: 'double' },
                         { name: 'error_rate', type: 'double' },
-                        { name: 'cost_per_1m_tokens', type: 'double', comment: 'Estimated USD cost per 1M output tokens' },
+                        { name: 'cost_per_1m_tokens', type: 'double', comment: 'USD per 1M output tokens = price_usd_per_hour x instance_count x 1e6 / (3600 x output tok/s) at the measured concurrency; NULL when price or throughput is missing' },
                         { name: 'benchmark_duration_sec', type: 'double' },
                         { name: 'run_type', type: 'string' },
                         { name: 'benchmark_job_name', type: 'string' },
@@ -142,10 +142,10 @@ export class MlccBenchmarkStack extends cdk.Stack {
                         { name: 'gpu_utilization_max', type: 'double', comment: 'Peak GPU compute utilization (0-100); Phase 1 CloudWatch OTel' },
                         { name: 'gpu_memory_util_avg', type: 'double', comment: 'Average GPU memory copy utilization (0-100); Phase 1 CloudWatch OTel' },
                         // BL101 R5: writer emits these two columns but the DDL previously omitted
-                        // them. NOTE (migration): editing this file only affects newly-bootstrapped
-                        // tables. Existing deployed Glue tables need the columns added out-of-band
-                        // (ALTER TABLE ... ADD COLUMNS) or via re-running bootstrap; until then the
-                        // writer emits data the deployed table cannot surface for these two columns.
+                        // them. NOTE (migration): this CfnTable owns the full TableInput, so
+                        // CloudFormation re-evaluates the column list on every template submit and
+                        // would revert an out-of-band ALTER TABLE. Roll columns out ONLY by editing
+                        // this list and running `bootstrap update` of the benchmark module.
                         { name: 'gpu_memory_used_avg_gb', type: 'double', comment: 'Avg GPU memory used (GB); Phase 1 CloudWatch OTel' },
                         { name: 'queue_depth_waiting_max', type: 'double', comment: 'Peak waiting-request queue depth; Phase 2 engine metrics' },
                         { name: 'kv_cache_util_avg', type: 'double', comment: 'Average KV cache utilization (0-1); Phase 1 OTel (KVCacheUtilization) or Phase 2 engine metrics' },
@@ -154,6 +154,36 @@ export class MlccBenchmarkStack extends cdk.Stack {
                         { name: 'queue_depth_waiting_avg', type: 'double', comment: 'Average number of waiting requests; Phase 1 OTel (QueueDepth) or Phase 2 engine metrics' },
                         { name: 'queue_depth_running_avg', type: 'double', comment: 'Average number of actively running requests; Phase 2 engine metrics only' },
                         { name: 'metrics_source', type: 'string', comment: 'Provenance of GPU/engine metrics: cloudwatch | engine_metrics | both | none' },
+                        // ── Wave 9 (append-only; must match PARQUET_COLUMNS in
+                        // templates/do/.benchmark_writer.py and docs/athena-benchmark-ddl.sql —
+                        // test/unit/test_benchmark_schema_drift.py). Old Parquet files read NULL.
+                        // BL128 curated AIPerf time-weighted aggregates (profile_export_aiperf.json)
+                        { name: 'effective_concurrency_avg', type: 'double', comment: 'AIPerf effective (time-weighted) concurrency, avg' },
+                        { name: 'effective_concurrency_p90', type: 'double', comment: 'AIPerf effective concurrency, p90' },
+                        { name: 'effective_total_tps_avg', type: 'double', comment: 'AIPerf effective total throughput tokens/s, avg' },
+                        { name: 'effective_total_tps_p90', type: 'double', comment: 'AIPerf effective total throughput tokens/s, p90' },
+                        { name: 'effective_decode_tps_avg', type: 'double', comment: 'AIPerf effective decode throughput tokens/s, avg' },
+                        { name: 'effective_decode_tps_p90', type: 'double', comment: 'AIPerf effective decode throughput tokens/s, p90' },
+                        { name: 'effective_prefill_tps_avg', type: 'double', comment: 'AIPerf effective prefill throughput tokens/s, avg' },
+                        { name: 'effective_prefill_tps_p90', type: 'double', comment: 'AIPerf effective prefill throughput tokens/s, p90' },
+                        { name: 'active_decode_tps_avg', type: 'double', comment: 'AIPerf active (decode in flight) throughput tokens/s, avg' },
+                        { name: 'active_decode_tps_p90', type: 'double', comment: 'AIPerf active decode throughput tokens/s, p90' },
+                        { name: 'active_prefill_tps_avg', type: 'double', comment: 'AIPerf active (prefill in flight) throughput tokens/s, avg' },
+                        { name: 'active_prefill_tps_p90', type: 'double', comment: 'AIPerf active prefill throughput tokens/s, p90' },
+                        { name: 'tokens_in_flight_avg', type: 'double', comment: 'AIPerf tokens in flight, avg' },
+                        { name: 'tokens_in_flight_p90', type: 'double', comment: 'AIPerf tokens in flight, p90' },
+                        { name: 'effective_latency_avg_ms', type: 'double', comment: 'AIPerf effective (coordinated-omission-aware) latency ms, avg' },
+                        { name: 'effective_latency_p90_ms', type: 'double', comment: 'AIPerf effective latency ms, p90' },
+                        { name: 'aiperf_version', type: 'string', comment: 'AIPerf version that produced the run (profile_export_aiperf.json)' },
+                        { name: 'spec_decode_acceptance_rate', type: 'double', comment: 'Speculative-decoding acceptance rate 0-1 over the run window; NULL when not enabled' },
+                        // Cost inputs (auditable) + Bedrock comparison
+                        { name: 'price_usd_per_hour', type: 'double', comment: 'On-demand USD/hour used for cost_per_1m_tokens' },
+                        { name: 'price_source', type: 'string', comment: 'pricing-api | pricing-api-cache | snapshot (API-generated); NULL when unresolved' },
+                        { name: 'price_as_of', type: 'string', comment: 'ISO 8601 UTC retrieval time of the price' },
+                        { name: 'price_component', type: 'string', comment: 'Price List component (Hosting | AsyncInf | BatchTransform | Cluster) or AmazonEC2' },
+                        { name: 'instance_count', type: 'int', comment: 'Billed instances: endpoint CurrentInstanceCount, or nodes occupied by replicas' },
+                        { name: 'bedrock_model_id', type: 'string', comment: 'Live-verified Bedrock equivalent; NULL when none' },
+                        { name: 'bedrock_cost_per_1m_tokens', type: 'double', comment: 'Bedrock on-demand USD per 1M output tokens at the measured input:output ratio' },
                     ],
                 },
                 partitionKeys: [

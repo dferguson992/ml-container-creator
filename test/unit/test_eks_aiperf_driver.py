@@ -135,6 +135,21 @@ def test_relocate_moves_jsonl_to_dest(tmp_path):
     out = eks_aiperf.relocate_profile_export(str(art), str(dest))
     assert out == str(dest)
     assert dest.exists()
+    # No aggregate export produced -> nothing invented next to the JSONL.
+    assert not (dest.parent / "profile_export_aiperf.json").exists()
+
+
+def test_relocate_keeps_the_aiperf_aggregate_next_to_the_jsonl(tmp_path):
+    # Wave 9 R10.3 (BL128): the writer reads the sibling profile_export_aiperf.json.
+    art = tmp_path / "aiperf"
+    run = art / "run-xyz"
+    run.mkdir(parents=True)
+    (run / "profile_export.jsonl").write_text('{"metadata":{},"metrics":{}}\n')
+    (run / "profile_export_aiperf.json").write_text('{"aiperf_version": "x"}')
+    dest = tmp_path / "output" / "profile_export.jsonl"
+    eks_aiperf.relocate_profile_export(str(art), str(dest))
+    kept = dest.parent / "profile_export_aiperf.json"
+    assert kept.exists() and kept.read_text() == '{"aiperf_version": "x"}'
 
 
 def test_relocate_raises_when_missing(tmp_path):

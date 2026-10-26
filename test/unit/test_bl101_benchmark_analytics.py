@@ -187,6 +187,32 @@ class TestCmdPeak:
         assert payload['delta_from_peak_pct'] == -25.0
         assert exc.value.code == 0
 
+    def test_cost_peak_is_labeled_with_concurrency_source_and_caveat(self, monkeypatch, capsys):
+        # Wave 9 R8.4/R8.5: --peak --metric cost reads "@ concurrency N (measured)"
+        # plus the price source/date and the sustained-utilization caveat.
+        peak_rows = [{'cost_per_1m_tokens': 4.2, 'concurrency': 8, 'run_timestamp': '2026-10-26T00:00:00',
+                      'benchmark_job_name': 'j', 'workload': 'w', 'deployment_target': 'hyperpod-eks'}]
+        price_row = [{'instance_type': 'ml.x.y', 'price_usd_per_hour': '3.0', 'price_source': 'pricing-api',
+                      'price_as_of': '2026-10-25T00:00:00Z', 'price_component': 'Cluster', 'instance_count': '1'}]
+        monkeypatch.setattr(_engine.AthenaQueryEngine, '_run_query',
+                            lambda self, sql: price_row if 'price_source' in sql else peak_rows)
+        with pytest.raises(SystemExit):
+            _engine.cmd_peak(self._args(metric='cost'))
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[0])
+        assert '@ concurrency 8 (measured)' in payload['cost_line']
+        assert 'pricing-api 2026-10-25' in payload['cost_line']
+        assert 'sustained utilization' in payload['caveat']
+
+    def test_cost_peak_on_a_pre_wave9_table_still_labels(self, monkeypatch, capsys):
+        peak_rows = [{'cost_per_1m_tokens': 4.2, 'concurrency': 2, 'run_timestamp': '2026-07-01T00:00:00'}]
+        monkeypatch.setattr(_engine.AthenaQueryEngine, '_run_query',
+                            lambda self, sql: [] if 'price_source' in sql else peak_rows)
+        with pytest.raises(SystemExit):
+            _engine.cmd_peak(self._args(metric='cost'))
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[0])
+        assert '@ concurrency 2 (measured)' in payload['cost_line']
+        assert 'not recorded' in payload['cost_line']
+
 
 # ── --list (Req 6) ────────────────────────────────────────────────────────────
 

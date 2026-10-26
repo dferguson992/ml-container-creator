@@ -29,6 +29,7 @@
   "serving_config_source": "kubernetes",
   "cluster_contract": { "script": "lib/python/hyperpod_ops.py", "entry": "preflight-env" },
   "adapter_delivery": { "strategy": "model-prefix", "mount_path": "/opt/ml/model", "subdir": ".mlcc-adapters" },
+  "pricing": { "service": "AmazonSageMaker", "component": "Cluster", "instance_count": { "basis": "replicas", "replicas_var": "HP_REPLICAS", "gpus_per_replica_var": "HP_GPU_COUNT" } },
   "verbs": {
     "optimize": true,
     "add-ic": false,

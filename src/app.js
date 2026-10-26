@@ -906,6 +906,15 @@ function _writeGenerationParams(destDir, answers) {
         if (fs.existsSync(archSupportSrc)) {
             fs.copyFileSync(archSupportSrc, path.join(mlccDir, 'model-arch-support.json'));
         }
+        // Wave 9 (R7.2, R9.1): the API-generated pricing snapshot (resolver
+        // fallback after cache + live Pricing API) and the live-verified
+        // Bedrock-equivalents catalog, read by do/lib/python/pricing.py.
+        for (const catalogName of ['pricing-snapshot.json', 'bedrock-equivalents.json']) {
+            const catalogSrc = path.join(GENERATOR_ROOT, 'servers', 'lib', 'catalogs', catalogName);
+            if (fs.existsSync(catalogSrc)) {
+                fs.copyFileSync(catalogSrc, path.join(mlccDir, catalogName));
+            }
+        }
 
         // Copy serve-engine plugin manifests to .mlcc/serve.d/ so do/draft and
         // do/deploy can read engine capabilities (supported_algorithms,

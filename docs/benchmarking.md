@@ -320,6 +320,108 @@ table — the CDK stack update adds the columns via Glue `UpdateTable` (idempote
 
 ---
 
+## Cost per 1M tokens, pricing and the Bedrock comparison (Wave 9)
+
+### How the cost is computed
+
+```
+cost_per_1m_tokens = price_usd_per_hour × instance_count × 1,000,000 / (3600 × output_token_throughput_tps)
+```
+
+Output tokens only. Each concurrency level gets its own figure, because the throughput is measured per level. The column is `NULL` (with a printed reason) when the price, the instance count or the throughput is missing. MLCC never substitutes an estimate.
+
+| Input | Source |
+|---|---|
+| `price_usd_per_hour` | On-demand USD/hour from the price resolver (`do/lib/python/pricing.py`), see below |
+| `instance_count` | realtime-inference: the endpoint's `CurrentInstanceCount` at write time (`DescribeEndpoint`); the whole endpoint is billed, even when one IC uses part of it. hyperpod-eks / eks: nodes occupied = ceil(`HP_REPLICAS` × `HP_GPU_COUNT` / GPUs per instance). `HP_GPU_COUNT=auto` means one whole instance per replica |
+| `output_token_throughput_tps` | AIPerf, measured at that level's concurrency |
+
+The Price List service, the `component` and the instance-count basis come from each target's descriptor (`templates/do/targets.d/<target>/manifest.json` → `pricing`). They are not branches in code:
+
+| Target | Price List service | `component` |
+|---|---|---|
+| realtime-inference | AmazonSageMaker | `Hosting` |
+| hyperpod-eks | AmazonSageMaker | `Cluster` (HyperPod; differs from `Hosting` for some families, e.g. p5) |
+| eks | AmazonEC2 | — (Linux, Shared tenancy, no pre-installed software, `capacitystatus=Used`) |
+| async-inference | AmazonSageMaker | `AsyncInf` (benchmark not supported) |
+| batch-transform | AmazonSageMaker | `BatchTransform` (benchmark not supported) |
+
+### Where prices come from
+
+The resolver returns `{usd_per_hour, source, as_of, component, region}` for one (instance, region, target) and tries these sources in order:
+
+1. **Project cache** `.mlcc/pricing-cache.json`, used when the entry is at most 24 hours old (`price_source = pricing-api-cache`).
+2. **AWS Price List API** `GetProducts` through the `us-east-1` Price List endpoint, on-demand terms only (`price_source = pricing-api`).
+3. **Snapshot** `.mlcc/pricing-snapshot.json`, copied into the project at generate time (`price_source = snapshot`). The snapshot is produced only by `npm run sync:pricing` (`pricing.py snapshot`) against the live API. Every entry records its source and retrieval date.
+4. **NULL**, with the reasons from steps 2 and 3.
+
+A lookup that does not return **exactly one** on-demand USD price is a miss. Zero matches, several distinct prices, or an unexpected unit all count as a miss; MLCC never picks one of several. Savings Plans, reserved and spot prices are not used. `--dry-run` writes skip the live API (cache and snapshot only).
+
+### What the output says
+
+Every printed cost carries the concurrency it was measured at, the price inputs and the caveat:
+
+```
+$12.10 / 1M output tokens @ concurrency 2 (measured) · ml.g7.12xlarge ×1 Cluster $8.9104/h, pricing-api 2026-10-26
+Assumes sustained utilization during billed hours; idle and scale-to-zero time are not included (BL202 / Wave 10).
+```
+
+When a write covers two or more concurrency levels, the summary adds a **peak sustained** line: the cost at the level with the highest output tokens/s, labeled with that level's concurrency. `./do/benchmark --peak --metric cost` uses the same label and caveat. Low-concurrency figures are much higher than what the same hardware costs at full load, so compare levels rather than quoting a single number.
+
+### Bedrock comparison
+
+MLCC shows a Bedrock on-demand figure next to its own cost **only** when the model has a verified Bedrock equivalent:
+
+- `servers/lib/catalogs/bedrock-equivalents.json` (copied to `.mlcc/`) maps an exact HuggingFace model id to a Bedrock model id and its Price List model name. Entries are added only by `pricing.py verify-bedrock`. That command calls `bedrock:ListFoundationModels` in each region and records the date and the regions where the model is listed with `ON_DEMAND`. MLCC never matches by name similarity.
+- Input and output token prices come from the same resolver (`AmazonBedrock`, feature `On-demand Inference`) for the **run's region**. MLCC never substitutes another region's price.
+- Comparable figure (per 1M output tokens, at the run's measured input:output ratio): `output_price + input_price × (input_sequence_length_avg / output_sequence_length_avg)`.
+- Otherwise the line reads `no Bedrock equivalent (<reason>)`. The reason is one of: no verified mapping, not verified in the region, no on-demand price in the region, or adapter run. Adapter (LoRA) runs never compare.
+
+The figure gets the same concurrency label and the same caveat. It is stored in `bedrock_model_id` and `bedrock_cost_per_1m_tokens`.
+
+### Athena columns added in Wave 9
+
+| Column(s) | Type | Description |
+|---|---|---|
+| `run_name` | STRING | Already in the Glue table; now written by the writer and listed in the DDL |
+| `effective_concurrency_{avg,p90}` | DOUBLE | AIPerf time-weighted concurrency over the full window (BL128) |
+| `effective_total_tps_*`, `effective_decode_tps_*`, `effective_prefill_tps_*` | DOUBLE | AIPerf effective throughput, tokens/s (avg, p90) |
+| `active_decode_tps_*`, `active_prefill_tps_*` | DOUBLE | AIPerf active throughput (only while that phase has work in flight) |
+| `tokens_in_flight_{avg,p90}` | DOUBLE | AIPerf tokens in flight |
+| `effective_latency_{avg,p90}_ms` | DOUBLE | AIPerf effective latency (accounts for coordinated omission) |
+| `aiperf_version` | STRING | AIPerf version that produced the run |
+| `spec_decode_acceptance_rate` | DOUBLE | Speculative-decoding acceptance rate, when collected |
+| `price_usd_per_hour`, `price_source`, `price_as_of`, `price_component`, `instance_count` | mixed | The inputs behind `cost_per_1m_tokens` |
+| `bedrock_model_id`, `bedrock_cost_per_1m_tokens` | STRING / DOUBLE | Bedrock comparison (NULL when there is no equivalent) |
+
+The AIPerf aggregates come from each level's `profile_export_aiperf.json`. A sweep keeps it as `results-concurrency-<L>.json` next to the per-level JSONL, and the eks path keeps it next to `profile_export.jsonl`. A missing file or key gives `NULL`. Per-request parsing and `--list` / `--peak` / `--compare-baseline` are unchanged.
+
+### Rolling out the schema change
+
+The Glue table is owned by CloudFormation (`BenchmarkResultsTable` in `infra/bootstrap-modules/benchmark/stack.ts`). CloudFormation re-evaluates the full column list every time the template is submitted. An out-of-band `ALTER TABLE ADD COLUMNS` would be reverted on the next bootstrap, so the only rollout is:
+
+```bash
+ml-container-creator bootstrap update --module benchmark --dry-run   # read-only: shows the column diff
+ml-container-creator bootstrap update --module benchmark
+```
+
+This is an in-place update of the table (the table keeps its logical ID, database and name). Existing Parquet files read `NULL` for the new columns, and nothing is rewritten. On each write the writer also checks whether an existing partition's column list matches the table's, and updates the partition when it does not (`glue:UpdatePartition`), so older partitions show the new columns too. Until the update runs, the writer still writes the new columns, but Athena will not show them.
+
+A drift test (`test/unit/test_benchmark_schema_drift.py`) keeps the writer's `PARQUET_COLUMNS`, `stack.ts` and `docs/athena-benchmark-ddl.sql` identical.
+
+### IAM
+
+| Action | Used by | When missing |
+|---|---|---|
+| `pricing:GetProducts` | writer (cost), `pricing.py snapshot` | falls back to the snapshot, else `NULL` cost with a warning naming the action |
+| `sagemaker:DescribeEndpoint` | writer (realtime `instance_count`) | `NULL` count → `NULL` cost |
+| `glue:GetPartition`, `glue:UpdatePartition` | writer (partition column reconcile) | warning; the row is still written |
+| `bedrock:ListFoundationModels` | `pricing.py verify-bedrock` (maintainers only) | mapping cannot be added |
+
+The bootstrapped CI CodeBuild role (`infra/bootstrap-modules/ci`) gets `pricing:GetProducts` and the Glue partition actions in this wave.
+
+---
+
 ## Plain EKS (local AIPerf)
 
 The plain `eks` target has no SageMaker endpoint, so it cannot call the SageMaker AI

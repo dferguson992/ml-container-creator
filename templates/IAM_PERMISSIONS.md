@@ -92,7 +92,8 @@ Your AWS user or CI system needs these permissions to run the do-scripts:
 | `./do/deploy` | `sagemaker:CreateEndpointConfig`, `sagemaker:CreateEndpoint`, `sagemaker:CreateModel`, `sagemaker:CreateInferenceComponent`, `sagemaker:DescribeEndpoint`, `iam:PassRole` |
 | `./do/add-ic` | `sagemaker:CreateInferenceComponent`, `sagemaker:DescribeEndpoint`, `sagemaker:ListInferenceComponents`, `iam:PassRole` |
 | `./do/test` | `sagemaker-runtime:InvokeEndpoint` |
-| `./do/benchmark` | `sagemaker:CreateAIBenchmarkJob`, `sagemaker:DescribeAIBenchmarkJob`, `sagemaker:ListAIBenchmarkJobs`, `sagemaker:CreateAIWorkloadConfig`, `iam:PassRole`, `s3:GetObject` |
+| `./do/benchmark` | `sagemaker:CreateAIBenchmarkJob`, `sagemaker:DescribeAIBenchmarkJob`, `sagemaker:ListAIBenchmarkJobs`, `sagemaker:CreateAIWorkloadConfig`, `iam:PassRole`, `s3:GetObject`; Athena write: `s3:PutObject`, `glue:GetTable`, `glue:BatchCreatePartition`, `glue:GetPartition`, `glue:UpdatePartition` (partition column reconcile); cost: `pricing:GetProducts` (Price List API, `us-east-1` endpoint; without it the cost falls back to the bundled snapshot), `sagemaker:DescribeEndpoint` (realtime `CurrentInstanceCount`) |
+| `pricing.py snapshot` / `verify-bedrock` (MLCC maintainers only) | `pricing:GetProducts`, `bedrock:ListFoundationModels` (read-only) |
 | `./do/train` | `sagemaker:CreateTrainingJob`, `sagemaker:DescribeTrainingJob`, `iam:PassRole`, `s3:GetObject`, `s3:PutObject` |
 | `./do/tune` | `sagemaker:CreateTrainingJob`, `sagemaker:DescribeTrainingJob`, `iam:PassRole`, `s3:GetObject`, `s3:PutObject` |
 | `./do/adapter` | `sagemaker:CreateInferenceComponent`, `sagemaker:UpdateInferenceComponent`, `sagemaker:DescribeInferenceComponent`, `s3:GetObject` |

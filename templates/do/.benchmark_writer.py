@@ -71,32 +71,142 @@ _MODEL_FAMILY_PATTERNS = [
     (re.compile(r'gpt[-_.]?oss', re.IGNORECASE), 'gpt-oss'),
 ]
 
-# Approximate on-demand $/hr for common SageMaker AI instances
-INSTANCE_PRICING_USD_PER_HOUR = {
-    'g5.xlarge': 1.408,
-    'g5.2xlarge': 1.52,
-    'g5.4xlarge': 2.03,
-    'g5.8xlarge': 3.06,
-    'g5.12xlarge': 7.09,
-    'g5.16xlarge': 5.10,
-    'g5.24xlarge': 10.18,
-    'g5.48xlarge': 20.36,
-    'g6.xlarge': 1.00,
-    'g6.2xlarge': 1.21,
-    'g6.4xlarge': 1.62,
-    'g6.8xlarge': 2.44,
-    'g6.12xlarge': 5.66,
-    'g6.16xlarge': 4.07,
-    'g6.24xlarge': 7.53,
-    'g6.48xlarge': 15.06,
-    'g6e.xlarge': 1.86,
-    'g6e.2xlarge': 2.35,
-    'g6e.4xlarge': 3.34,
-    'g6e.12xlarge': 11.67,
-    'g6e.48xlarge': 38.12,
-    'p4d.24xlarge': 37.69,
-    'p5.48xlarge': 65.85,
-    'trn2.48xlarge': 21.50,
+# ── Athena / Glue column list (R11.1) ────────────────────────────────────────
+# The ONE writer-side declaration of the benchmark_results columns (pyarrow-free
+# so the drift test can import it without pyarrow). get_parquet_schema() builds
+# from it; infra/bootstrap-modules/benchmark/stack.ts (BenchmarkResultsTable)
+# and docs/athena-benchmark-ddl.sql must carry the same names + types —
+# test/unit/test_benchmark_schema_drift.py fails on any disagreement.
+# Kinds: string | double | int (int32 / Glue int) | boolean.
+# Partition columns (model, instance, target) are NOT listed: they are encoded
+# in the S3 path. To add a column: append here, append to stack.ts, add to the
+# DDL, then `bootstrap update` the benchmark module (no ALTER TABLE).
+PARQUET_COLUMNS = [
+    # Identity
+    ('project_name', 'string'),
+    # Model + serving config
+    ('model_name', 'string'),
+    ('model_family', 'string'),
+    ('instance_type', 'string'),
+    ('deployment_config', 'string'),
+    ('deployment_target', 'string'),
+    ('quantization', 'string'),
+    ('tensor_parallel_degree', 'int'),
+    # Hardware metadata (instance catalog at write time)
+    ('instance_family', 'string'),
+    ('gpu_count', 'int'),
+    ('gpu_type', 'string'),
+    ('gpu_memory_gb', 'double'),
+    # Configuration dimensions
+    ('max_model_len', 'int'),
+    ('enable_lora', 'boolean'),
+    ('kv_cache_dtype', 'string'),
+    ('serving_config', 'string'),
+    # Workload
+    ('workload', 'string'),
+    ('concurrency', 'int'),
+    ('input_tokens_mean', 'int'),
+    ('output_tokens_mean', 'int'),
+    ('streaming', 'boolean'),
+    ('duration_seconds', 'int'),
+    # Client-side metrics (AIPerf per-request JSONL)
+    ('request_throughput_rps', 'double'),
+    ('total_token_throughput_tps', 'double'),
+    ('output_token_throughput_tps', 'double'),
+    ('request_count', 'double'),
+    ('ttft_avg_ms', 'double'),
+    ('ttft_p50_ms', 'double'),
+    ('ttft_p90_ms', 'double'),
+    ('ttft_p99_ms', 'double'),
+    ('itl_avg_ms', 'double'),
+    ('itl_p50_ms', 'double'),
+    ('itl_p90_ms', 'double'),
+    ('itl_p99_ms', 'double'),
+    ('e2e_latency_avg_ms', 'double'),
+    ('e2e_latency_p50_ms', 'double'),
+    ('e2e_latency_p90_ms', 'double'),
+    ('e2e_latency_p99_ms', 'double'),
+    ('prefill_tps_avg', 'double'),
+    ('prefill_tps_p50', 'double'),
+    ('output_token_tps_avg', 'double'),
+    ('output_token_tps_p50', 'double'),
+    ('output_token_tps_p90', 'double'),
+    ('ttst_p50_ms', 'double'),
+    ('ttst_p90_ms', 'double'),
+    ('output_sequence_length_avg', 'double'),
+    ('input_sequence_length_avg', 'double'),
+    ('error_rate', 'double'),
+    ('cost_per_1m_tokens', 'double'),
+    ('benchmark_duration_sec', 'double'),
+    # Run metadata
+    ('run_type', 'string'),
+    ('benchmark_job_name', 'string'),
+    ('run_name', 'string'),
+    ('mcc_version', 'string'),
+    ('run_timestamp', 'string'),
+    ('region', 'string'),
+    ('adapter_name', 'string'),
+    # GPU / engine signals (BL086; nullable — NULL = signal unavailable)
+    ('gpu_utilization_avg', 'double'),
+    ('gpu_utilization_max', 'double'),
+    ('gpu_memory_used_avg_gb', 'double'),
+    ('gpu_memory_util_avg', 'double'),
+    ('kv_cache_util_avg', 'double'),
+    ('kv_cache_util_max', 'double'),
+    ('prefix_cache_hit_rate', 'double'),
+    ('queue_depth_running_avg', 'double'),
+    ('queue_depth_waiting_avg', 'double'),
+    ('queue_depth_waiting_max', 'double'),
+    ('metrics_source', 'string'),
+    # ── Wave 9 (append-only below) ──
+    # BL128 curated AIPerf time-weighted aggregates (R10.1)
+    ('effective_concurrency_avg', 'double'),
+    ('effective_concurrency_p90', 'double'),
+    ('effective_total_tps_avg', 'double'),
+    ('effective_total_tps_p90', 'double'),
+    ('effective_decode_tps_avg', 'double'),
+    ('effective_decode_tps_p90', 'double'),
+    ('effective_prefill_tps_avg', 'double'),
+    ('effective_prefill_tps_p90', 'double'),
+    ('active_decode_tps_avg', 'double'),
+    ('active_decode_tps_p90', 'double'),
+    ('active_prefill_tps_avg', 'double'),
+    ('active_prefill_tps_p90', 'double'),
+    ('tokens_in_flight_avg', 'double'),
+    ('tokens_in_flight_p90', 'double'),
+    ('effective_latency_avg_ms', 'double'),
+    ('effective_latency_p90_ms', 'double'),
+    # R10.2
+    ('aiperf_version', 'string'),
+    ('spec_decode_acceptance_rate', 'double'),
+    # Cost inputs (R8.3) + Bedrock comparison (R9.4)
+    ('price_usd_per_hour', 'double'),
+    ('price_source', 'string'),
+    ('price_as_of', 'string'),
+    ('price_component', 'string'),
+    ('instance_count', 'int'),
+    ('bedrock_model_id', 'string'),
+    ('bedrock_cost_per_1m_tokens', 'double'),
+]
+
+# BL128 (R10.1): AIPerf profile_export_aiperf.json top-level key -> column stem
+# and the unit family it must be in. Values in any other unit are NULL (never
+# converted by guesswork). Verified against AIPerf 0.12.0 / 0.13.0 exports.
+_AIPERF_CURATED = (
+    ('effective_concurrency', 'effective_concurrency', 'requests'),
+    ('effective_total_throughput', 'effective_total_tps', 'tps'),
+    ('effective_decode_throughput', 'effective_decode_tps', 'tps'),
+    ('effective_prefill_throughput', 'effective_prefill_tps', 'tps'),
+    ('active_decode_throughput', 'active_decode_tps', 'tps'),
+    ('active_prefill_throughput', 'active_prefill_tps', 'tps'),
+    ('tokens_in_flight', 'tokens_in_flight', 'tokens'),
+    ('effective_latency', 'effective_latency', 'ms'),
+)
+_AIPERF_UNIT_SCALE = {
+    'requests': {'requests': 1.0},
+    'tps': {'tokens/sec': 1.0, 'tokens/s': 1.0},
+    'tokens': {'tokens': 1.0},
+    'ms': {'ms': 1.0, 'sec': 1000.0, 's': 1000.0, 'us': 0.001, 'ns': 0.000001},
 }
 
 
@@ -175,33 +285,97 @@ def derive_instance_family(instance_type):
 compute_instance_family = derive_instance_family
 
 
-def compute_cost_per_1m_tokens(instance_type, tokens_per_second):
-    """Estimate cost per 1M output tokens (USD).
+def _load_helper(name):
+    """Import a do/lib/python helper (pricing, target_manifest) by path.
 
-    Uses approximate on-demand SageMaker AI instance pricing.
-    If tokens_per_second is 0 or unknown, returns None.
-
-    Args:
-        instance_type: SageMaker AI instance type string.
-        tokens_per_second: Output tokens/second throughput.
-
-    Returns:
-        float or None — estimated USD cost per 1M output tokens.
+    The writer lives at <project>/do/.benchmark_writer.py (source tree:
+    templates/do/), so helpers are always at ./lib/python/<name>.py.
     """
-    if not instance_type or not tokens_per_second:
-        return None
-    if tokens_per_second <= 0:
-        return None
+    import importlib.util as _ilu
+    if name in sys.modules:
+        return sys.modules[name]
+    lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib', 'python')
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    spec = _ilu.spec_from_file_location(name, os.path.join(lib_dir, f'{name}.py'))
+    mod = _ilu.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
-    # Extract instance spec (remove ml. prefix)
-    instance_spec = instance_type.replace('ml.', '', 1) if instance_type.startswith('ml.') else instance_type
-    cost_per_hour = INSTANCE_PRICING_USD_PER_HOUR.get(instance_spec)
-    if cost_per_hour is None:
-        return None
 
-    # cost_per_1m_tokens = (cost_per_hour / tokens_per_second / 3600) * 1_000_000
-    cost_per_token = cost_per_hour / (tokens_per_second * 3600)
-    return round(cost_per_token * 1_000_000, 4)
+# ── BL128: curated AIPerf aggregates (R10) ───────────────────────────────────
+
+
+def aiperf_aggregate_columns(data):
+    """Map an AIPerf profile_export_aiperf.json dict to the 16 curated columns
+    plus aiperf_version. Missing keys, missing stats or an unexpected unit
+    yield None for that column (R10.3). Never raises."""
+    cols = {}
+    data = data if isinstance(data, dict) else {}
+    for key, stem, family in _AIPERF_CURATED:
+        metric = data.get(key)
+        scale = None
+        if isinstance(metric, dict):
+            scale = _AIPERF_UNIT_SCALE[family].get(metric.get('unit'))
+        for stat in ('avg', 'p90'):
+            col = f'{stem}_{stat}_ms' if family == 'ms' else f'{stem}_{stat}'
+            val = metric.get(stat) if isinstance(metric, dict) else None
+            if scale is None or not isinstance(val, (int, float)) or isinstance(val, bool):
+                cols[col] = None
+            else:
+                cols[col] = float(val) * scale
+    version = data.get('aiperf_version')
+    cols['aiperf_version'] = str(version) if version not in (None, '') else None
+    return cols
+
+
+def load_aiperf_aggregates(path):
+    """Read one aiperf JSON and return its curated columns ({} when unreadable)."""
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, 'r') as f:
+            return aiperf_aggregate_columns(json.load(f))
+    except (OSError, ValueError):
+        return {}
+
+
+def find_aiperf_aggregates(results_path, aiperf_dir=None, concurrencies=()):
+    """Locate the per-level aiperf JSON files for a write (R10.1).
+
+    Returns {concurrency(int) | '*': columns}. Sweep: <aiperf_dir or the
+    results file's directory>/results-concurrency-<L>.json per level.
+    Single level: the results file itself when it IS the aiperf JSON, else its
+    sibling profile_export_aiperf.json (key '*').
+    """
+    found = {}
+    base_dir = aiperf_dir or (os.path.dirname(os.path.abspath(results_path)) if results_path else None)
+    if base_dir:
+        for conc in concurrencies:
+            try:
+                level = int(conc)
+            except (TypeError, ValueError):
+                continue
+            cols = load_aiperf_aggregates(os.path.join(base_dir, f'results-concurrency-{level}.json'))
+            if cols:
+                found[level] = cols
+    if found or not results_path:
+        return found
+    if os.path.basename(results_path) == 'profile_export_aiperf.json':
+        cols = load_aiperf_aggregates(results_path)
+    else:
+        cols = load_aiperf_aggregates(os.path.join(os.path.dirname(os.path.abspath(results_path)),
+                                                   'profile_export_aiperf.json'))
+    if cols:
+        found['*'] = cols
+    return found
+
+
+_AIPERF_COLUMN_NAMES = tuple(
+    name for name, _kind in PARQUET_COLUMNS
+    if name.startswith(('effective_', 'active_', 'tokens_in_flight_')) or name == 'aiperf_version'
+)
 
 
 def compute_partition_keys(timestamp):
@@ -340,7 +514,53 @@ def _extract_base_image_version(base_image):
     return ''
 
 
-def enrich_records(config, results, run_timestamp=None, instance_catalog=None, gpu_metrics=None):
+def _no_bedrock_prices(_model, _region):
+    return {'input_usd_per_1m': None, 'output_usd_per_1m': None, 'reason': 'no Bedrock price resolver'}
+
+
+def _cost_columns(cost_context, output_tps, model_name, adapter_name, region, isl_avg, osl_avg):
+    """Cost + price-input + Bedrock columns for one level (R8.1, R8.3, R9).
+
+    Returns (columns, reason_or_None, bedrock_result_or_None).
+    """
+    cols = {
+        'cost_per_1m_tokens': None, 'price_usd_per_hour': None, 'price_source': None,
+        'price_as_of': None, 'price_component': None, 'instance_count': None,
+        'bedrock_model_id': None, 'bedrock_cost_per_1m_tokens': None,
+    }
+    if not cost_context:
+        return cols, 'price not resolved', None
+    pricing = _load_helper('pricing')
+    price = cost_context.get('price') or {}
+    count = cost_context.get('instance_count')
+    cols.update({
+        'price_usd_per_hour': price.get('usd_per_hour'),
+        'price_source': price.get('source'),
+        'price_as_of': price.get('as_of'),
+        'price_component': price.get('component'),
+        'instance_count': count,
+    })
+    cols['cost_per_1m_tokens'] = pricing.compute_cost(price.get('usd_per_hour'), count, output_tps)
+    reason = None
+    if cols['cost_per_1m_tokens'] is None:
+        if price.get('usd_per_hour') is None:
+            reason = f"no price: {price.get('reason') or 'unresolved'}"
+        elif count is None:
+            reason = f"no instance count: {cost_context.get('instance_count_reason') or 'unknown'}"
+        else:
+            reason = 'no measured output throughput'
+    bedrock = pricing.bedrock_comparison(
+        model_name, adapter_name=adapter_name, region=region,
+        input_seq_len_avg=isl_avg, output_seq_len_avg=osl_avg,
+        catalog=cost_context.get('bedrock_catalog') or {},
+        price_resolver=cost_context.get('bedrock_price_resolver') or _no_bedrock_prices)
+    cols['bedrock_model_id'] = bedrock.get('bedrock_model_id')
+    cols['bedrock_cost_per_1m_tokens'] = bedrock.get('bedrock_cost_per_1m_tokens')
+    return cols, reason, bedrock
+
+
+def enrich_records(config, results, run_timestamp=None, instance_catalog=None, gpu_metrics=None,
+                   cost_context=None, aiperf_aggregates=None):
     """Build enriched records from config context and benchmark results.
 
     Each metrics entry becomes one enriched record with all Athena columns populated.
@@ -358,6 +578,13 @@ def enrich_records(config, results, run_timestamp=None, instance_catalog=None, g
             'metrics_source' key set by the caller; when absent, provenance is
             derived from which signal groups are present. Missing signals → NULL
             columns (additive-only migration).
+        cost_context: Optional dict from _resolve_cost_context() (Wave 9 R7-R9):
+            {'price': pricing.resolve_instance_price() result, 'instance_count',
+            'instance_count_reason', 'bedrock_catalog', 'bedrock_price_resolver'}.
+            None → every cost / price / Bedrock column is NULL (with a reason
+            kept in the record's private '_cost_reason').
+        aiperf_aggregates: Optional {concurrency | '*': columns} from
+            find_aiperf_aggregates() (BL128 R10). Missing → NULL columns.
 
     Returns:
         list of enriched record dicts (one per concurrency level).
@@ -468,8 +695,21 @@ def enrich_records(config, results, run_timestamp=None, instance_catalog=None, g
         else:
             status = 'completed'
 
-        # Cost computation
-        cost = compute_cost_per_1m_tokens(instance_type, tokens_per_second)
+        # Cost (R8.1): usd/h x instance_count x 1e6 / (3600 x output tok/s),
+        # from the resolved price + billed count. Any missing input → NULL.
+        cost_cols, cost_reason, bedrock = _cost_columns(
+            cost_context, tokens_per_second, model_name, config.get('adapter_name', ''), region,
+            scalar(metric.get('input_sequence_length', metric.get('input_sequence_length_avg', 0.0))),
+            scalar(metric.get('output_sequence_length', metric.get('output_sequence_length_avg', 0.0))))
+
+        # BL128 curated AIPerf aggregates for this level (R10.1).
+        _agg = aiperf_aggregates or {}
+        try:
+            _level_key = int(concurrency)
+        except (TypeError, ValueError):
+            _level_key = None
+        agg_cols = _agg.get(_level_key) or _agg.get('*') or {}
+        aiperf_cols = {k: agg_cols.get(k) for k in _AIPERF_COLUMN_NAMES}
 
         # Build serving_config JSON blob from all available config params
         serving_config_dict = {
@@ -543,7 +783,7 @@ def enrich_records(config, results, run_timestamp=None, instance_catalog=None, g
             'output_sequence_length_avg': scalar(metric.get('output_sequence_length', metric.get('output_sequence_length_avg', 0.0))),
             'input_sequence_length_avg': scalar(metric.get('input_sequence_length', metric.get('input_sequence_length_avg', 0.0))),
             'error_rate': error_rate,
-            'cost_per_1m_tokens': cost,
+            'cost_per_1m_tokens': cost_cols['cost_per_1m_tokens'],
             'benchmark_duration_sec': metric.get('benchmark_duration_sec', duration_seconds),
             'run_type': run_type,
             'benchmark_job_name': results.get('job_name', '') if isinstance(results, dict) else '',
@@ -554,6 +794,14 @@ def enrich_records(config, results, run_timestamp=None, instance_catalog=None, g
             'adapter_name': config.get('adapter_name', ''),
             # GPU efficiency signals + provenance (BL086); None → NULL column.
             **gpu_columns,
+            # Wave 9: BL128 aggregates, spec-decode acceptance (R10.2), cost
+            # inputs (R8.3) and the Bedrock comparison (R9.4).
+            **aiperf_cols,
+            'spec_decode_acceptance_rate': gpu_metrics.get('spec_decode_acceptance_rate'),
+            **cost_cols,
+            # Private (not a Parquet column): feeds the printed cost summary.
+            '_cost_reason': cost_reason,
+            '_bedrock': bedrock,
         }
         records.append(record)
 
@@ -705,6 +953,65 @@ def emit_validation_error(errors):
 # ── Partition Registration ────────────────────────────────────────────────────
 
 
+def _column_signature(columns):
+    """[(name, type)] for a Glue column list (comments ignored)."""
+    out = []
+    for col in columns or []:
+        if isinstance(col, dict):
+            out.append((col.get('Name'), col.get('Type')))
+    return out
+
+
+def reconcile_partition_columns(glue_client, glue_database, glue_table, partition_values, table_sd):
+    """R11.4: make an existing partition's column list match the table's.
+
+    A partition registered before a schema change keeps its old column list,
+    which hides the new columns for every file under it. Compares (name, type)
+    lists and calls UpdatePartition ONLY when they differ (idempotent).
+    Returns (reconciled: bool, error: str | None). Never raises.
+    """
+    try:
+        resp = glue_client.get_partition(
+            DatabaseName=glue_database, TableName=glue_table, PartitionValues=partition_values)
+    except Exception as e:
+        return False, f"GetPartition failed: {e}"
+    partition = resp.get('Partition') if isinstance(resp, dict) else None
+    if not isinstance(partition, dict):
+        return False, None
+    part_sd = partition.get('StorageDescriptor') or {}
+    table_cols = table_sd.get('Columns') or []
+    if _column_signature(part_sd.get('Columns')) == _column_signature(table_cols):
+        return False, None
+    new_sd = {k: v for k, v in part_sd.items()}
+    new_sd['Columns'] = table_cols
+    partition_input = {
+        'Values': partition.get('Values') or partition_values,
+        'StorageDescriptor': new_sd,
+    }
+    if isinstance(partition.get('Parameters'), dict):
+        partition_input['Parameters'] = partition['Parameters']
+    try:
+        glue_client.update_partition(
+            DatabaseName=glue_database, TableName=glue_table,
+            PartitionValueList=partition_values, PartitionInput=partition_input)
+    except Exception as e:
+        return False, f"UpdatePartition failed: {e}"
+    return True, None
+
+
+def _already_exists_result(glue_client, glue_database, glue_table, partition_values, location, table_sd):
+    reconciled, error = reconcile_partition_columns(
+        glue_client, glue_database, glue_table, partition_values, table_sd)
+    return {
+        'registered': False,
+        'already_exists': True,
+        'reconciled': reconciled,
+        'partition_values': partition_values,
+        'location': location,
+        'error': error,
+    }
+
+
 def register_partition(bucket, model, instance, target,
                        glue_database='mlcc_ci', glue_table='benchmark_results',
                        glue_client=None, region='us-east-1'):
@@ -807,13 +1114,8 @@ def register_partition(bucket, model, instance, target,
     except Exception as e:
         # Handle AlreadyExistsException thrown as an API exception
         if 'AlreadyExistsException' in str(e):
-            return {
-                'registered': False,
-                'already_exists': True,
-                'partition_values': partition_values,
-                'location': location,
-                'error': None,
-            }
+            return _already_exists_result(glue_client, glue_database, glue_table,
+                                          partition_values, location, table_sd)
         return {
             'registered': False,
             'already_exists': False,
@@ -829,13 +1131,8 @@ def register_partition(bucket, model, instance, target,
         error_code = error_detail.get('ErrorCode', '')
 
         if error_code == 'AlreadyExistsException':
-            return {
-                'registered': False,
-                'already_exists': True,
-                'partition_values': partition_values,
-                'location': location,
-                'error': None,
-            }
+            return _already_exists_result(glue_client, glue_database, glue_table,
+                                          partition_values, location, table_sd)
         else:
             error_msg = error_detail.get('ErrorMessage', 'unknown error')
             return {
@@ -920,103 +1217,20 @@ def resolve_instance_metadata(instance_type, instance_catalog=None):
 
 
 def get_parquet_schema():
-    """Return the pyarrow schema matching the Athena DDL for benchmark_results.
+    """Return the pyarrow schema for benchmark_results, built from PARQUET_COLUMNS.
 
-    All columns defined in the Athena DDL are included. Partition columns
-    (model, instance, target) are NOT included here — they are encoded in the
-    S3 path and handled by Glue/Athena partitioning.
+    Partition columns (model, instance, target) are NOT included here — they
+    are encoded in the S3 path and handled by Glue/Athena partitioning.
     """
     import pyarrow as pa
 
-    return pa.schema([
-        # Identity
-        pa.field("project_name", pa.string()),
-
-        # Model + Serving Config (queryable columns)
-        pa.field("model_name", pa.string()),
-        pa.field("model_family", pa.string()),
-        pa.field("instance_type", pa.string()),
-        pa.field("deployment_config", pa.string()),
-        pa.field("deployment_target", pa.string()),
-        pa.field("quantization", pa.string()),
-        pa.field("tensor_parallel_degree", pa.int32()),
-
-        # Hardware metadata (resolved from instance catalog at write time)
-        pa.field("instance_family", pa.string()),
-        pa.field("gpu_count", pa.int32()),
-        pa.field("gpu_type", pa.string()),
-        pa.field("gpu_memory_gb", pa.float64()),
-
-        # Configuration dimensions (top-level for Athena queryability)
-        pa.field("max_model_len", pa.int32()),
-        pa.field("enable_lora", pa.bool_()),
-        pa.field("kv_cache_dtype", pa.string()),
-
-        # Full serving config (extensible JSON blob)
-        pa.field("serving_config", pa.string()),
-
-        # Workload
-        pa.field("workload", pa.string()),
-        pa.field("concurrency", pa.int32()),
-        pa.field("input_tokens_mean", pa.int32()),
-        pa.field("output_tokens_mean", pa.int32()),
-        pa.field("streaming", pa.bool_()),
-        pa.field("duration_seconds", pa.int32()),
-
-        # Rich Metrics
-        pa.field("request_throughput_rps", pa.float64()),
-        pa.field("total_token_throughput_tps", pa.float64()),
-        pa.field("output_token_throughput_tps", pa.float64()),
-        pa.field("request_count", pa.float64()),
-        pa.field("ttft_avg_ms", pa.float64()),
-        pa.field("ttft_p50_ms", pa.float64()),
-        pa.field("ttft_p90_ms", pa.float64()),
-        pa.field("ttft_p99_ms", pa.float64()),
-        pa.field("itl_avg_ms", pa.float64()),
-        pa.field("itl_p50_ms", pa.float64()),
-        pa.field("itl_p90_ms", pa.float64()),
-        pa.field("itl_p99_ms", pa.float64()),
-        pa.field("e2e_latency_avg_ms", pa.float64()),
-        pa.field("e2e_latency_p50_ms", pa.float64()),
-        pa.field("e2e_latency_p90_ms", pa.float64()),
-        pa.field("e2e_latency_p99_ms", pa.float64()),
-        pa.field("prefill_tps_avg", pa.float64()),
-        pa.field("prefill_tps_p50", pa.float64()),
-        pa.field("output_token_tps_avg", pa.float64()),
-        pa.field("output_token_tps_p50", pa.float64()),
-        pa.field("output_token_tps_p90", pa.float64()),
-        pa.field("ttst_p50_ms", pa.float64()),
-        pa.field("ttst_p90_ms", pa.float64()),
-        pa.field("output_sequence_length_avg", pa.float64()),
-        pa.field("input_sequence_length_avg", pa.float64()),
-        pa.field("error_rate", pa.float64()),
-        pa.field("cost_per_1m_tokens", pa.float64()),
-        pa.field("benchmark_duration_sec", pa.float64()),
-
-        # Run Metadata
-        pa.field("run_type", pa.string()),
-        pa.field("benchmark_job_name", pa.string()),
-        pa.field("mcc_version", pa.string()),
-        pa.field("run_timestamp", pa.string()),
-        pa.field("region", pa.string()),
-        pa.field("adapter_name", pa.string()),
-
-        # GPU efficiency signals (BL086; all nullable — NULL = signal unavailable)
-        # Phase 1: CloudWatch (all engines, all targets)
-        pa.field("gpu_utilization_avg", pa.float64()),
-        pa.field("gpu_utilization_max", pa.float64()),
-        pa.field("gpu_memory_used_avg_gb", pa.float64()),
-        pa.field("gpu_memory_util_avg", pa.float64()),
-        # Phase 2: engine /metrics (HyperPod EKS only)
-        pa.field("kv_cache_util_avg", pa.float64()),
-        pa.field("kv_cache_util_max", pa.float64()),
-        pa.field("prefix_cache_hit_rate", pa.float64()),
-        pa.field("queue_depth_running_avg", pa.float64()),
-        pa.field("queue_depth_waiting_avg", pa.float64()),
-        pa.field("queue_depth_waiting_max", pa.float64()),
-        # Provenance
-        pa.field("metrics_source", pa.string()),
-    ])
+    kind_to_type = {
+        'string': pa.string(),
+        'double': pa.float64(),
+        'int': pa.int32(),
+        'boolean': pa.bool_(),
+    }
+    return pa.schema([pa.field(name, kind_to_type[kind]) for name, kind in PARQUET_COLUMNS])
 
 
 def _records_to_parquet_table(records):
@@ -1374,6 +1588,114 @@ def _collect_gpu_signals(args, input_data):
     return signals
 
 
+def _read_config_vars(config_path, names):
+    """Read plain VAR=value / export VAR="value" (and ${VAR:-default}) entries
+    for ``names`` from a do/config file. Missing file → {}."""
+    out = {}
+    if not config_path or not names:
+        return out
+    try:
+        with open(config_path, 'r') as f:
+            lines = f.read().split('\n')
+    except (OSError, IOError):
+        return out
+    for line in lines:
+        line = line.strip()
+        if line.startswith('export '):
+            line = line[7:]
+        if '=' not in line or line.startswith('#'):
+            continue
+        key, _, value = line.partition('=')
+        key = key.strip()
+        if key not in names:
+            continue
+        value = value.strip().strip('"').strip("'")
+        if value.startswith('${') and ':-' in value:
+            value = value.split(':-', 1)[1].rstrip('}')
+        if value.startswith('${') or value.startswith('$('):
+            continue
+        out[key] = value
+    return out
+
+
+def _resolve_cost_context(args, input_data, allow_api=True):
+    """Resolve the price, billed instance count and Bedrock price lookup for a
+    write (Wave 9 R7-R9). Service/component/count basis come from the target
+    descriptor's ``pricing`` block. Never raises: any failure yields a context
+    whose missing pieces carry a reason (→ NULL columns)."""
+    try:
+        pricing = _load_helper('pricing')
+        target_manifest = _load_helper('target_manifest')
+    except Exception as e:
+        return {'price': {'usd_per_hour': None, 'reason': f'pricing helper unavailable: {e}'},
+                'instance_count': None, 'instance_count_reason': 'pricing helper unavailable'}
+
+    instance_type = input_data.get('instance_type', '')
+    region = input_data.get('region', '') or os.environ.get('AWS_REGION', '')
+    target = (input_data.get('deployment_target') or 'realtime-inference').strip()
+    try:
+        target = target_manifest.resolve_target(target)
+    except Exception:
+        pass
+
+    price = pricing.resolve_instance_price(
+        instance_type, region, target, cache_path=pricing.default_cache_path(),
+        snapshot_path=pricing.default_snapshot_path(), allow_api=allow_api)
+    # Design §10: a live-API failure is a warning naming the reason (and the
+    # IAM action when it is an AccessDenied), whether or not a fallback hit.
+    _api_note = price.get('fallback_reason') or price.get('reason') or ''
+    if allow_api and 'pricing-api:' in _api_note and 'skipped (offline)' not in _api_note:
+        print(f"⚠️  Pricing API lookup failed ({_api_note}); "
+              f"price source: {price.get('source') or 'none (cost NULL)'}", file=sys.stderr)
+
+    # Billed instance count (R8.2). Env first (do/benchmark sources do/config),
+    # then the config file for standalone runs.
+    try:
+        spec_count = (target_manifest.pricing(target) or {}).get('instance_count') or {}
+    except Exception:
+        spec_count = {}
+    var_names = {v for v in (spec_count.get('replicas_var'), spec_count.get('gpus_per_replica_var'),
+                             'ENDPOINT_NAME') if v}
+    env = _read_config_vars(getattr(args, 'config_file', None), var_names)
+    env.update({k: os.environ[k] for k in var_names if os.environ.get(k)})
+    hw = resolve_instance_metadata(instance_type)
+    count, count_reason = pricing.compute_instance_count(
+        target, gpus_per_instance=hw.get('gpu_count'), env=env,
+        endpoint_name=getattr(args, 'endpoint_name', None) or env.get('ENDPOINT_NAME'),
+        region=region, allow_api=allow_api)
+
+    memo = {}
+
+    def bedrock_prices(model, reg):
+        key = (model, reg)
+        if key not in memo:
+            memo[key] = pricing.resolve_bedrock_prices(
+                model, reg, cache_path=pricing.default_cache_path(),
+                snapshot_path=pricing.default_snapshot_path(), allow_api=allow_api)
+        return memo[key]
+
+    return {
+        'price': price,
+        'instance_count': count,
+        'instance_count_reason': count_reason,
+        'bedrock_catalog': pricing.load_bedrock_catalog(),
+        'bedrock_price_resolver': bedrock_prices,
+    }
+
+
+def _cost_summary(records):
+    """Printed cost lines (R8.4/R8.5/R9.4) for a set of enriched records."""
+    try:
+        return _load_helper('pricing').cost_summary_lines(records)
+    except Exception as e:
+        return [f'cost summary unavailable: {e}']
+
+
+def _public_records(records):
+    """Strip the writer-private '_'-prefixed keys before JSON output."""
+    return [{k: v for k, v in r.items() if not k.startswith('_')} for r in records]
+
+
 def cmd_write(args):
     """Validate, enrich, and write benchmark results to S3 as Parquet.
 
@@ -1474,7 +1796,14 @@ def cmd_write(args):
         if getattr(args, 'run_name', None):
             results_obj['run_name'] = args.run_name
 
-        enriched_records = enrich_records(config_context, results_obj, timestamp, gpu_metrics=gpu_signals)
+        # Dry run makes no live pricing / DescribeEndpoint call (cache + snapshot only).
+        cost_context = _resolve_cost_context(args, input_data, allow_api=False)
+        aiperf_aggs = find_aiperf_aggregates(
+            results_path, getattr(args, 'aiperf_dir', None),
+            [m.get('concurrency') for m in input_data['metrics'] if isinstance(m, dict)])
+        enriched_records = enrich_records(config_context, results_obj, timestamp, gpu_metrics=gpu_signals,
+                                          cost_context=cost_context, aiperf_aggregates=aiperf_aggs)
+        cost_lines = _cost_summary(enriched_records)
 
         # Compute intended S3 path (use bucket if provided, else placeholder)
         bucket = args.bucket or '<benchmark bucket (profile benchmarkS3Bucket)>'
@@ -1486,7 +1815,8 @@ def cmd_write(args):
             "s3_path": s3_path,
             "partition": partition,
             "record_count": len(enriched_records),
-            "records": enriched_records,
+            "records": _public_records(enriched_records),
+            "cost_summary": cost_lines,
         })
         return  # Never reached after _output
 
@@ -1505,7 +1835,12 @@ def cmd_write(args):
     if getattr(args, 'run_name', None):
         results_obj['run_name'] = args.run_name
 
-    enriched_records = enrich_records(config_context, results_obj, timestamp, gpu_metrics=gpu_signals)
+    cost_context = _resolve_cost_context(args, input_data, allow_api=True)
+    aiperf_aggs = find_aiperf_aggregates(
+        results_path, getattr(args, 'aiperf_dir', None),
+        [m.get('concurrency') for m in input_data['metrics'] if isinstance(m, dict)])
+    enriched_records = enrich_records(config_context, results_obj, timestamp, gpu_metrics=gpu_signals,
+                                      cost_context=cost_context, aiperf_aggregates=aiperf_aggs)
 
     if not enriched_records:
         _error_exit("No records produced from benchmark metrics")
@@ -1567,9 +1902,16 @@ def cmd_write(args):
             file=sys.stderr,
         )
 
+    # Cost summary (R8.4/R8.5): human lines on stderr (stdout stays JSON).
+    cost_lines = _cost_summary(enriched_records)
+    print('\n💲 Cost (' + input_data.get('deployment_target', 'realtime-inference') + '):', file=sys.stderr)
+    for line in cost_lines:
+        print(f'   {line}', file=sys.stderr)
+
     _output({
         "success": True,
         "s3_uri": s3_info['s3_uri'],
+        "cost_summary": cost_lines,
         "partition": {
             "model": s3_info['partition_model'],
             "instance": s3_info['partition_instance'],
@@ -1852,6 +2194,11 @@ def main():
     write_parser.add_argument(
         '--run-end', dest='run_end', default=None,
         help='ISO 8601 UTC benchmark run end time (for the CloudWatch query window)'
+    )
+    write_parser.add_argument(
+        '--aiperf-dir', dest='aiperf_dir', default=None,
+        help='Directory holding per-level results-concurrency-<L>.json AIPerf aggregate files '
+             '(BL128; default: the results file directory, or the sibling profile_export_aiperf.json)'
     )
     write_parser.add_argument(
         '--gpu-metrics-file', dest='gpu_metrics_file', default=None,

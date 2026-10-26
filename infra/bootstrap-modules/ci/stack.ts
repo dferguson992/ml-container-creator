@@ -101,6 +101,25 @@ export class MlccCiStack extends cdk.Stack {
             actions: ['logs:CreateLogStream', 'logs:PutLogEvents'],
             resources: [logGroup.logGroupArn, `${logGroup.logGroupArn}:*`],
         }));
+        // Wave 9 (R7, R11.4): the benchmark writer that CI runs resolves on-demand
+        // prices through the Price List API (no resource-level permissions, so
+        // '*') and registers / reconciles its Glue partition. Database name comes
+        // from the benchmark module's export, not a literal.
+        codebuildRole.addToPolicy(new iam.PolicyStatement({
+            sid: 'BenchmarkPriceLookup',
+            actions: ['pricing:GetProducts'],
+            resources: ['*'],
+        }));
+        const glueDatabase = cdk.Fn.importValue(`mlcc-${profileName}-benchmark-GlueDatabase`);
+        codebuildRole.addToPolicy(new iam.PolicyStatement({
+            sid: 'BenchmarkPartitionRegister',
+            actions: ['glue:GetTable', 'glue:GetPartition', 'glue:BatchCreatePartition', 'glue:UpdatePartition'],
+            resources: [
+                `arn:${this.partition}:glue:${this.region}:${this.account}:catalog`,
+                `arn:${this.partition}:glue:${this.region}:${this.account}:database/${glueDatabase}`,
+                `arn:${this.partition}:glue:${this.region}:${this.account}:table/${glueDatabase}/*`,
+            ],
+        }));
 
         // CodeBuild project
         const codebuildProject = new codebuild.Project(this, 'CiExecutor', {

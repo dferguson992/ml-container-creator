@@ -135,6 +135,7 @@
     "sync:models": "node scripts/sync-model-families.js",
     "sync:serving": "node scripts/sync-serving-versions.js",
     "sync:all": "npm run sync:models && npm run sync:serving",
+    "sync:pricing": "python3 templates/do/lib/python/pricing.py snapshot",
     "validate:doc-commands": "node scripts/validate-docs-commands.js",
     "validate:catalogs": "node scripts/validate-catalogs.js",
     "validate:serve-manifests": "node scripts/validate-serve-manifests.js",

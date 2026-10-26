@@ -1830,6 +1830,14 @@ if [ -n "${BENCHMARK_CONCURRENCY_LEVELS:-}" ] && [ -z "${_BENCHMARK_SINGLE_LEVEL
                 elif [ -n "${_LATEST_JOB_DIR}" ] && [ -f "${_LATEST_JOB_DIR}/output/profile_export_aiperf.json" ]; then
                     cp "${_LATEST_JOB_DIR}/output/profile_export_aiperf.json" "${_ALL_RESULTS_DIR}/results-concurrency-${_LEVEL}.json"
                 fi
+                # BL128 (W9 R10.1): also keep the level's AIPerf aggregate JSON next to
+                # its JSONL; the writer reads results-concurrency-<L>.json from the
+                # results dir for the Effective/Active columns (JSONL stays the metrics
+                # source — the aggregator only falls back to these JSONs without JSONL).
+                if [ -n "${_LATEST_JOB_DIR}" ] && [ -f "${_LATEST_JOB_DIR}/output/profile_export_aiperf.json" ] \
+                    && [ ! -f "${_ALL_RESULTS_DIR}/results-concurrency-${_LEVEL}.json" ]; then
+                    cp "${_LATEST_JOB_DIR}/output/profile_export_aiperf.json" "${_ALL_RESULTS_DIR}/results-concurrency-${_LEVEL}.json"
+                fi
             else
                 echo "⚠️  Benchmark at concurrency ${_LEVEL} failed (non-fatal, continuing)"
                 _LEVEL_FAILURES=$((_LEVEL_FAILURES + 1))

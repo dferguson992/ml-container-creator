@@ -332,7 +332,12 @@ class TestBenchmarkWriterUnchanged:
     # placeholder no longer spells a convention-built bucket name
     # (mlcc-benchmark-results-<accountId>-<region>); it now labels the profile key
     # benchmarkS3Bucket. Display-only; real writes always pass --bucket.
-    _EXPECTED_SHA256 = "434489039597a7d981afbf7c9a5d1c5154c7c896ba1fe93b872f1ad2308c379c"
+    #
+    # Re-pinned (Wave 9 half 9B, R7-R11, spec v2-w9-01): PARQUET_COLUMNS single
+    # column list, Pricing-API cost + instance_count + Bedrock columns, BL128
+    # AIPerf aggregates, Glue partition reconcile; INSTANCE_PRICING_USD_PER_HOUR
+    # deleted. Deliberate, spec-mandated writer change; pin updated.
+    _EXPECTED_SHA256 = "b8767404b719f2c74cf01c0e02d704e686c34600f854b67c67c86d314afde604"
 
     def test_writer_hash_unchanged(self):
         with open(_WRITER_PATH, "rb") as f:

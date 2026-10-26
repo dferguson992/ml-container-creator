@@ -39,7 +39,8 @@ import {
     listTargets,
     allDescriptors,
     statusVarToAnswerKey,
-    adapterDelivery
+    adapterDelivery,
+    pricing
 } from '../../src/lib/target-manifest-reader.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -303,5 +304,46 @@ describe('Wave 6.1 R1.1 — adapter_delivery is declared in the descriptor and r
             'do/adapter must not hardcode the in-pod adapter path');
         assert.match(read('templates/do/lib/python/adapter_delivery.py'), /target_manifest\.adapter_delivery\(/);
         assert.match(read('templates/do/deploy.d/hyperpod-eks'), /target_manifest\.py" adapter_delivery hyperpod-eks/);
+    });
+});
+
+describe('Wave 9 R7.1/R8.2 — pricing is declared in the descriptor and read by the resolver', () => {
+    // Price List component values verified live (Task 1, GetProducts 2026-10-26).
+    const SAGEMAKER_COMPONENTS = ['Hosting', 'AsyncInf', 'BatchTransform', 'Cluster'];
+    it('every target declares a pricing block with a service and a count basis', () => {
+        for (const d of descriptors) {
+            const p = pricing(d.target);
+            assert.ok(['AmazonSageMaker', 'AmazonEC2'].includes(p.service), d.target);
+            assert.ok(p.instance_count && p.instance_count.basis, d.target);
+            if (p.service === 'AmazonSageMaker') {
+                assert.ok(SAGEMAKER_COMPONENTS.includes(p.component), `${d.target}: ${p.component}`);
+            } else {
+                assert.strictEqual(p.component, undefined, `${d.target}: EC2 has no component`);
+            }
+            if (p.instance_count.basis === 'replicas') {
+                assert.ok(p.instance_count.replicas_var && p.instance_count.gpus_per_replica_var, d.target);
+                assert.ok(d.optional_vars[p.instance_count.replicas_var] !== undefined
+                    || d.required_vars.includes(p.instance_count.replicas_var), `${d.target}: replicas var is a target var`);
+            }
+        }
+    });
+    it('the Python reader (target_manifest.py pricing) agrees with the Node reader', () => {
+        const py = process.env.MLCC_PYTHON || 'python3';
+        for (const d of descriptors) {
+            const r = spawnSync(py, [join(ROOT, 'templates/do/lib/python/target_manifest.py'), 'pricing', d.target],
+                { encoding: 'utf8' });
+            assert.strictEqual(r.status, 0, r.stderr);
+            assert.deepStrictEqual(JSON.parse(r.stdout), pricing(d.target), d.target);
+        }
+    });
+    it('the resolver derives service/component from the descriptor (no per-target branch)', () => {
+        const src = read('templates/do/lib/python/pricing.py');
+        assert.match(src, /target_manifest\.pricing\(/);
+        for (const t of targets) {
+            assert.ok(!new RegExp(`['"]${t}['"]`).test(src), `pricing.py must not name target ${t}`);
+        }
+        for (const c of SAGEMAKER_COMPONENTS) {
+            assert.ok(!new RegExp(`['"]${c}['"]`).test(src), `pricing.py must not hardcode component ${c}`);
+        }
     });
 });

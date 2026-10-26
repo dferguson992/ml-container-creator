@@ -19,7 +19,8 @@
     "runtime_owned_vars",
     "serving_config_source",
     "verbs",
-    "answer_params"
+    "answer_params",
+    "pricing"
   ],
   "properties": {
     "target": {
@@ -110,6 +111,27 @@
       "type": "string",
       "minLength": 1,
       "description": "Wave 8 (right-sizing `quota` check): the SageMaker Service Quotas usage suffix this target's instances count against, e.g. 'endpoint usage' (quota name '<instance> for endpoint usage') or 'transform job usage'. Omit on targets whose capacity is cluster-provided (kubernetes family); the quota check then reports skip."
+    },
+    "pricing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service", "instance_count"],
+      "description": "Wave 9 (R7.1, R8.2): how the price resolver (do/lib/python/pricing.py) prices this target's instances. service: the AWS Price List service code. component: the AmazonSageMaker `component` attribute value (Task 1, live GetProducts 2026-10-26: Hosting = real-time endpoints, AsyncInf = async endpoints, BatchTransform = transform jobs, Cluster = HyperPod); omitted for AmazonEC2 (EC2 uses the fixed Linux / Shared / NA / Used filter set). instance_count: how many instances one benchmark run is billed for.",
+      "properties": {
+        "service": { "type": "string", "enum": ["AmazonSageMaker", "AmazonEC2"] },
+        "component": { "type": "string", "enum": ["Hosting", "AsyncInf", "BatchTransform", "Cluster"] },
+        "instance_count": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["basis"],
+          "description": "basis endpoint-current: DescribeEndpoint ProductionVariants[0].CurrentInstanceCount at write time. basis replicas: nodes occupied = ceil(<replicas_var> x <gpus_per_replica_var> / catalog GPUs per instance); a gpus_per_replica value of 'auto' means the whole instance. basis not-benchmarked: do/benchmark refuses this target, so no count is derived.",
+          "properties": {
+            "basis": { "type": "string", "enum": ["endpoint-current", "replicas", "not-benchmarked"] },
+            "replicas_var": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+            "gpus_per_replica_var": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" }
+          }
+        }
+      }
     },
     "verbs": {
       "type": "object",
