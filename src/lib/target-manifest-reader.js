@@ -122,6 +122,17 @@ export function adapterDelivery(target, targetsDir = TARGETS_D) {
     return d && d.adapter_delivery ? d.adapter_delivery : {};
 }
 /**
+ * The target's pricing declaration (Wave 9 R7.1/R8.2): the Price List service,
+ * the AmazonSageMaker component, and the billed instance-count basis, or {}.
+ * Node twin of target_manifest.pricing(), used by the conformance test.
+ * @returns {{service?: string, component?: string, instance_count?: Object}}
+ */
+export function pricing(target, targetsDir = TARGETS_D) {
+    const d = getDescriptor(target, targetsDir);
+    return d && d.pricing ? d.pricing : {};
+}
+
+/**
  * The status_var -> answer_key map across all targets, for building
  * SHELL_VAR_TO_ANSWER's per-target status entries.
  * @returns {Object<string,string>}

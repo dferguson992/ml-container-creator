@@ -120,6 +120,26 @@ def _load_serve_manifest_module():
         return None
 
 
+def _load_pricing_module():
+    """Import the Wave 9 price/cost formatter (do/lib/python/pricing.py), or
+    None for projects generated before Wave 9."""
+    helper_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib', 'python', 'pricing.py')
+    if not os.path.isfile(helper_path):
+        return None
+    lib_dir = os.path.dirname(helper_path)
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    try:
+        spec = importlib.util.spec_from_file_location('pricing', helper_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except (NameError, AttributeError):
+        raise
+    except Exception:  # noqa: BLE001 — formatter is display-only
+        return None
+
+
 def _dimension_config_key(dimension: str, deployment_target: str | None = None) -> str:
     """Return the do/config key for a benchmark dimension, resolved per deployment target.
 
@@ -477,6 +497,27 @@ class AthenaQueryEngine:
             f"LIMIT 50"
         )
         return self._run_query(sql)
+
+    def query_price_inputs(self, run_timestamp: str, concurrency) -> dict:
+        """Wave 9 (R8.3): the persisted price inputs of one row, for the cost
+        label. A separate best-effort query so --peak keeps working against a
+        table that has not been `bootstrap update`d yet (returns {})."""
+        ts = str(run_timestamp or '').replace("'", "")
+        if not ts:
+            return {}
+        try:
+            conc_clause = f"AND concurrency = {int(concurrency)} "
+        except (TypeError, ValueError):
+            conc_clause = ''
+        sql = (
+            f"SELECT instance_type, price_usd_per_hour, price_source, price_as_of, "
+            f"price_component, instance_count "
+            f"FROM {self.database}.{self.table} "
+            f"WHERE run_timestamp = '{ts}' {conc_clause}"
+            f"LIMIT 1"
+        )
+        rows = self._run_query(sql)
+        return rows[0] if rows else {}
 
     def query_list(self, model_name: str | None = None,
                    model_family: str | None = None,
@@ -1595,6 +1636,34 @@ def cmd_peak(args):
         'delta_from_peak_pct': delta_pct,
     }
 
+    # Wave 9 (R8.4/R8.5): a cost is always labeled with its measured
+    # concurrency, the price source/date and the sustained-utilization caveat.
+    cost_line = None
+    caveat = None
+    if metric == 'cost_per_1m_tokens':
+        pricing = _load_pricing_module()
+        if pricing is not None:
+            inputs = engine.query_price_inputs(peak.get('run_timestamp', ''), peak.get('concurrency'))
+
+            def _num(v):
+                try:
+                    return float(v) if v not in (None, '') else None
+                except (TypeError, ValueError):
+                    return None
+            count = _num(inputs.get('instance_count'))
+            cost_line = pricing.format_cost_line(
+                peak_val, peak.get('concurrency'),
+                instance_type=inputs.get('instance_type') or args.instance_type,
+                instance_count=int(count) if count is not None else None,
+                component=inputs.get('price_component') or None,
+                usd_per_hour=_num(inputs.get('price_usd_per_hour')),
+                price_source=inputs.get('price_source') or 'price source not recorded (pre-Wave-9 row)',
+                price_as_of=inputs.get('price_as_of') or None,
+                reason='no cost recorded')
+            caveat = pricing.COST_CAVEAT
+            result['cost_line'] = cost_line
+            result['caveat'] = caveat
+
     if getattr(args, 'json_output', False):
         _output(result)
 
@@ -1607,6 +1676,9 @@ def cmd_peak(args):
         print(f'   Workload:     {peak.get("workload")}')
     if peak.get('deployment_target'):
         print(f'   Target:       {peak.get("deployment_target")}')
+    if cost_line:
+        print(f'   Cost:         {cost_line}')
+        print(f'                 {caveat}')
     if delta_pct is not None:
         arrow = '↑' if delta_pct > 0 else ('↓' if delta_pct < 0 else '=')
         print(f'\n   Most recent:  {result["most_recent"]["value"]} '

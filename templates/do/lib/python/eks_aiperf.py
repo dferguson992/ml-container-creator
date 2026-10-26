@@ -206,6 +206,13 @@ def relocate_profile_export(artifact_dir: str, dest: str) -> str:
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     if os.path.abspath(found) != os.path.abspath(dest):
         shutil.copyfile(found, dest)
+    # BL128 (Wave 9 R10.3): keep AIPerf's time-weighted aggregate export next to
+    # the JSONL so the writer can persist the Effective/Active columns (and the
+    # sweep copy step finds it under <job>/output/). Absent file -> NULL columns.
+    aggregate = os.path.join(os.path.dirname(found), "profile_export_aiperf.json")
+    aggregate_dest = os.path.join(os.path.dirname(dest), "profile_export_aiperf.json")
+    if os.path.isfile(aggregate) and os.path.abspath(aggregate) != os.path.abspath(aggregate_dest):
+        shutil.copyfile(aggregate, aggregate_dest)
     return dest
 
 

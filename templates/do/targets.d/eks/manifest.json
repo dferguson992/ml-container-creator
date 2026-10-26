@@ -31,6 +31,7 @@
   "serving_config_source": "kubernetes",
   "cluster_contract": { "script": "lib/eks-contract.sh", "entry": "_eks_contract_preflight" },
   "adapter_delivery": { "strategy": "model-prefix", "mount_path": "/opt/ml/model", "subdir": ".mlcc-adapters" },
+  "pricing": { "service": "AmazonEC2", "instance_count": { "basis": "replicas", "replicas_var": "HP_REPLICAS", "gpus_per_replica_var": "HP_GPU_COUNT" } },
   "verbs": {
     "optimize": false,
     "add-ic": false,
