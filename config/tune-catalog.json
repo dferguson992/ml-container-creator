@@ -1269,6 +1269,7 @@
       "provider": "Qwen",
       "displayName": "Qwen3.6-27B",
       "huggingFaceId": "Qwen/Qwen3.6-27B",
+      "architecture": "Qwen3_5ForConditionalGeneration",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -1333,6 +1334,7 @@
       "provider": "Qwen",
       "displayName": "Qwen3.5-9b",
       "huggingFaceId": "Qwen/Qwen3.5-9B",
+      "architecture": "Qwen3_5ForConditionalGeneration",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -1390,6 +1392,7 @@
       "provider": "Qwen",
       "displayName": "Qwen3.5-4B",
       "huggingFaceId": "Qwen/Qwen3.5-4B",
+      "architecture": "Qwen3_5ForConditionalGeneration",
       "techniques": {
         "rlaif": {
           "trainingTypes": [
@@ -1447,6 +1450,7 @@
       "provider": "Qwen",
       "displayName": "Qwen3.5-27b",
       "huggingFaceId": "Qwen/Qwen3.5-27B",
+      "architecture": "Qwen3_5ForConditionalGeneration",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -1504,6 +1508,7 @@
       "provider": "nvidia",
       "displayName": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
       "huggingFaceId": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+      "architecture": "NemotronHForCausalLM",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -1561,6 +1566,7 @@
       "provider": "nvidia",
       "displayName": "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
       "huggingFaceId": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "architecture": "NemotronHForCausalLM",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -1618,6 +1624,7 @@
       "provider": "google",
       "displayName": "gemma-4-e4b-it",
       "huggingFaceId": "google/gemma-4-E4B-it",
+      "architecture": "Gemma4ForConditionalGeneration",
       "techniques": {
         "dpo": {
           "trainingTypes": [
@@ -1675,6 +1682,7 @@
       "provider": "google",
       "displayName": "gemma-4-31b-it",
       "huggingFaceId": "google/gemma-4-31b-it",
+      "architecture": "Gemma4ForConditionalGeneration",
       "techniques": {
         "dpo": {
           "trainingTypes": [
@@ -1739,6 +1747,7 @@
       "provider": "nvidia",
       "displayName": "NVIDIA Nemotron 3.5 Lightning 30B A3B BF16",
       "huggingFaceId": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+      "architecture": "NemotronHForCausalLM",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -1796,6 +1805,7 @@
       "provider": "Qwen",
       "displayName": "Qwen3.8 27B",
       "huggingFaceId": "Qwen/Qwen3.8-27B",
+      "architecture": "Qwen3_5ForConditionalGeneration",
       "techniques": {
         "dpo": {
           "trainingTypes": [
@@ -1853,6 +1863,7 @@
       "provider": "Qwen",
       "displayName": "Qwen3.6-35B-A3B",
       "huggingFaceId": "Qwen/Qwen3.6-35B-A3B",
+      "architecture": "Qwen3_5MoeForConditionalGeneration",
       "techniques": {
         "rlaif": {
           "trainingTypes": [
@@ -1892,6 +1903,7 @@
       "provider": "mistralai",
       "displayName": "Ministral 3 8B Instruct 2512 BF16",
       "huggingFaceId": "mistralai/Ministral-3-8B-Instruct-2512-BF16",
+      "architecture": "Mistral3ForConditionalGeneration",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -1949,6 +1961,7 @@
       "provider": "mistralai",
       "displayName": "Ministral 3 3B Instruct 2512 BF16",
       "huggingFaceId": "mistralai/Ministral-3-3B-Instruct-2512-BF16",
+      "architecture": "Mistral3ForConditionalGeneration",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -2006,6 +2019,7 @@
       "provider": "mistralai",
       "displayName": "Ministral 3 14B Instruct 2512 BF16",
       "huggingFaceId": "mistralai/Ministral-3-14B-Instruct-2512-BF16",
+      "architecture": "Mistral3ForConditionalGeneration",
       "techniques": {
         "dpo": {
           "trainingTypes": [
@@ -2063,6 +2077,7 @@
       "provider": "google",
       "displayName": "gemma-4-26b-a4b-it",
       "huggingFaceId": "google/gemma-4-26B-A4B-it",
+      "architecture": "Gemma4ForConditionalGeneration",
       "techniques": {
         "sft": {
           "trainingTypes": [
@@ -2120,6 +2135,7 @@
       "provider": "meta-models",
       "displayName": "Muse-Glimmer-30B",
       "huggingFaceId": "meta-models/Muse-Glimmer-30B",
+      "architecture": "MuseGlimmerForConditionalGeneration",
       "techniques": {
         "sft": {
           "trainingTypes": [
