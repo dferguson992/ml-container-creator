@@ -151,6 +151,7 @@ If you've already run `npm link`, changes to `src/` and `templates/` take effect
 | `npm run test:unit` | Unit tests only | ~5s |
 | `npm run test:property` | Property-based tests (fast-check) | ~15s |
 | `npm run test:integration` | Generation + parsing tests | ~10s |
+| `npm run test:node` | Suites that import `node:test` (discovered, run via `node --test`) | ~20s |
 | `npm run test:servers` | MCP server standalone tests | ~5s |
 | `npm run test:watch` | Watch mode — re-runs on file change | continuous |
 | `npm run test:coverage` | Tests + coverage report (nyc) | ~45s |
