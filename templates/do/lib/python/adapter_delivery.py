@@ -11,24 +11,34 @@ read via target_manifest.py):
 
     {strategy: model-prefix, mount_path: /opt/ml/model, subdir: <s3_layout.ADAPTER_SUBDIR>}
 
-The CANONICAL adapter home is composed by s3_layout.py (the single layout
-module): <base prefix>/.mlcc-adapters/<project>/<name>/ in the core bucket,
-keyed by the base the adapter was trained on. For a deployment of that base the
-canonical adapter is already on the mount, so delivery is "load by path":
+The CANONICAL adapter is composed by s3_layout.py (the single layout module):
+the content-addressed version <base prefix>/.mlcc-adapters/<project>/<name>/v<hash12>/
+in the core bucket (BL199), keyed by the base the adapter was trained on. For a
+deployment of that base the canonical adapter is already on the mount, so
+delivery is "load by path" (the vLLM lora_name stays <name>):
 
-  s3://<core>/models/<org>/<base>/.mlcc-adapters/<project>/<name>/   (in S3)
-  /opt/ml/model/.mlcc-adapters/<project>/<name>                      (in the pod)
+  s3://<core>/models/<org>/<base>/.mlcc-adapters/<project>/<name>/v<hash12>/   (in S3)
+  /opt/ml/model/.mlcc-adapters/<project>/<name>/v<hash12>                      (in the pod)
+
+An unversioned home written before BL199 (or a hand copy) is still a canonical
+adapter and loads by its own path.
 
 Plan (R1.3), decided from config / the live IEC BEFORE any copy:
   - not yet canonical (tune/train raw output, --from-weights, --from-hub, registry)
-      → promote into the canonical prefix of the ADAPTER's base (s3_layout.promote);
+      → promote into the canonical home of the ADAPTER's base (s3_layout.promote
+        picks the version directory from the content hash);
   - canonical under THIS deployment's model prefix → load by path, no copy;
   - canonical under a DIFFERENT prefix → copy into this deployment's
-      .mlcc-adapters/<project>/<name>/ (a serving copy, marked `serving_copy_of`
-      in its manifest) ONLY when the base id (+ revision, when both are known)
-      matches; otherwise refuse as an incompatible base.
-`do/adapter remove` deletes only a serving copy it made (remove-copy); the
-canonical adapter is never deleted here (that is `do/clean adapters`).
+      .mlcc-adapters/<project>/<name>/v<hash12>/ (a serving copy, marked
+      `serving_copy_of` in its manifest; versioned like its source) ONLY when the
+      base id (+ revision, when both are known) matches; otherwise refuse as an
+      incompatible base.
+When a promotion or copy is planned, the version (so the pod path) is decided by
+that step: the plan's "path" is "" and "path_home" names the home; deliver()
+returns the final path.
+`do/adapter remove` deletes only serving copies it made (remove-copy, every
+version of them); the canonical adapter is never deleted here (that is
+`do/clean adapters`).
 
 CLI (stdlib + boto3 for the S3 subcommands):
     adapter_delivery.py model-base --target T [--iec-json FILE]
@@ -37,7 +47,7 @@ CLI (stdlib + boto3 for the S3 subcommands):
     adapter_delivery.py deliver   (local-path flags) --core-bucket C --adapter-base ID
                         [--deployment-model ID] [--source-job J] [--technique T]
                         [--created-by C] [--region R] [--dry-run]
-        -> JSON {"path", "canonical", "copy", "actions": [...]} (exit 0)
+        -> JSON {"path", "path_home", "canonical", "promote_to", "copy_to", "actions": [...]} (exit 0)
            refusal + fix (exit 3), unmapped base / layout error (exit 2), S3 error (exit 1)
     adapter_delivery.py remove-copy --bucket B --prefix X --project P --name N [--region R]
 """
@@ -87,7 +97,7 @@ def model_base_from_env(env: dict) -> dict:
 
 
 def deployment_adapter_uri(base: dict, project: str, name: str) -> str:
-    """This deployment's adapter location (canonical when the deployment serves the adapter's base)."""
+    """This deployment's adapter HOME (canonical when the deployment serves the adapter's base)."""
     return s3_layout.s3_uri(base["bucket"], s3_layout.adapter_prefix(base.get("prefix", ""), project, name))
 
 
@@ -158,10 +168,13 @@ def plan_delivery(target: str, uri: str, project: str, name: str, base: dict, *,
     adapter_base       — HF id of the base the adapter was trained on (non-canonical sources)
     deployment_model   — HF id this deployment serves (fallback when its prefix isn't models/<id>)
     canonical_manifest — manifest of the canonical adapter when `uri` is canonical
-    Returns {"promote_to", "canonical", "copy_to", "path"} (unused steps are "").
+    Returns {"promote_to", "canonical", "copy_to", "path", "path_home"} (unused steps are "").
+    promote_to / copy_to are adapter HOMES: the promotion picks the content-addressed
+    version, so "path" is "" until deliver() runs and "path_home" is the pod path of
+    the home the version will sit under.
     """
     delivery = delivery if delivery is not None else target_manifest.adapter_delivery(target)
-    plan = {"promote_to": "", "canonical": "", "copy_to": "", "path": ""}
+    plan = {"promote_to": "", "canonical": "", "copy_to": "", "path": "", "path_home": ""}
     if not uri.startswith("s3://"):
         plan["path"] = uri.rstrip("/")
         return plan
@@ -187,7 +200,7 @@ def plan_delivery(target: str, uri: str, project: str, name: str, base: dict, *,
         src_base = hf
         path = _pod_path_if_mounted(canonical, base, delivery)
         if path:
-            plan["path"] = path
+            plan["path_home"] = path
             return plan
     else:
         plan["canonical"] = uri.rstrip("/") + "/"
@@ -205,8 +218,8 @@ def plan_delivery(target: str, uri: str, project: str, name: str, base: dict, *,
             f"adapter '{name}' was trained on revision {src_rev} of {src_base}; this deployment serves "
             f"revision {base.get('revision')}.", "Deploy the matching revision of the base model.")
     plan["copy_to"] = deployment_adapter_uri(base, project, name)
-    plan["path"] = s3_layout.pod_path(delivery.get("mount_path", ""), base.get("prefix", ""),
-                                      s3_layout.adapter_prefix(base.get("prefix", ""), project, name))
+    plan["path_home"] = s3_layout.pod_path(delivery.get("mount_path", ""), base.get("prefix", ""),
+                                           s3_layout.adapter_prefix(base.get("prefix", ""), project, name))
     return plan
 
 
@@ -214,7 +227,11 @@ def deliver(s3, target: str, uri: str, project: str, name: str, base: dict, *,
             core_bucket: str = "", adapter_base: str = "", deployment_model: str = "",
             source_job: str = "", technique: str = "", created_by: str = "do/adapter",
             delivery: dict | None = None, dry_run: bool = False) -> dict:
-    """plan_delivery + execute (promote, then copy on a base-prefix mismatch)."""
+    """plan_delivery + execute (promote, then copy on a base-prefix mismatch).
+
+    Both steps write a content-addressed version directory; the returned "canonical"
+    is the promoted version and "path" the in-pod path of the version that is loaded.
+    """
     delivery = delivery if delivery is not None else target_manifest.adapter_delivery(target)
     manifest = None
     if uri.startswith("s3://") and s3_layout.parse_adapter_uri(uri) is not None and not dry_run:
@@ -233,6 +250,9 @@ def deliver(s3, target: str, uri: str, project: str, name: str, base: dict, *,
                                 technique=technique, created_by=created_by)
         actions.append(f"promote:{res['action']}")
         manifest = res["manifest"]
+        plan["canonical"] = res["dest"]
+        if not plan["copy_to"]:
+            plan["path"] = _pod_path_if_mounted(res["dest"], base, delivery)
     if plan["copy_to"]:
         existing = s3_layout.read_manifest(s3, plan["copy_to"])
         if existing and not existing.get("serving_copy_of") and \
@@ -247,16 +267,40 @@ def deliver(s3, target: str, uri: str, project: str, name: str, base: dict, *,
                                 technique=(manifest or {}).get("technique") or technique,
                                 created_by=created_by, serving_copy_of=plan["canonical"])
         actions.append(f"copy:{res['action']}")
+        plan["path"] = _pod_path_if_mounted(res["dest"], base, delivery)
+    if not plan["path"]:
+        raise s3_layout.LayoutError(f"adapter '{name}' was delivered but its pod path could not be derived")
     return {**plan, "actions": actions or ["load"]}
 
 
 def remove_copy(s3, base: dict, project: str, name: str) -> dict:
-    """Delete this deployment's serving copy of <name> if do/adapter made one; never a canonical."""
+    """Delete this deployment's serving copies of <name> (every version) if do/adapter made them.
+
+    Each version directory under the home (and an unversioned pre-BL199 copy at the
+    home itself) is judged by its own manifest: only one marked `serving_copy_of`
+    is deleted; a canonical adapter (no such mark, or no manifest) is never touched.
+    """
     uri = deployment_adapter_uri(base, project, name)
-    m = s3_layout.read_manifest(s3, uri)
-    if not m or not m.get("serving_copy_of"):
-        return {"deleted": 0, "uri": uri, "kept": "canonical" if m else "absent"}
-    return {"deleted": s3_layout.delete_prefix(s3, uri), "uri": uri, "copy_of": m["serving_copy_of"]}
+    bucket, key = s3_layout.split_uri(uri)
+    groups: dict[str, list[str]] = {}
+    for o in s3_layout.list_objects(s3, bucket, key):
+        rel = o["Key"][len(key):]
+        head = rel.split("/", 1)[0]
+        groups.setdefault(head if "/" in rel and s3_layout.is_version_segment(head) else "", []).append(o["Key"])
+    deleted, copy_of, kept = 0, "", []
+    for version, keys in sorted(groups.items()):
+        m = s3_layout.read_manifest(s3, s3_layout.s3_uri(bucket, key + (version + "/" if version else "")))
+        if m and m.get("serving_copy_of"):
+            deleted += s3_layout._delete_keys(s3, bucket, keys)  # noqa: SLF001 — same layout family
+            copy_of = copy_of or m["serving_copy_of"]
+        else:
+            kept.append(version or "unversioned")
+    out = {"deleted": deleted, "uri": uri}
+    if copy_of:
+        out["copy_of"] = copy_of
+    if not deleted:
+        out["kept"] = "canonical" if kept else "absent"
+    return out
 
 
 def _s3(region: str):

@@ -192,7 +192,8 @@ fails when any other file assembles them. Bucket names come only from profile ke
 | Bucket (profile key) | Prefix | What | Writer |
 |---|---|---|---|
 | core (`coreS3Bucket`) | `models/<org>/<base>/` | staged base weights | `do/stage` (adds only; never `--delete`) |
-| core | `models/<org>/<base>/.mlcc-adapters/<project>/<name>/` | canonical LoRA adapter + `mlcc-adapter.json` | promotion in `do/tune` / `do/train`; `do/adapter add` (`--from-hub`, `--from-weights`, `--from-registry`, `--from-tune`, `--from-train`); `do/adapter promote` |
+| core | `models/<org>/<base>/.mlcc-adapters/<project>/<name>/` | the adapter's home (one per name); holds its versions | — |
+| core | `models/<org>/<base>/.mlcc-adapters/<project>/<name>/v<hash12>/` | canonical LoRA adapter **version** + `mlcc-adapter.json` (content-addressed, BL199) | promotion in `do/tune` / `do/train`; `do/adapter add` / `update` (`--from-hub`, `--from-weights`, `--from-registry`, `--from-tune`, `--from-train`); `do/adapter promote` |
 | core | `models/mlcc-<project>/<name>/` | full fine-tune + `mlcc-model.json` | promotion in `do/tune` / `do/train` |
 | core | `evaluators/<name>/` | reward-function code backups (the reward-Lambda role reads this prefix) | `do/register evaluator --finalize` |
 | artifacts (`artifactsS3Bucket`) | `<project>/tune\|train\|optimize/...` | raw job output, MLflow artifacts | the jobs |
@@ -200,8 +201,45 @@ fails when any other file assembles them. Bucket names come only from profile ke
 `<org>/<base>` is the model's Hugging Face id; a hub/JumpStart id maps through the tune
 catalog (`do/.tune_catalog.json`) and an unmapped id fails fast. The manifest records the
 source URI, source job, technique, rank, target modules, base model (+ revision), a
-content hash, the creator and a timestamp; promotion is idempotent on the hash and
-removes stale files of the previous version of the SAME artifact.
+content hash, the adapter `version`, the creator and a timestamp. Promotion is idempotent
+on the hash.
+
+### Content-addressed adapter versions (BL199)
+
+A LoRA adapter is promoted into `<home>/v<hash12>/`, where `hash12` is the first 12 hex
+digits of the promotion's content hash. The hash is a sha256 over each payload file's
+relative key, size and ETag. A tarball is hashed on its name, size and ETag, and a
+`--from-hub` download on each file's MD5.
+
+- **Same content, same version.** Promoting identical content again resolves to the
+  existing version directory and reports `unchanged` without copying anything.
+- **New content, new directory.** Different content always gets a new version directory.
+  An existing version is never rewritten in place: a version directory only receives the
+  content it is named for, and a 48-bit prefix collision is refused rather than
+  overwritten. The manifest is still written last, so a half-written version has no
+  manifest and a retry copies it again.
+- **What consumers use.** The adapter IC `ArtifactUrl` (realtime) and the vLLM load path
+  (Kubernetes) are the version, never the home. So `do/adapter update` sends a new
+  `ArtifactUrl` whenever the content changed, and is a no-op when it didn't. Other ICs and
+  pods keep reading their own version.
+- **Composition.** Only `s3_layout.py` composes the version segment
+  (`adapter_version` / `adapter_version_uri`). `s3_layout.py parse` accepts both forms
+  and reports `version` and `home_uri`. Producers take the promoted location from the
+  `dest` field of the promotion result.
+- **Retention.** Old versions are never deleted automatically, because an IC may still
+  reference one. Roll back with `do/adapter update <name> --from-weights <older version URI>`.
+  `./do/clean adapters` removes every version of the project's adapters.
+- **Backward compatibility.** Pre-BL199 homes stay valid canonical adapters: those
+  promoted straight into `<home>/`, and hand copies without a manifest such as the live
+  `fresh-ai-ml` `sft-w6/` and `dpo-w6/`. They work as `--from-weights` sources (used
+  as-is, no copy), for list, remove and update, and as recorded `ADAPTER_WEIGHTS_URI` /
+  `TUNE_ADAPTER_PATH_*` values. Legacy-bucket URIs in existing confs stay readable. When
+  such a home is used as a promotion source, the version directories later promoted under
+  it are not part of its payload.
+- **Caveat for legacy ICs.** An IC whose `ArtifactUrl` is still an unversioned home also
+  downloads any version subdirectories promoted under that home later. They're extra
+  bytes only: the top-level `adapter_config.json` that the loader reads is unchanged.
+  Updating the adapter moves the IC onto a version.
 
 Rules:
 
@@ -213,18 +251,22 @@ Rules:
 - **Backfill.** `./do/adapter promote <name> --from-tune <t>` (or `--from-weights <uri>`)
   publishes an existing output; `--update-config` repoints the do/config var and keeps the
   old value as `TUNE_ADAPTER_SOURCE_<T>` (or `TUNE_MODEL_SOURCE_<T>`). `--dry-run` prints
-  every key it would copy and delete and writes nothing (`s3_layout.py promote-plan`).
+  the version directory it would create or reuse, every key it would copy and delete, and
+  writes nothing (`s3_layout.py promote-plan`).
 - **Servable adapters only.** A LoRA source must have `adapter_config.json` at its top level
   (a job-output root or a `.tar.gz` with a top-level folder is refused before any write).
-  An existing manifest is removed before the payload is rewritten, so an interrupted
-  promotion never leaves a manifest the idempotency check would trust.
-- **Serving.** Realtime adapter ICs load the canonical prefix directly; the realtime model
-  sync excludes `.mlcc-adapters/*`. On Kubernetes the canonical prefix is on the pod's model
-  mount (see [LoRA delivery on Kubernetes](k8s-lora-delivery.md)); a serving copy is made
-  only on a base-prefix mismatch with the same base and is deleted by `do/adapter remove`.
+  New adapter content always goes to a fresh version directory. A full fine-tune
+  (unversioned) has its existing manifest removed before the payload is rewritten. Either
+  way, an interrupted promotion never leaves a manifest that the idempotency check would
+  trust.
+- **Serving.** Realtime adapter ICs load the canonical version directly, and the realtime
+  model sync excludes `.mlcc-adapters/*`. On Kubernetes the canonical version is on the
+  pod's model mount (see [LoRA delivery on Kubernetes](k8s-lora-delivery.md)). A serving
+  copy, versioned like its source, is made only on a base-prefix mismatch with the same
+  base, and `do/adapter remove` deletes it (every version of it).
 - **Cleanup.** `./do/clean adapters` deletes only this project's `.mlcc-adapters/<project>/`
-  (under every base) and `models/mlcc-<project>/`. Never base weights, never other
-  projects' adapters, never the artifacts bucket.
+  under every base (all versions) and `models/mlcc-<project>/`. It never touches base
+  weights, other projects' adapters, or the artifacts bucket.
 - **Legacy.** The frozen training / adapters buckets get no new writes; recorded URIs stay
   valid (nothing is moved). Already-recorded raw `TUNE_ADAPTER_PATH_*` values keep working:
   `do/adapter add` promotes them on first use.

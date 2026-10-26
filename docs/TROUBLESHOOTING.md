@@ -382,8 +382,8 @@ download the adapter from Hugging Face.
 the pod's model mount) is treated as a Hub repo id. The pod has no AWS credentials.
 
 **Fix:** use `./do/adapter add <name> --from-tune <t>` (or `--from-weights`): it promotes the
-adapter to its canonical prefix `models/<org>/<base>/.mlcc-adapters/<project>/<name>/` in the
-core bucket and loads `/opt/ml/model/.mlcc-adapters/<project>/<name>`. If it refuses:
+adapter to its canonical version `models/<org>/<base>/.mlcc-adapters/<project>/<name>/v<hash12>/`
+in the core bucket and loads `/opt/ml/model/.mlcc-adapters/<project>/<name>/v<hash12>`. If it refuses:
 
 - *model is not served from S3* — `./do/stage` and `./do/deploy --target hyperpod-eks --force`;
 - *prefetchEnabled: true* — redeploy so MLCC turns prefetch off for LoRA + S3:

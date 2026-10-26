@@ -130,7 +130,8 @@ _download_from_hub() {
     # ── Resolve the canonical destination (bucket consolidation R3.4) ──────
     # A Hub adapter is published straight into its canonical home in the core
     # bucket (s3_layout.py: <base prefix>/.mlcc-adapters/<project>/<name>/, base =
-    # this project's MODEL_NAME). The legacy adapters bucket is frozen for writes.
+    # this project's MODEL_NAME), as the content-addressed version v<hash12>/ the
+    # layout module picks (BL199). The legacy adapters bucket is frozen for writes.
     _require_bucket CORE_S3_BUCKET || exit 1
     local _hub_dest_json _hub_dest
     _hub_dest_json=$(python3 "${SCRIPT_DIR}/lib/python/s3_layout.py" adapter-uri --bucket "${CORE_S3_BUCKET}" \
@@ -283,13 +284,14 @@ _download_from_hub() {
 
     # ── Publish the adapter files (flat PEFT layout + mlcc-adapter.json) ──
     # Loose files, not a tarball: the same prefix serves the SMAI adapter IC
-    # (ArtifactUrl = prefix) and the k8s mount (load by path). Idempotent on the
-    # content hash.
-    local s3_path="${_hub_dest}"
-    echo "☁️  Publishing to the canonical adapter prefix: ${s3_path}"
+    # (ArtifactUrl = prefix) and the k8s mount (load by path). Content-addressed
+    # (BL199): the same files are the same version ("unchanged"); new files are a
+    # new <home>/v<hash12>/ and older versions are left untouched.
+    local s3_path=""
+    echo "☁️  Publishing under the canonical adapter home: ${_hub_dest}"
     local _pub_out
     if ! _pub_out=$(python3 "${SCRIPT_DIR}/lib/python/s3_layout.py" publish-local \
-        --dir "${tmp_dir}/adapter_files" --dest "${s3_path}" --kind lora_adapter \
+        --dir "${tmp_dir}/adapter_files" --dest "${_hub_dest}" --kind lora_adapter \
         --project "${PROJECT_NAME}" --name "${adapter_name}" --base-model "${MODEL_NAME:-}" \
         --source "hf://${hf_repo_id}" --created-by "do/adapter from-hub" --region "${AWS_REGION}"); then
         echo "❌ Failed to publish adapter to S3."
@@ -301,6 +303,7 @@ _download_from_hub() {
         exit 1
     fi
 
+    s3_path=$(_adapter_json_get "${_pub_out}" dest)
     echo "✅ Published ($(_adapter_json_get "${_pub_out}" action)): ${s3_path}"
 
     # ── Clean up ──────────────────────────────────────────────────────────
@@ -342,8 +345,11 @@ _adapter_update_config_var() {
 # ── Promote a source into its canonical home (bucket consolidation R3) ────────
 # _adapter_promote_canonical <src-uri> <name> <base-model-id> <kind> [technique] [created-by]
 # Prints the canonical URI on stdout (progress on stderr). An already-canonical
-# source is returned as-is. kind: lora_adapter → <base prefix>/.mlcc-adapters/
-# <project>/<name>/; full_model → models/mlcc-<project>/<name>/ (s3_layout.py).
+# source (a version directory, or an unversioned pre-BL199 home / hand copy) is
+# returned as-is. kind: lora_adapter → the content-addressed version
+# <base prefix>/.mlcc-adapters/<project>/<name>/v<hash12>/ (BL199: identical
+# content → the same version, "unchanged"; new content → a new directory, older
+# versions untouched); full_model → models/mlcc-<project>/<name>/ (s3_layout.py).
 _ADAPTER_PROMOTE_DRY_RUN=""
 _adapter_promote_canonical() {
     local _src="$1" _name="$2" _base="$3" _kind="${4:-lora_adapter}" _tech="${5:-}" _by="${6:-do/adapter}"
@@ -365,8 +371,9 @@ _adapter_promote_canonical() {
     fi
     _dest=$(_adapter_json_get "${_dest_json}" uri)
     if [ -n "${_ADAPTER_PROMOTE_DRY_RUN}" ]; then
-        # Read-only plan (s3_layout.py promote-plan): every key it would copy, the
-        # stale keys it would delete and the manifest it would write — no S3 write.
+        # Read-only plan (s3_layout.py promote-plan): the version directory it would
+        # create or reuse, every key it would copy, the stale keys it would delete
+        # and the manifest it would write — no S3 write.
         local _plan
         _plan=$(python3 "${_layout}" promote-plan --source "${_src}" --dest "${_dest}" --kind "${_kind}" \
             --region "${AWS_REGION:-}") || return 1
@@ -375,6 +382,9 @@ import json, sys
 p = json.load(sys.stdin)
 print("🔎 Promotion plan (read-only): " + p["source"] + " -> " + p["dest"])
 print("   action: " + p["action"] + ("  (" + p["refused"] + ")" if p["refused"] else ""))
+if p.get("version"):
+    print("   version: " + p["version"] + ("  (already published: same content)" if p["action"] == "unchanged"
+          else "  (new content-addressed directory; existing versions are not touched)"))
 print("   source content hash: " + str(p["content_hash"]) + "   dest manifest hash: " + str(p["dest_content_hash"]))
 for c in p["copies"]:
     print("   copy   " + c["from"] + "  ->  " + c["to"])
@@ -384,7 +394,7 @@ if p["manifest"]:
     print("   write  " + p["manifest"] + "  (last)")
 sys.exit(3 if p["action"] == "refused" else 0)
 ' >&2 || return 1
-        printf '%s\n' "${_dest}"
+        printf '%s\n' "$(_adapter_json_get "${_plan}" dest)"
         return 0
     fi
     echo "📤 Promoting ${_src} → ${_dest}" >&2
@@ -394,6 +404,8 @@ sys.exit(3 if p["action"] == "refused" else 0)
         echo "❌ Promotion into ${_dest} failed (see the error above)." >&2
         return 1
     fi
+    # The promoted location: for an adapter, the content-addressed version directory.
+    _dest=$(_adapter_json_get "${_out}" dest)
     echo "   ✅ Promotion $(_adapter_json_get "${_out}" action): ${_dest}" >&2
     printf '%s\n' "${_dest}"
 }
@@ -643,16 +655,18 @@ if [ -n "${_ADAPTER_USE_VLLM_HOTLOAD}" ]; then
                 echo "  add <name> --from-hub <hf-repo-id>      Stage a HuggingFace adapter to S3, then hot-load"
                 echo "  remove <name>                           Unload a LoRA adapter from vLLM"
                 echo "  list                                    List loaded LoRA adapters"
-                echo "  update <name> --from-weights s3://...   Replace a LoRA adapter's weights in place"
-                echo "                                          (update accepts every --from-* source too)"
+                echo "  update <name> --from-weights s3://...   Swap a LoRA adapter to new weights on every pod"
+                echo "                                          (unload + load the new version; every --from-* source)"
                 echo "  promote <name> --from-tune <technique>  Publish a finished tune's adapter to its canonical"
                 echo "                                          prefix (no load; --update-config rewrites do/config)"
                 echo ""
                 echo "Delivery: the canonical adapter home is <base prefix>/.mlcc-adapters/<project>/<name>/"
-                echo "in the core bucket, which is on the pod's model mount. add promotes a source there"
-                echo "first, loads it by path, and copies it only when this deployment serves the same base"
-                echo "under a different prefix. remove unloads (and deletes only such a copy);"
-                echo "./do/clean adapters deletes this project's canonical adapters."
+                echo "in the core bucket, which is on the pod's model mount. Each promotion is content-addressed:"
+                echo "it lands in <home>/v<hash12>/ (same content → same version; new content → a new"
+                echo "directory, older versions are never rewritten or deleted). add promotes a source there"
+                echo "first, loads that version by path (lora_name stays <name>), and copies it only when this"
+                echo "deployment serves the same base under a different prefix. remove unloads (and deletes only"
+                echo "such copies); ./do/clean adapters deletes every version of this project's adapters."
                 echo ""
                 echo "Examples:"
                 echo "  ./do/adapter add ectsum --from-weights s3://my-bucket/adapters/ectsum/"
@@ -812,13 +826,20 @@ for k, v in (("_src_type", "source_type"), ("_bucket", "bucket"), ("_prefix", "p
                 rm -f "${_iec_json_f}"
                 exit 1
             fi
+            # A planned promotion / serving copy decides the content-addressed version
+            # (BL199), so the pod path is known only after delivery; the plan names the
+            # home it will sit under (path_home).
             _LORA_PATH=$(_adapter_json_get "${_plan_out}" path)
             local _plan_promote _plan_copy
             _plan_promote=$(_adapter_json_get "${_plan_out}" promote_to)
             _plan_copy=$(_adapter_json_get "${_plan_out}" copy_to)
-            [ -n "${_plan_promote}" ] && echo "📤 Promote: ${WEIGHTS_URI} → ${_plan_promote} (canonical)"
-            [ -n "${_plan_copy}" ] && echo "📋 Base-prefix mismatch: serving copy → ${_plan_copy}"
-            echo "📍 Pod path: ${_LORA_PATH}"
+            [ -n "${_plan_promote}" ] && echo "📤 Promote: ${WEIGHTS_URI} → ${_plan_promote} (canonical home; version = content hash)"
+            [ -n "${_plan_copy}" ] && echo "📋 Base-prefix mismatch: serving copy → ${_plan_copy} (same version)"
+            if [ -n "${_LORA_PATH}" ]; then
+                echo "📍 Pod path: ${_LORA_PATH}"
+            else
+                echo "📍 Pod path: $(_adapter_json_get "${_plan_out}" path_home)/<version> (fixed by the delivery below)"
+            fi
 
             # Wave 6.1 R3.2: pre-check the adapter's rank (adapter_config.json r and
             # rank_pattern) against the LIVE serving max_lora_rank (pod env, else
@@ -859,6 +880,12 @@ for k, v in (("_src_type", "source_type"), ("_bucket", "bucket"), ("_prefix", "p
                     exit 1
                 fi
                 echo "✅ Delivered ($(_adapter_json_get "${_deliver_out}" actions)): $(_adapter_json_get "${_deliver_out}" canonical)"
+                _LORA_PATH=$(_adapter_json_get "${_deliver_out}" path)
+                echo "📍 Pod path: ${_LORA_PATH}"
+            fi
+            if [ -z "${_LORA_PATH}" ]; then
+                echo "❌ No in-pod path for '${LORA_NAME}' after delivery (nothing was sent to the engine)."
+                exit 1
             fi
         fi
 
@@ -1018,8 +1045,10 @@ for l in loras:
                     ;;
                 update)
                     # remove-then-add: unload the existing adapter, then load the new
-                    # weights. A failed unload aborts before the load so weights are
-                    # not half-swapped.
+                    # version's path under the SAME lora_name (BL199: new content is a
+                    # new v<hash12> directory, so the old version stays intact for any
+                    # pod not yet swapped). A failed unload aborts before the load so
+                    # weights are not half-swapped.
                     _lora_do_unload "${LORA_NAME}" || return 1
                     _lora_do_load "${LORA_NAME}" "${_LORA_PATH}" || return 1
                     ;;
@@ -1097,7 +1126,7 @@ _usage() {
     echo "  add <name> --from-registry [arn]     Add adapter from model registry"
     echo "  list                                  List all adapters on the endpoint"
     echo "  remove <name>                         Remove an adapter"
-    echo "  update <name> --from-weights <uri> Update adapter weights from S3"
+    echo "  update <name> --from-weights <uri> Update adapter weights from S3 (new content → new version)"
     echo "  update <name> --from-hub <hf-repo-id> Update adapter weights from HuggingFace Hub"
     echo "  search [--limit N]                    Search HuggingFace Hub for compatible adapters"
     echo "  promote <name> --from-tune <t> | --from-weights <uri> [--update-config]"
@@ -1124,6 +1153,13 @@ _usage() {
     echo "  ./do/adapter update ectsum --from-hub predibase/llama-3.1-8b-ectsum-v2"
     echo ""
     echo "Adapter metadata is stored in do/adapters/<name>.conf"
+    echo ""
+    echo "Versions: every source is promoted to its canonical home"
+    echo "<base prefix>/.mlcc-adapters/<project>/<name>/ as the content-addressed version"
+    echo "v<hash12>/ (same content → same version; new content → a new directory). The adapter"
+    echo "IC's ArtifactUrl is that version, so update always points the IC at a NEW URI when the"
+    echo "content changed and is a no-op when it did not. Old versions are kept (an IC may still"
+    echo "use one); ./do/clean adapters removes every version of this project's adapters."
     echo ""
     echo "Note: --from-weights, --from-hub, --from-tune, --from-train, and --from-registry are mutually exclusive."
     echo ""
@@ -2253,6 +2289,10 @@ _adapter_update() {
                 echo ""
                 echo "Update the weights of an existing LoRA adapter."
                 echo ""
+                echo "The new weights are promoted to a content-addressed version <home>/v<hash12>/ and the"
+                echo "adapter IC is pointed at that NEW ArtifactUrl; the previous version is left intact"
+                echo "(roll back with --from-weights <previous version URI>). Identical content is a no-op."
+                echo ""
                 echo "Arguments:"
                 echo "  <name>                    Adapter name to update"
                 echo "  --from-weights <new-s3-uri>  New S3 prefix or .tar.gz of the adapter weights"
@@ -2389,8 +2429,23 @@ _adapter_update() {
     fi
 
     # ── Promote the new weights into the canonical home (bucket consolidation R3.4) ──
+    # BL199: the promotion is content-addressed (<home>/v<hash12>/), so new content
+    # is a NEW ArtifactUrl (atomic and roll-back-able: the old version is never
+    # rewritten) and identical content is the SAME URI.
     weights_uri=$(_adapter_promote_canonical "${weights_uri}" "${adapter_name}" "${MODEL_NAME:-}" \
         lora_adapter "" "do/adapter update") || exit 1
+
+    # ── Unchanged content → no UpdateInferenceComponent ───────────────────
+    # The IC already serves exactly this version; resending a byte-identical spec
+    # is not a reliable reload, and there is nothing to reload.
+    local _current_uri
+    _current_uri=$(grep "^export ADAPTER_WEIGHTS_URI=" "${conf_file}" 2>/dev/null | sed 's/^export ADAPTER_WEIGHTS_URI="//' | sed 's/"$//' || echo "")
+    if [ -n "${_current_uri}" ] && [ "${_current_uri%/}" = "${weights_uri%/}" ]; then
+        echo "✅ Adapter '${adapter_name}' is unchanged: ${adapter_ic_name} already serves ${weights_uri}"
+        echo "   (same content hash, same version). No UpdateInferenceComponent was sent."
+        return 0
+    fi
+    [ -n "${_current_uri}" ] && echo "   Previous version (kept for rollback): ${_current_uri}"
 
     # ── Update the inference component ────────────────────────────────────
     echo "🚀 Updating inference component: ${adapter_ic_name}"
