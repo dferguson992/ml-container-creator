@@ -336,7 +336,7 @@ These files are instance-family-agnostic and need no updates:
 
 - **`model-servers.json`** — image entries specify CUDA version requirements, not instance families. The `image-filter.js` handles instance↔image compatibility at runtime via `fleet-drivers.json`.
 - **`popular-transformers.json` / `popular-diffusors.json`** — model-centric catalogs, no instance references.
-- **`image-filter.js`** — uses generic regex `^ml\.([a-z0-9]+)\.` to parse family, then looks up `fleet-drivers.json`. Works for any family automatically.
+- **`image-filter.js`** — uses generic regex `^ml\.([a-z0-9][a-z0-9-]*)\.` to parse family (hyphenated families such as `p6-b200` included), then looks up `fleet-drivers.json`. Works for any family automatically.
 - **`scripts/validate-catalogs.js`** — schema accepts any `ml.*` key with the correct shape.
 - **`scripts/sync-model-families.js`** — model discovery, not instance-related.
 - **`scripts/sync-serving-versions.js`** — image version management, not instance-related.

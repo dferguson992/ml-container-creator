@@ -53,12 +53,14 @@ function loadModelArchSupport() {
 
 /**
  * Parse instance family from SageMaker instance type.
- * E.g., "ml.g5.24xlarge" → "g5", "ml.p5e.48xlarge" → "p5e"
+ * E.g., "ml.g5.24xlarge" → "g5", "ml.p5e.48xlarge" → "p5e",
+ * "ml.p6-b200.48xlarge" → "p6-b200" (hyphenated families are valid SageMaker
+ * family names; BL203).
  */
 export function parseInstanceFamily(instanceType) {
     if (!instanceType) return null;
     // Pattern: ml.<family>.<size>
-    const match = instanceType.match(/^ml\.([a-z0-9]+)\./i);
+    const match = instanceType.match(/^ml\.([a-z0-9][a-z0-9-]*)\./i);
     return match ? match[1] : null;
 }
 
