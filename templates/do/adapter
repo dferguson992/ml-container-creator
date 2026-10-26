@@ -344,12 +344,15 @@ _adapter_update_config_var() {
 # Prints the canonical URI on stdout (progress on stderr). An already-canonical
 # source is returned as-is. kind: lora_adapter → <base prefix>/.mlcc-adapters/
 # <project>/<name>/; full_model → models/mlcc-<project>/<name>/ (s3_layout.py).
+_ADAPTER_PROMOTE_DRY_RUN=""
 _adapter_promote_canonical() {
     local _src="$1" _name="$2" _base="$3" _kind="${4:-lora_adapter}" _tech="${5:-}" _by="${6:-do/adapter}"
     local _layout="${SCRIPT_DIR}/lib/python/s3_layout.py" _parsed _dest_json _dest _out
     _parsed=$(python3 "${_layout}" parse --uri "${_src}" 2>/dev/null || echo '{}')
     if [ -n "$(_adapter_json_get "${_parsed}" adapter)" ] || [ -n "$(_adapter_json_get "${_parsed}" finetune)" ]; then
-        printf '%s\n' "${_src}"
+        # Already canonical: used as-is, but normalized to ONE trailing slash (the
+        # SMAI IC ArtifactUrl is this prefix; "…/sft" would also match "…/sft-w6/").
+        printf '%s\n' "$(_adapter_json_get "${_parsed}" canonical_uri)"
         return 0
     fi
     _require_bucket CORE_S3_BUCKET || return 1
@@ -361,6 +364,29 @@ _adapter_promote_canonical() {
             --project "${PROJECT_NAME}" --name "${_name}") || return 1
     fi
     _dest=$(_adapter_json_get "${_dest_json}" uri)
+    if [ -n "${_ADAPTER_PROMOTE_DRY_RUN}" ]; then
+        # Read-only plan (s3_layout.py promote-plan): every key it would copy, the
+        # stale keys it would delete and the manifest it would write — no S3 write.
+        local _plan
+        _plan=$(python3 "${_layout}" promote-plan --source "${_src}" --dest "${_dest}" --kind "${_kind}" \
+            --region "${AWS_REGION:-}") || return 1
+        printf '%s' "${_plan}" | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+print("🔎 Promotion plan (read-only): " + p["source"] + " -> " + p["dest"])
+print("   action: " + p["action"] + ("  (" + p["refused"] + ")" if p["refused"] else ""))
+print("   source content hash: " + str(p["content_hash"]) + "   dest manifest hash: " + str(p["dest_content_hash"]))
+for c in p["copies"]:
+    print("   copy   " + c["from"] + "  ->  " + c["to"])
+for k in p["stale_deletes"]:
+    print("   delete " + k + "  (stale file of this adapter)")
+if p["manifest"]:
+    print("   write  " + p["manifest"] + "  (last)")
+sys.exit(3 if p["action"] == "refused" else 0)
+' >&2 || return 1
+        printf '%s\n' "${_dest}"
+        return 0
+    fi
     echo "📤 Promoting ${_src} → ${_dest}" >&2
     if ! _out=$(python3 "${_layout}" promote --source "${_src}" --dest "${_dest}" --kind "${_kind}" \
         --project "${PROJECT_NAME}" --name "${_name}" --base-model "${_base}" \
@@ -381,7 +407,7 @@ _adapter_promote_cmd() {
     local _name="${1:-}"
     if [ -z "${_name}" ] || [[ "${_name}" == -* ]]; then
         echo "❌ 'do/adapter promote' requires a name argument"
-        echo "   Usage: ./do/adapter promote <name> --from-tune <technique> | --from-weights <s3-uri> [--update-config]"
+        echo "   Usage: ./do/adapter promote <name> --from-tune <technique> | --from-weights <s3-uri> [--update-config] [--dry-run]"
         exit 1
     fi
     shift
@@ -391,8 +417,9 @@ _adapter_promote_cmd() {
             --from-tune) _verb="from-tune"; _arg="${2:-}"; shift; shift || true ;;
             --from-weights) _verb="from-weights"; _arg="${2:-}"; shift; shift || true ;;
             --update-config) _update="true"; shift ;;
+            --dry-run) _ADAPTER_PROMOTE_DRY_RUN="true"; shift ;;
             --help|-h)
-                echo "Usage: ./do/adapter promote <name> --from-tune <technique> | --from-weights <s3-uri> [--update-config]"
+                echo "Usage: ./do/adapter promote <name> --from-tune <technique> | --from-weights <s3-uri> [--update-config] [--dry-run]"
                 exit 0
                 ;;
             *) echo "❌ Unknown option: $1"; exit 1 ;;
@@ -414,6 +441,10 @@ _adapter_promote_cmd() {
     local _canonical
     _canonical=$(_adapter_promote_canonical "${RESOLVED_URI}" "${_name}" "${_base}" "${_kind}" \
         "${RESOLVED_META_TECHNIQUE:-}" "do/adapter promote") || exit 1
+    if [ -n "${_ADAPTER_PROMOTE_DRY_RUN}" ]; then
+        echo "🔎 Dry run: nothing was written (do/config unchanged). Destination: ${_canonical}"
+        exit 0
+    fi
     echo "✅ Canonical: ${_canonical}"
     if [ "${_verb}" = "from-tune" ]; then
         local _tu _pvar _svar
@@ -1238,7 +1269,7 @@ _adapter_add() {
                 echo ""
                 echo "Arguments:"
                 echo "  <name>                      Adapter name (lowercase alphanumeric + hyphens, 1-50 chars)"
-                echo "  --from-weights <s3-uri>          S3 URI to adapter weights (.tar.gz)"
+                echo "  --from-weights <s3-uri>          S3 prefix or .tar.gz of the adapter weights"
                 echo "  --from-hub <hf-repo-id>     Download adapter from HuggingFace Hub"
                 echo "  --from-tune [technique]     Use adapter output from do/tune"
                 echo "                              Without technique: uses latest tune output"
@@ -1518,12 +1549,15 @@ _adapter_add() {
 
     # ── Validate S3 URI format (only when --from-weights is explicitly used) ──
     if [ -n "${weights_uri}" ] && [ -z "${from_hub}" ] && [ -z "${from_tune}" ] && [ -z "${from_train}" ] && [ -z "${from_registry}" ]; then
-        if ! echo "${weights_uri}" | grep -qE '^s3://.*\.tar\.gz$'; then
+        # A .tar.gz archive OR an S3 prefix of loose PEFT files (bucket R3.4): both
+        # are promoted into the canonical prefix, which is what the IC loads. A
+        # prefix is what ./do/adapter promote prints as the next step.
+        if ! echo "${weights_uri}" | grep -qE '^s3://[^/]+/.+'; then
             echo "❌ Invalid S3 URI: ${weights_uri}"
             echo ""
-            echo "   Adapter weights must be:"
-            echo "   • An S3 URI starting with s3://"
-            echo "   • A .tar.gz archive containing adapter files"
+            echo "   Adapter weights must be one of:"
+            echo "   • An S3 prefix holding adapter_config.json + adapter weights (s3://bucket/path/)"
+            echo "   • A .tar.gz archive containing those files at its top level"
             echo ""
             echo "   Example: s3://my-bucket/adapters/ectsum/adapter.tar.gz"
             exit 1
@@ -1828,7 +1862,10 @@ EOF
                 --project-name "${PROJECT_NAME}" \
                 --region "${AWS_REGION}" 2>/dev/null || echo "")
             local models_line
-            models_line=$(echo "${models_json}" | grep -E '^\{' | tail -1)
+            # `|| true`: no JSON line (helper failed / no MPG) just means no parent ARN.
+            # Without it pipefail + set -e aborted HERE — after the IC was created but
+            # before do/adapters/<name>.conf was written (an IC remove can't find).
+            models_line=$(echo "${models_json}" | grep -E '^\{' | tail -1 || true)
             if [ -n "${models_line}" ]; then
                 parent_model_arn=$(echo "${models_line}" | python3 -c "
 import sys, json
@@ -1885,8 +1922,9 @@ EOF
         fi
     fi
 
-    # Default source: bare S3 URI (no --from-* flag)
-    if [ -z "${from_hub}" ] && [ -z "${from_tune}" ] && [ -z "${from_registry}" ]; then
+    # Default source: bare S3 URI (no --from-* flag). --from-train wrote its own
+    # ADAPTER_SOURCE="train" above; a second line here would override it.
+    if [ -z "${from_hub}" ] && [ -z "${from_tune}" ] && [ -z "${from_train}" ] && [ -z "${from_registry}" ]; then
         cat >> "${SCRIPT_DIR}/adapters/${adapter_name}.conf" <<EOF
 export ADAPTER_SOURCE="s3"
 EOF
@@ -2217,7 +2255,7 @@ _adapter_update() {
                 echo ""
                 echo "Arguments:"
                 echo "  <name>                    Adapter name to update"
-                echo "  --from-weights <new-s3-uri>  New S3 URI to adapter weights (.tar.gz)"
+                echo "  --from-weights <new-s3-uri>  New S3 prefix or .tar.gz of the adapter weights"
                 echo "                            (--weights is a deprecated alias)"
                 echo "  --from-hub <hf-repo-id>   Download new weights from HuggingFace Hub"
                 echo ""
@@ -2286,12 +2324,15 @@ _adapter_update() {
 
     # ── Validate S3 URI format (only when --from-weights is used) ─────────────
     if [ -n "${weights_uri}" ]; then
-        if ! echo "${weights_uri}" | grep -qE '^s3://.*\.tar\.gz$'; then
+        # A .tar.gz archive OR an S3 prefix of loose PEFT files (bucket R3.4): both
+        # are promoted into the canonical prefix, which is what the IC loads. A
+        # prefix is what ./do/adapter promote prints as the next step.
+        if ! echo "${weights_uri}" | grep -qE '^s3://[^/]+/.+'; then
             echo "❌ Invalid S3 URI: ${weights_uri}"
             echo ""
-            echo "   Adapter weights must be:"
-            echo "   • An S3 URI starting with s3://"
-            echo "   • A .tar.gz archive containing adapter files"
+            echo "   Adapter weights must be one of:"
+            echo "   • An S3 prefix holding adapter_config.json + adapter weights (s3://bucket/path/)"
+            echo "   • A .tar.gz archive containing those files at its top level"
             echo ""
             echo "   Example: s3://my-bucket/adapters/ectsum-v2/adapter.tar.gz"
             exit 1

@@ -36,6 +36,7 @@ CLI (JSON on stdout; exit 0 ok, 2 usage/unmapped, 3 refused, 1 AWS error):
     s3_layout.py parse --uri U
     s3_layout.py promote --source U --dest U --kind lora_adapter|full_model --project P --name N
                          --base-model ID [--source-job J] [--technique T] [--created-by C] [--region R]
+    s3_layout.py promote-plan --source U --dest U --kind K [--region R]   (read-only dry run)
     s3_layout.py publish-local --dir D --dest U --kind K --project P --name N --base-model ID --source S
     s3_layout.py manifest --uri U [--region R]
     s3_layout.py clean-plan --bucket B --project P [--region R]
@@ -379,15 +380,52 @@ def _safe_members(tf: tarfile.TarFile, dest: str):
         yield m
 
 
+ADAPTER_CONFIG = "adapter_config.json"
+
+
+def _require_servable_adapter(kind: str, rels, source: str) -> None:
+    """A LoRA adapter must have adapter_config.json at the TOP of its prefix.
+
+    Both loaders read it there: the SMAI adapter sidecar (ArtifactResolver uses
+    the downloaded directory only when adapter_config.json is directly in it) and
+    vLLM's load-by-path on Kubernetes. A nested layout (a tarball with a top-level
+    directory, or a job-output root above checkpoints/hf/) would publish a prefix
+    that no loader can use, so it is refused before anything is written.
+    """
+    if kind != "lora_adapter":
+        return
+    rels = list(rels)
+    if ADAPTER_CONFIG in rels:
+        return
+    nested = sorted(r for r in rels if r.split("/")[-1] == ADAPTER_CONFIG)
+    hint = (f" It is nested at '{nested[0]}': point the source at that directory "
+            "(or re-pack the archive without the top-level folder).") if nested else ""
+    raise LayoutError(f"{source} is not a servable LoRA adapter: no {ADAPTER_CONFIG} at its top level.{hint}")
+
+
+def _invalidate_manifest(s3, bucket: str, root: str, previous: dict | None) -> None:
+    """Drop dest's manifest BEFORE the payload is rewritten.
+
+    The manifest marks a complete promotion and carries the content hash the
+    idempotency check trusts. Without this, a promotion interrupted mid-copy would
+    leave the PREVIOUS manifest next to a half-overwritten payload, and a later
+    promote of the previous source would answer "unchanged" over mixed files.
+    """
+    if previous is not None:
+        _delete_keys(s3, bucket, [root + m for m in MANIFEST_FILES])
+
+
 def promote(s3, *, source: str, dest: str, kind: str, project: str, name: str, base_model: str,
             source_job: str = "", technique: str = "", created_by: str = "",
             serving_copy_of: str = "") -> dict:
     """Publish `source` (an S3 prefix or a .tar.gz) to the canonical `dest` prefix.
 
     Idempotent: when dest's manifest already records the source's content hash,
-    nothing is copied. Otherwise every payload object is copied server-side, stale
-    dest objects (from an older version of THIS artifact) are removed, and the
-    manifest is written last (its presence marks a complete promotion).
+    nothing is copied. Otherwise any existing manifest is removed first, every
+    payload object is copied server-side, stale dest objects (from an older
+    version of THIS artifact) are removed, and the manifest is written last (its
+    presence marks a complete promotion; an interrupted run leaves none).
+    A lora_adapter source must have adapter_config.json at its top level.
     Returns {"action": "copied"|"unchanged", "dest": dest, "manifest": {...}}.
     """
     if kind not in ("lora_adapter", "full_model"):
@@ -434,29 +472,37 @@ def promote(s3, *, source: str, dest: str, kind: str, project: str, name: str, b
                     tf.extractall(out, members=members, filter="data")  # noqa: S202 — members vetted
                 except TypeError:  # Python without tarfile extraction filters
                     tf.extractall(out, members=members)  # noqa: S202 — members vetted
-            for dirpath, _, files in os.walk(out):
-                for fn in files:
+            files = []
+            for dirpath, _, fnames in os.walk(out):
+                for fn in fnames:
                     full = os.path.join(dirpath, fn)
                     rel = os.path.relpath(full, out).replace(os.sep, "/")
-                    if rel.split("/")[-1] in MANIFEST_FILES:
-                        continue
-                    s3.upload_file(full, d_bucket, d_root + rel)
-                    written.add(d_root + rel)
-                    if rel == "adapter_config.json":
-                        with open(full, encoding="utf-8") as f:
-                            try:
-                                adapter_cfg = json.load(f)
-                            except ValueError:
-                                adapter_cfg = None
+                    if rel.split("/")[-1] not in MANIFEST_FILES:
+                        files.append((full, rel))
+            if not files:
+                raise LayoutError(f"nothing to promote: {source} contained no files")
+            _require_servable_adapter(kind, (rel for _, rel in files), source)
+            _invalidate_manifest(s3, d_bucket, d_root, previous)
+            for full, rel in sorted(files, key=lambda f: f[1]):
+                s3.upload_file(full, d_bucket, d_root + rel)
+                written.add(d_root + rel)
+                if rel == ADAPTER_CONFIG:
+                    with open(full, encoding="utf-8") as f:
+                        try:
+                            adapter_cfg = json.load(f)
+                        except ValueError:
+                            adapter_cfg = None
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     else:
         s_root = s_key.rstrip("/") + "/"
+        _require_servable_adapter(kind, (o["Key"][len(s_root):] for o in src_objects), source)
+        _invalidate_manifest(s3, d_bucket, d_root, previous)
         for o in src_objects:
             rel = o["Key"][len(s_root):]
             s3.copy({"Bucket": s_bucket, "Key": o["Key"]}, d_bucket, d_root + rel)
             written.add(d_root + rel)
-        adapter_cfg = read_json(s3, s_bucket, s_root + "adapter_config.json")
+        adapter_cfg = read_json(s3, s_bucket, s_root + ADAPTER_CONFIG)
     if not written:
         raise LayoutError(f"nothing to promote: {source} contained no files")
     stale = [o["Key"] for o in list_objects(s3, d_bucket, d_root)
@@ -471,6 +517,71 @@ def promote(s3, *, source: str, dest: str, kind: str, project: str, name: str, b
     s3.put_object(Bucket=d_bucket, Key=d_root + manifest_name(kind),
                   Body=json.dumps(manifest, indent=2).encode("utf-8"), ContentType="application/json")
     return {"action": "copied", "dest": dest, "manifest": manifest}
+
+
+def plan_promote(s3, *, source: str, dest: str, kind: str) -> dict:
+    """READ-ONLY dry run of promote(): which keys would be copied where.
+
+    Lists the source (a tarball is downloaded to a temp dir and its member list
+    read, never extracted), the destination's current objects and manifest, and
+    reports the action promote() would take ("unchanged" | "copy" | "refused"),
+    every source → destination key, the stale destination keys it would delete,
+    and the manifest key it would write last. Makes no S3 write.
+    """
+    if kind not in ("lora_adapter", "full_model"):
+        raise LayoutError(f"unknown artifact kind '{kind}'")
+    if parse_adapter_uri(dest) is None and parse_finetune_uri(dest) is None:
+        raise LayoutError(f"refusing to plan a promotion into a non-canonical prefix: {dest}")
+    d_bucket, d_key = split_uri(dest)
+    d_root = d_key.rstrip("/") + "/"
+    s_bucket, s_key = split_uri(source)
+    previous = read_manifest(s3, dest)
+    if s_key.endswith((".tar.gz", ".tgz")):
+        head = s3.head_object(Bucket=s_bucket, Key=s_key)
+        src_hash = "sha256:" + hashlib.sha256(
+            f"{s_key.split('/')[-1]}\t{head.get('ContentLength')}\t{str(head.get('ETag') or '').strip(chr(34))}"
+            .encode("utf-8")).hexdigest()
+        tmp = tempfile.mkdtemp(prefix="mlcc-plan-")
+        try:
+            arc = os.path.join(tmp, "a.tar.gz")
+            s3.download_file(s_bucket, s_key, arc)
+            with tarfile.open(arc, "r:gz") as tf:
+                rels = sorted(os.path.normpath(m.name).replace(os.sep, "/")
+                              for m in _safe_members(tf, os.path.join(tmp, "x")) if m.isfile())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        rels = [r for r in rels if r.split("/")[-1] not in MANIFEST_FILES]
+        pairs = [(f"{source}#{r}", r) for r in rels]
+    else:
+        s_root = s_key.rstrip("/") + "/"
+        payload = [o for o in list_objects(s3, s_bucket, s_root)
+                   if o["Key"][len(s_root):].split("/")[-1] not in MANIFEST_FILES and not o["Key"].endswith("/")]
+        src_manifest = read_manifest(s3, source)
+        src_hash = (src_manifest or {}).get("content_hash") or content_hash(payload, s_root)
+        pairs = [(s3_uri(s_bucket, o["Key"]), o["Key"][len(s_root):]) for o in payload]
+    refused = ""
+    if not pairs:
+        refused = f"nothing to promote: {source} is empty or does not exist"
+    else:
+        try:
+            _require_servable_adapter(kind, (r for _, r in pairs), source)
+        except LayoutError as exc:
+            refused = str(exc)
+    targets = {d_root + r for _, r in pairs}
+    stale = sorted(o["Key"] for o in list_objects(s3, d_bucket, d_root)
+                   if o["Key"] not in targets and o["Key"][len(d_root):] not in MANIFEST_FILES)
+    unchanged = bool(previous and previous.get("content_hash") == src_hash)
+    return {
+        "action": "unchanged" if unchanged else ("refused" if refused else "copy"),
+        "refused": refused,
+        "source": source,
+        "dest": s3_uri(d_bucket, d_root),
+        "content_hash": src_hash,
+        "dest_content_hash": (previous or {}).get("content_hash"),
+        "copies": [] if unchanged or refused else [{"from": f, "to": s3_uri(d_bucket, d_root + r)} for f, r in pairs],
+        "stale_deletes": [] if unchanged or refused else [s3_uri(d_bucket, k) for k in stale],
+        "manifest": "" if unchanged or refused else s3_uri(d_bucket, d_root + manifest_name(kind)),
+    }
 
 
 def publish_local(s3, *, local_dir: str, dest: str, kind: str, project: str, name: str,
@@ -492,10 +603,12 @@ def publish_local(s3, *, local_dir: str, dest: str, kind: str, project: str, nam
             files.append((full, rel))
     if not files:
         raise LayoutError(f"nothing to publish: {local_dir} is empty")
+    _require_servable_adapter(kind, (rel for _, rel in files), source)
     src_hash = "sha256:" + hashlib.sha256("\n".join(sorted(rows)).encode("utf-8")).hexdigest()
     previous = read_manifest(s3, dest)
     if previous and previous.get("content_hash") == src_hash:
         return {"action": "unchanged", "dest": dest, "manifest": previous}
+    _invalidate_manifest(s3, d_bucket, d_root, previous)
     written = set()
     for full, rel in files:
         s3.upload_file(full, d_bucket, d_root + rel)
@@ -591,6 +704,7 @@ def _cli(argv: list[str]) -> int:
     add("parse", "--uri")
     add("promote", "--source", "--dest", "--kind", "--project", "--name", "--base-model",
         optional=("--source-job", "--technique", "--created-by", "--region", "--catalog"))
+    add("promote-plan", "--source", "--dest", "--kind", optional=("--region",))
     add("publish-local", "--dir", "--dest", "--kind", "--project", "--name", "--base-model", "--source",
         optional=("--created-by", "--region", "--catalog"))
     add("manifest", "--uri", optional=("--region",))
@@ -615,12 +729,20 @@ def _cli(argv: list[str]) -> int:
         elif a.cmd == "evaluator-key":
             _print({"key": evaluator_key(a.name)})
         elif a.cmd == "parse":
-            _print({"adapter": parse_adapter_uri(a.uri), "finetune": parse_finetune_uri(a.uri)})
+            pa, pf = parse_adapter_uri(a.uri), parse_finetune_uri(a.uri)
+            canon = pa or pf
+            # canonical_uri: the same prefix normalized to ONE trailing slash — what
+            # an adapter IC ArtifactUrl must be (without it, an S3 prefix match also
+            # takes sibling names like <name>-v2/; TROUBLESHOOTING "Failed to download").
+            _print({"adapter": pa, "finetune": pf,
+                    "canonical_uri": s3_uri(canon["bucket"], canon["prefix"]) if canon else ""})
         elif a.cmd == "promote":
             res = promote(_client(a.region or None), source=a.source, dest=a.dest, kind=a.kind,
                           project=a.project, name=a.name, base_model=resolve_base_id(a.base_model, cat()),
                           source_job=a.source_job, technique=a.technique, created_by=a.created_by)
             _print(res)
+        elif a.cmd == "promote-plan":
+            _print(plan_promote(_client(a.region or None), source=a.source, dest=a.dest, kind=a.kind))
         elif a.cmd == "publish-local":
             _print(publish_local(_client(a.region or None), local_dir=a.dir, dest=a.dest, kind=a.kind,
                                  project=a.project, name=a.name,

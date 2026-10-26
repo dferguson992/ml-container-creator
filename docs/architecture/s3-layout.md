@@ -212,7 +212,12 @@ Rules:
   failed promotion keeps the raw path and never fails the tune.
 - **Backfill.** `./do/adapter promote <name> --from-tune <t>` (or `--from-weights <uri>`)
   publishes an existing output; `--update-config` repoints the do/config var and keeps the
-  old value as `TUNE_ADAPTER_SOURCE_<T>` (or `TUNE_MODEL_SOURCE_<T>`).
+  old value as `TUNE_ADAPTER_SOURCE_<T>` (or `TUNE_MODEL_SOURCE_<T>`). `--dry-run` prints
+  every key it would copy and delete and writes nothing (`s3_layout.py promote-plan`).
+- **Servable adapters only.** A LoRA source must have `adapter_config.json` at its top level
+  (a job-output root or a `.tar.gz` with a top-level folder is refused before any write).
+  An existing manifest is removed before the payload is rewritten, so an interrupted
+  promotion never leaves a manifest the idempotency check would trust.
 - **Serving.** Realtime adapter ICs load the canonical prefix directly; the realtime model
   sync excludes `.mlcc-adapters/*`. On Kubernetes the canonical prefix is on the pod's model
   mount (see [LoRA delivery on Kubernetes](k8s-lora-delivery.md)); a serving copy is made

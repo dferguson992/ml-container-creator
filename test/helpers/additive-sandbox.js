@@ -25,8 +25,10 @@ export const BASH = existsSync('/bin/bash') ? '/bin/bash' : 'bash';
  * @param {object} opts
  * @param {string[]} [opts.scripts] do/ scripts to copy verbatim (e.g. ['adapter'])
  * @param {string} [opts.config] contents of do/config
+ * @param {boolean} [opts.pyHelpers] copy the real do/lib/python helpers, descriptors and tune catalog
+ * @param {boolean} [opts.realProfile] use the real do/lib/profile.sh (bucket names from writeProfile)
  */
-export function makeSandbox({ scripts = [], config = '', pyHelpers = false } = {}) {
+export function makeSandbox({ scripts = [], config = '', pyHelpers = false, realProfile = false } = {}) {
     const root = mkdtempSync(join(tmpdir(), 'mlcc-additive-'));
     const doDir = join(root, 'do');
     const libDir = join(doDir, 'lib');
@@ -57,6 +59,14 @@ export function makeSandbox({ scripts = [], config = '', pyHelpers = false } = {
         }
         cpSync(join(DO_SRC, 'targets.d'), join(doDir, 'targets.d'), { recursive: true });
         cpSync(join(REPO, 'templates/code/serve.d'), join(root, '.mlcc/serve.d'), { recursive: true });
+        // The generated project's tune catalog (s3_layout maps a TUNE_MODEL_ID to its HF id).
+        writeFileSync(join(doDir, '.tune_catalog.json'), readFileSync(join(REPO, 'config/tune-catalog.json')));
+    }
+    // realProfile: the REAL do/lib/profile.sh, so bucket names reach the script only
+    // through the active bootstrap profile (<root>/.ml-container-creator/config.json
+    // when HOME=<root>; write it with writeProfile) — never a literal.
+    if (realProfile) {
+        writeFileSync(join(libDir, 'profile.sh'), readFileSync(join(DO_SRC, 'lib/profile.sh')));
     }
     const write = (rel, content, mode = 0o755) => {
         const p = join(root, rel);
@@ -65,7 +75,10 @@ export function makeSandbox({ scripts = [], config = '', pyHelpers = false } = {
         return p;
     };
     const cleanup = () => rmSync(root, { recursive: true, force: true });
-    return { root, doDir, bin, write, cleanup };
+    /** Write the active bootstrap profile read by the real profile.sh (HOME=<root>). */
+    const writeProfile = (keys) => write('.ml-container-creator/config.json',
+        JSON.stringify({ activeProfile: 'sandbox', profiles: { sandbox: keys } }), 0o644);
+    return { root, doDir, bin, write, writeProfile, cleanup };
 }
 
 /** Env with the sandbox bin/ first on PATH and no inherited venv / AWS profile. */
