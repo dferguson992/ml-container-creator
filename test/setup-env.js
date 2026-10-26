@@ -6,7 +6,7 @@
  *
  * Mocha does NOT set NODE_ENV automatically, and this project runs with
  * `--parallel`, so each worker process must independently mark itself as a
- * test context. This file is loaded via `--require` in .mocharc.json for every
+ * test context. This file is loaded via `--require` in .mocharc.cjs for every
  * mocha process (main and parallel workers) BEFORE any test module is imported.
  *
  * We set ONLY `MLCC_SKIP_SECRET_DISCOVERY=1`. It fully activates the guard in

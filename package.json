@@ -116,7 +116,9 @@
   "scripts": {
     "test": "mocha 'test/**/*.test.js' --ignore 'test/property/**' --recursive --timeout 30000 --parallel",
     "test:property": "NODE_OPTIONS='--max-old-space-size=8192' mocha 'test/property/**/*.test.js' --recursive --timeout 60000 --parallel --jobs 4",
-    "test:all": "npm run test && npm run test:property",
+    "test:all": "npm run test && npm run test:node && npm run test:property",
+    "test:node": "node scripts/run-node-tests.js",
+    "test:node:network": "node scripts/run-node-tests.js --include-network",
     "test:fast": "mocha 'test/**/*.test.js' --recursive --timeout 15000 --parallel",
     "test:unit": "mocha 'test/unit/**/*.test.js' --recursive --timeout 15000",
     "test:integration": "mocha 'test/integration/**/*.test.js' --recursive --timeout 30000",
