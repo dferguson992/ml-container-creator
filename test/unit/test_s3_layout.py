@@ -8,6 +8,7 @@ knows a bucket name, callers pass what the profile says."""
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -200,6 +201,114 @@ def test_promote_refuses_non_canonical_destinations_and_empty_sources():
                   kind="lora_adapter", project="p", name="n", base_model=HF)
 
 
+# Modeled on the real fresh-ai-ml / sharp-gpt-bot tune output (live listing, SMAI screen):
+# do/tune records .../output/model/checkpoints/hf/; the job root next to it also holds
+# checkpoints/hf_merged/ (full model) and global_step_N/ (optimizer state + lora_adapter/).
+JOB = f"s3://{ART}/fresh-ai-ml/tune/sft/job-1/output/model/"
+REAL_HF_FILES = ("adapter_config.json", "adapter_model.safetensors", "chat_template.jinja",
+                 "processor_config.json", "tokenizer.json", "tokenizer_config.json")
+
+
+def _real_layout_s3():
+    s3 = FakeS3()
+    root = L.split_uri(JOB)[1]
+    for f in REAL_HF_FILES:
+        s3.put(ART, root + "checkpoints/hf/" + f, ADAPTER_CFG if f == "adapter_config.json" else b"x" + f.encode())
+    s3.put(ART, root + "checkpoints/hf_merged/model.safetensors", b"merged")
+    s3.put(ART, root + "global_step_404/optim_world_size_8_rank_0.pt", b"optim")
+    s3.put(ART, root + "global_step_404/lora_adapter/adapter_config.json", ADAPTER_CFG)
+    return s3
+
+
+def test_promote_of_the_recorded_checkpoints_hf_copies_only_the_adapter_dir():
+    s3 = _real_layout_s3()
+    dest = L.adapter_uri(CORE, HF, "fresh-ai-ml", "tuned-sft")
+    L.promote(s3, source=JOB + "checkpoints/hf/", dest=dest, kind="lora_adapter", project="fresh-ai-ml",
+              name="tuned-sft", base_model=HF)
+    key = L.split_uri(dest)[1]
+    assert sorted(k[len(key):] for k in s3.keys(CORE)) == sorted(REAL_HF_FILES + (L.ADAPTER_MANIFEST,))
+
+
+def test_promote_refuses_a_job_root_or_a_nested_tarball_before_any_write():
+    """SMAI screen: a nested layout would publish a prefix the adapter sidecar /
+    vLLM cannot load (adapter_config.json not at the top) — refused, nothing written."""
+    s3 = _real_layout_s3()
+    dest = L.adapter_uri(CORE, HF, "p", "n")
+    with pytest.raises(L.LayoutError, match="nested at 'checkpoints/hf/adapter_config.json'"):
+        L.promote(s3, source=JOB, dest=dest, kind="lora_adapter", project="p", name="n", base_model=HF)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, body in (("my-adapter/adapter_config.json", ADAPTER_CFG.encode()), ("my-adapter/adapter_model.safetensors", b"w")):
+            ti = tarfile.TarInfo(name)
+            ti.size = len(body)
+            tf.addfile(ti, io.BytesIO(body))
+    s3.put(ART, "in/nested.tar.gz", buf.getvalue())
+    with pytest.raises(L.LayoutError, match="my-adapter/adapter_config.json"):
+        L.promote(s3, source=f"s3://{ART}/in/nested.tar.gz", dest=dest, kind="lora_adapter", project="p",
+                  name="n", base_model=HF)
+    assert s3.keys(CORE) == [] and not [c for c in s3.calls if c[0] in ("put", "copy", "upload", "delete")]
+    # A full model has no adapter_config.json and is not subject to the check.
+    L.promote(s3, source=JOB + "checkpoints/hf_merged/", dest=L.finetune_uri(CORE, "p", "m"), kind="full_model",
+              project="p", name="m", base_model=HF)
+
+
+def test_an_interrupted_promotion_never_leaves_a_manifest_the_idempotency_check_trusts():
+    """SMAI screen bug: re-promoting over an existing adapter overwrote the payload in
+    place while the PREVIOUS manifest stayed; a failure mid-copy then made a later
+    promote of the previous source answer "unchanged" over half-overwritten files."""
+    s3 = _raw_s3()
+    dest = L.adapter_uri(CORE, HF, "fresh-ai-ml", "tuned-sft")
+    key = L.split_uri(dest)[1]
+    L.promote(s3, source=RAW, dest=dest, kind="lora_adapter", project="fresh-ai-ml", name="tuned-sft", base_model=HF)
+    v1 = {k: v for (b, k), v in s3.o.items() if b == CORE and k.startswith(key)}
+    other = f"s3://{ART}/other/hf/"
+    s3.put(ART, "other/hf/adapter_config.json", ADAPTER_CFG)
+    s3.put(ART, "other/hf/adapter_model.safetensors", b"weights-OTHER")
+    real_copy, n = s3.copy, {"i": 0}
+
+    def flaky(src, bucket, k):
+        n["i"] += 1
+        if n["i"] == 2:
+            raise RuntimeError("injected copy failure")
+        real_copy(src, bucket, k)
+    s3.copy = flaky
+    with pytest.raises(RuntimeError):
+        L.promote(s3, source=other, dest=dest, kind="lora_adapter", project="fresh-ai-ml", name="tuned-sft", base_model=HF)
+    s3.copy = real_copy
+    assert (CORE, key + L.ADAPTER_MANIFEST) not in s3.o, "no manifest next to a half-written payload"
+    again = L.promote(s3, source=RAW, dest=dest, kind="lora_adapter", project="fresh-ai-ml", name="tuned-sft", base_model=HF)
+    assert again["action"] == "copied"
+    now = {k: v for (b, k), v in s3.o.items() if b == CORE and k.startswith(key)}
+    assert {k: v for k, v in now.items() if not k.endswith(L.ADAPTER_MANIFEST)} == \
+        {k: v for k, v in v1.items() if not k.endswith(L.ADAPTER_MANIFEST)}
+
+
+def test_promote_plan_is_read_only_and_names_every_key():
+    s3 = _real_layout_s3()
+    src = JOB + "checkpoints/hf/"
+    dest = L.adapter_uri(CORE, HF, "fresh-ai-ml", "tuned-sft")
+    s3.put(CORE, L.split_uri(dest)[1] + "leftover.bin", b"old")
+    plan = L.plan_promote(s3, source=src, dest=dest, kind="lora_adapter")
+    assert plan["action"] == "copy" and not s3.calls
+    assert sorted(c["to"] for c in plan["copies"]) == sorted(dest + f for f in REAL_HF_FILES)
+    assert plan["stale_deletes"] == [dest + "leftover.bin"]
+    assert plan["manifest"] == dest + L.ADAPTER_MANIFEST
+    L.promote(s3, source=src, dest=dest, kind="lora_adapter", project="fresh-ai-ml", name="tuned-sft", base_model=HF)
+    assert L.plan_promote(s3, source=src, dest=dest, kind="lora_adapter")["action"] == "unchanged"
+    assert L.plan_promote(s3, source=JOB, dest=dest, kind="lora_adapter")["action"] == "refused"
+
+
+def test_cli_parse_normalizes_a_canonical_uri_to_one_trailing_slash():
+    uri = L.adapter_uri(CORE, HF, "p", "sft")
+    for given in (uri, uri.rstrip("/"), uri + "/"):
+        out = subprocess.run([sys.executable, os.path.join(_PY, "s3_layout.py"), "parse", "--uri", given],
+                             capture_output=True, text=True, check=True).stdout
+        assert json.loads(out)["canonical_uri"] == uri
+    out = subprocess.run([sys.executable, os.path.join(_PY, "s3_layout.py"), "parse", "--uri", RAW],
+                         capture_output=True, text=True, check=True).stdout
+    assert json.loads(out)["canonical_uri"] == ""
+
+
 def test_publish_local_writes_files_and_manifest(tmp_path):
     (tmp_path / "adapter_config.json").write_text(ADAPTER_CFG)
     (tmp_path / "adapter_model.safetensors").write_bytes(b"w")
@@ -304,3 +413,126 @@ def test_remove_deletes_only_a_serving_copy_it_made():
     assert ("core", "models/google/gemma-4-E4B-it/.mlcc-adapters/fresh-ai-ml/tuned-sft/w.safetensors") in s3.o
     # A canonical adapter (no serving_copy_of) is never removed by remove.
     assert ad.remove_copy(s3, BASE, "fresh-ai-ml", "tuned-sft")["deleted"] == 0
+
+
+# ── SMAI adapter IC request vs the botocore service model (Wave 6.1 Part B screen) ──
+# Runs the REAL do/adapter (realtime-inference) in a sandbox with a stub `aws` that
+# records its argv and a fake boto3 for the promotion; then rebuilds the
+# CreateInferenceComponent / UpdateInferenceComponent parameters from the recorded
+# CLI call and validates them against the SageMaker service model.
+_FAKE_BOTO3 = '''import hashlib, io, json, os
+class _C:
+    def _l(self):
+        return json.load(open(os.environ["FAKE_S3"]))
+    def _s(self, d):
+        json.dump(d, open(os.environ["FAKE_S3"], "w"))
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):
+        d = self._l(); pre = Bucket + "/" + Prefix
+        return {"Contents": [{"Key": k[len(Bucket) + 1:], "Size": len(v), "ETag": hashlib.md5(v.encode()).hexdigest()}
+                             for k, v in sorted(d.items()) if k.startswith(pre)], "IsTruncated": False}
+    def get_object(self, Bucket, Key):
+        d = self._l()
+        if Bucket + "/" + Key not in d:
+            raise KeyError(Key)
+        return {"Body": io.BytesIO(d[Bucket + "/" + Key].encode())}
+    def put_object(self, Bucket, Key, Body, ContentType=None):
+        d = self._l(); d[Bucket + "/" + Key] = Body.decode(); self._s(d)
+    def copy(self, src, bucket, key):
+        d = self._l(); d[bucket + "/" + key] = d[src["Bucket"] + "/" + src["Key"]]; self._s(d)
+    def delete_objects(self, Bucket, Delete):
+        d = self._l()
+        for o in Delete["Objects"]:
+            d.pop(Bucket + "/" + o["Key"], None)
+        self._s(d)
+def client(service, region_name=None):
+    return _C()
+'''
+_AWS_STUB = '''#!/bin/bash
+python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@" >> "$AWS_LOG"
+q=""; prev=""
+for a in "$@"; do [ "$prev" = "--query" ] && q="$a"; prev="$a"; done
+case "$1 $2" in
+  "sagemaker describe-inference-component")
+    case "$q" in InferenceComponentStatus) echo InService ;; *) echo None ;; esac ;;
+  "sagemaker create-inference-component"|"sagemaker update-inference-component") echo '{}' ;;
+  "s3 ls") exit 0 ;;
+  *) exit 1 ;;
+esac
+'''
+
+
+def _smai_sandbox(tmp_path):
+    import shutil
+    do = tmp_path / "do"
+    (do / "lib" / "python" / "boto3").mkdir(parents=True)
+    shutil.copy(os.path.join(_DO, "adapter"), do / "adapter")
+    for f in ("script-contract.sh", "wait.sh", "profile.sh", "s3-layout.sh"):
+        shutil.copy(os.path.join(_DO, "lib", f), do / "lib" / f)
+    for f in ("s3_layout.py", "right_sizing.py", "serve_manifest.py", "target_manifest.py", "instance_sizer.py"):
+        shutil.copy(os.path.join(_PY, f), do / "lib" / "python" / f)
+    shutil.copytree(os.path.join(_DO, "targets.d"), do / "targets.d")
+    repo = os.path.normpath(os.path.join(_DO, "..", ".."))
+    shutil.copy(os.path.join(repo, "config", "tune-catalog.json"), do / ".tune_catalog.json")
+    shutil.copytree(os.path.join(repo, "templates", "code", "serve.d"), tmp_path / ".mlcc" / "serve.d")
+    (tmp_path / ".mlcc" / "hey-venv" / "bin").mkdir(parents=True)
+    (tmp_path / ".mlcc" / "hey-venv" / "bin" / "activate").write_text("# stub venv\n")
+    (do / "lib" / "python" / "boto3" / "__init__.py").write_text(_FAKE_BOTO3)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "aws").write_text(_AWS_STUB)
+    (tmp_path / "bin" / "aws").chmod(0o755)
+    (tmp_path / ".ml-container-creator").mkdir()
+    (tmp_path / ".ml-container-creator" / "config.json").write_text(json.dumps(
+        {"activeProfile": "s", "profiles": {"s": {"coreS3Bucket": CORE, "artifactsS3Bucket": ART}}}))
+    (do / "config").write_text("\n".join([
+        'export DEPLOYMENT_TARGET="realtime-inference"', 'export DEPLOYMENT_TARGET_SMAI_STATUS="InService"',
+        'export ENABLE_LORA="true"', 'export PROJECT_NAME="proj"', 'export AWS_REGION="us-west-2"',
+        'export ENDPOINT_NAME="proj-endpoint"', 'export INFERENCE_COMPONENT_NAME="proj-base-ic"',
+        f'export MODEL_NAME="{HF}"', 'export TUNE_MODEL_ID="huggingface-vlm-gemma-4-e4b-it"',
+        f'export TUNE_ADAPTER_PATH_SFT="{RAW}"', ""]))
+    root = L.split_uri(RAW)[1]
+    (tmp_path / "s3.json").write_text(json.dumps({f"{ART}/{root}adapter_config.json": ADAPTER_CFG,
+                                                  f"{ART}/{root}adapter_model.safetensors": "w"}))
+    env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "AWS_PROFILE")}
+    env.update(PATH=f"{tmp_path / 'bin'}:{env['PATH']}", HOME=str(tmp_path), FAKE_S3=str(tmp_path / "s3.json"),
+               AWS_LOG=str(tmp_path / "aws.log"), MLCC_SKIP_SECRET_DISCOVERY="1")
+    return do, env
+
+
+def _cli_to_params(argv):
+    """aws sagemaker <op> --kebab-name value ... → (OperationName, {PascalName: value})."""
+    op = "".join(p.capitalize() for p in argv[1].split("-"))
+    params, i = {}, 2
+    while i < len(argv):
+        name = argv[i][2:]
+        if name not in ("region", "query", "output"):
+            val = argv[i + 1]
+            params["".join(p[:1].upper() + p[1:] for p in name.split("-"))] = json.loads(val) if val.startswith("{") else val
+        i += 2
+    return op, params
+
+
+def test_smai_adapter_ic_requests_validate_against_the_botocore_service_model(tmp_path):
+    botocore_session = pytest.importorskip("botocore.session")
+    from botocore.validate import ParamValidator
+    do, env = _smai_sandbox(tmp_path)
+    for args in (["add", "tuned-sft", "--from-tune", "sft"],
+                 ["update", "tuned-sft", "--from-weights", RAW.rstrip("/")]):
+        r = subprocess.run(["/bin/bash", str(do / "adapter"), *args], env=env, capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, r.stdout + r.stderr
+    calls = [json.loads(line) for line in (tmp_path / "aws.log").read_text().splitlines()]
+    ic_calls = [c for c in calls if c[:1] == ["sagemaker"] and c[1] in ("create-inference-component", "update-inference-component")]
+    assert [c[1] for c in ic_calls] == ["create-inference-component", "update-inference-component"]
+    model = botocore_session.get_session().get_service_model("sagemaker")
+    url_meta = model.shape_for("InferenceComponentContainerSpecification").members["ArtifactUrl"].metadata
+    expected = L.adapter_uri(CORE, HF, "proj", "tuned-sft")
+    for c in ic_calls:
+        op, params = _cli_to_params(c)
+        report = ParamValidator().validate(params, model.operation_model(op).input_shape)
+        assert not report.has_errors(), report.generate_report()
+        url = params["Specification"]["Container"]["ArtifactUrl"]
+        # The service-side constraints botocore does not enforce client-side.
+        assert re.fullmatch(url_meta["pattern"], url) and len(url) <= url_meta["max"]
+        assert url == expected
+    create = _cli_to_params(ic_calls[0])[1]
+    assert create["Specification"] == {"BaseInferenceComponentName": "proj-base-ic", "Container": {"ArtifactUrl": expected}}
+    assert create["EndpointName"] == "proj-endpoint" and create["InferenceComponentName"] == "proj-adapter-tuned-sft"

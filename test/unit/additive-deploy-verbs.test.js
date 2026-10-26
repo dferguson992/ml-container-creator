@@ -17,7 +17,9 @@
  */
 import { describe, it, before, after } from 'mocha';
 import assert from 'node:assert';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeSandbox, runBash, sandboxEnv, ACTIVE_STATUS_CONFIG, REPO } from '../helpers/additive-sandbox.js';
 
@@ -110,12 +112,29 @@ class _C:
     def put_object(self, Bucket, Key, Body, ContentType=None):
         d = self._l(); d[Bucket + "/" + Key] = Body.decode() if isinstance(Body, bytes) else Body; self._s(d)
     def copy(self, src, bucket, key):
+        # FAKE_S3_FAIL_COPY_AT=<n>: the n-th server-side copy fails (mid-promotion failure).
+        at = os.environ.get("FAKE_S3_FAIL_COPY_AT", "")
+        if at:
+            cf = os.environ["FAKE_S3"] + ".copies"
+            n = (int(open(cf).read()) if os.path.exists(cf) else 0) + 1
+            open(cf, "w").write(str(n))
+            if str(n) == at:
+                raise RuntimeError("injected copy failure")
         d = self._l(); d[bucket + "/" + key] = d[src["Bucket"] + "/" + src["Key"]]; self._s(d)
     def delete_objects(self, Bucket, Delete):
         d = self._l()
         for o in Delete["Objects"]:
             d.pop(Bucket + "/" + o["Key"], None)
         self._s(d)
+    # Binary-safe file transfer (tarball sources, --from-hub publish): bytes are
+    # stored as latin-1 strings so they round-trip through the JSON store.
+    def head_object(self, Bucket, Key):
+        v = self._l()[Bucket + "/" + Key]
+        return {"ContentLength": len(v), "ETag": hashlib.md5(v.encode("latin-1")).hexdigest()}
+    def download_file(self, bucket, key, path):
+        open(path, "wb").write(self._l()[bucket + "/" + key].encode("latin-1"))
+    def upload_file(self, path, bucket, key):
+        d = self._l(); d[bucket + "/" + key] = open(path, "rb").read().decode("latin-1"); self._s(d)
 def client(service, region_name=None):
     return _C()
 `;
@@ -415,6 +434,294 @@ describe('Wave 6 — do/adapter (SMAI) --weights deprecated alias (R2.2)', funct
             assert.match(r.stderr, /Cannot determine base inference component/, 'BL165: the base-IC error must not be swallowed by $(...)');
         } finally {
             sb.cleanup();
+        }
+    });
+});
+
+// ── SMAI (realtime-inference) adapter ICs end to end (Wave 6.1 Part B screen) ──
+// aws stub: records every invocation (JSON argv per line in AWS_LOG); the base IC
+// is InService with STUB_IC_ENV as its container Environment; create/update/delete
+// of adapter ICs succeed (a deleted IC then reads as not found); `aws s3 cp <uri> -`
+// (the rank pre-check) reads the fake S3 store. No AWS call is made.
+const SMAI_AWS_STUB = `#!/bin/bash
+python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@" >> "\${AWS_LOG}"
+q=""; ic=""; prev=""
+for a in "$@"; do
+  case "$prev" in --query) q="$a" ;; --inference-component-name) ic="$a" ;; esac
+  prev="$a"
+done
+case "$1 $2" in
+  "sagemaker describe-inference-component")
+    if [ -f "\${AWS_LOG}.deleted-$ic" ]; then echo "ValidationException: not found" >&2; exit 254; fi
+    case "$q" in
+      InferenceComponentStatus) echo "InService" ;;
+      Specification.Container.Environment) echo "\${STUB_IC_ENV:-{\\}}" ;;
+      *) echo "None" ;;
+    esac ;;
+  "sagemaker create-inference-component"|"sagemaker update-inference-component")
+    rm -f "\${AWS_LOG}.deleted-$ic"
+    echo '{"InferenceComponentArn": "arn:aws:sagemaker:us-west-2:111122223333:inference-component/x"}' ;;
+  "sagemaker delete-inference-component") : > "\${AWS_LOG}.deleted-$ic" ;;
+  "s3 ls") exit 0 ;;
+  "s3 cp")
+    if [ "$4" = "-" ]; then
+      exec python3 -c 'import json, os, sys
+d = json.load(open(os.environ["FAKE_S3"])); k = sys.argv[1][len("s3://"):]
+sys.exit(1) if k not in d else sys.stdout.write(d[k])' "$3"
+    fi
+    exit 1 ;;
+  *) exit 1 ;;
+esac
+`;
+// hf CLI stub (--from-hub): writes a PEFT adapter + the repo files hf download brings.
+const HF_STUB = `#!/bin/bash
+dir=""; prev=""
+for a in "$@"; do [ "$prev" = "--local-dir" ] && dir="$a"; prev="$a"; done
+mkdir -p "$dir/.cache/huggingface"
+printf '%s' '{"r": 16, "target_modules": ["q_proj", "v_proj"], "base_model_name_or_path": "google/gemma-4-E4B-it"}' > "$dir/adapter_config.json"
+printf 'hub-weights' > "$dir/adapter_model.safetensors"
+printf '# card' > "$dir/README.md"
+printf '*.safetensors filter=lfs' > "$dir/.gitattributes"
+`;
+// The engine's max-LoRA-rank env var, derived from the serving-engine descriptor.
+const loraRankVar = () => {
+    const m = JSON.parse(readFileSync(join(REPO, 'templates/code/serve.d/vllm/manifest.json'), 'utf8'));
+    return m.env_var_prefix + m.capability_map.lora_max_rank.suffix;
+};
+describe('Wave 6.1 Part B — do/adapter on realtime-inference: every source is promoted to the canonical prefix the adapter IC loads', function () {
+    this.timeout(180000);
+    const CORE_B = 'zz-core-smai';
+    const ART_B = 'zz-art-smai';
+    const TUNE_ID = 'huggingface-vlm-gemma-4-e4b-it';
+    // Modeled on a real fresh-ai-ml SFT output (do/tune records .../output/model/checkpoints/hf/):
+    // the PEFT pair plus the tokenizer / processor files the recipe writes next to it.
+    const RAW = `${ART_B}/proj/tune/sft/proj-tune-sft-1/output/model/checkpoints/hf/`;
+    const RAW_FILES = {
+        'adapter_config.json': JSON.stringify({ r: 32, lora_alpha: 64, target_modules: ['q_proj', 'v_proj'], base_model_name_or_path: 'google/gemma-4-E4B-it' }),
+        'adapter_model.safetensors': 'tuned-weights',
+        'chat_template.jinja': '{{ messages }}',
+        'processor_config.json': '{}',
+        'tokenizer.json': '{}',
+        'tokenizer_config.json': '{}'
+    };
+    let sb;
+    let store;
+    let awsLog;
+    const allIcRequests = [];
+    const pyLayout = join(REPO, 'templates/do/lib/python/s3_layout.py');
+    // The canonical home, composed by the ONE layout module (never re-derived here).
+    const canonical = (name) => JSON.parse(spawnSync('python3', [pyLayout, 'adapter-uri', '--bucket', CORE_B,
+        '--model', TUNE_ID, '--project', 'proj', '--name', name, '--catalog', join(REPO, 'config/tune-catalog.json')],
+    { encoding: 'utf8' }).stdout).uri;
+    const keysUnder = (s, uri) => Object.keys(s).filter(k => k.startsWith(uri.slice('s3://'.length)))
+        .map(k => k.slice(uri.length - 's3://'.length)).sort();
+    const smaiConfig = (extra = []) => [
+        ACTIVE_STATUS_CONFIG,
+        'export DEPLOYMENT_TARGET="realtime-inference"',
+        'export ENABLE_LORA="true"',
+        'export PROJECT_NAME="proj"',
+        'export AWS_REGION="us-west-2"',
+        'export ENDPOINT_NAME="proj-endpoint"',
+        'export INFERENCE_COMPONENT_NAME="proj-base-ic"',
+        'export MODEL_NAME="google/gemma-4-E4B-it"',
+        `export TUNE_MODEL_ID="${TUNE_ID}"`,
+        `export TUNE_ADAPTER_PATH_SFT="s3://${RAW}"`,
+        `export TRAIN_ADAPTER_PATH_SFT="s3://${RAW}"`,
+        ...extra,
+        ''
+    ].join('\n');
+    const seedRaw = (s = {}) => {
+        for (const [f, v] of Object.entries(RAW_FILES)) s[RAW + f] = v;
+        return s;
+    };
+    const tarball = (layout) => {
+        const dir = mkdtempSync(join(tmpdir(), 'mlcc-smai-tar-'));
+        const src = layout === 'nested' ? join(dir, 'my-adapter') : join(dir, 'flat');
+        mkdirSync(src, { recursive: true });
+        writeFileSync(join(src, 'adapter_config.json'), RAW_FILES['adapter_config.json']);
+        writeFileSync(join(src, 'adapter_model.safetensors'), 'tar-weights');
+        const out = join(dir, 'adapter.tar.gz');
+        const args = layout === 'nested' ? ['-czf', out, '-C', dir, 'my-adapter'] : ['-czf', out, '-C', src, '.'];
+        spawnSync('tar', args, { env: { ...process.env, COPYFILE_DISABLE: '1' } });
+        const bytes = readFileSync(out).toString('latin1');
+        rmSync(dir, { recursive: true, force: true });
+        return bytes;
+    };
+    before(() => {
+        sb = makeSandbox({ scripts: ['adapter'], pyHelpers: true, realProfile: true });
+        sb.write('bin/aws', SMAI_AWS_STUB);
+        sb.write('bin/hf', HF_STUB);
+        sb.write('do/lib/python/boto3/__init__.py', FAKE_BOTO3, 0o644);
+        // Bucket names reach do/adapter only through the profile (profile.sh → CORE_S3_BUCKET).
+        sb.writeProfile({ coreS3Bucket: CORE_B, artifactsS3Bucket: ART_B, awsRegion: 'us-west-2' });
+        store = join(sb.root, 'fake-s3.json');
+        awsLog = join(sb.root, 'aws.log');
+    });
+    after(() => sb.cleanup());
+    const run = (args, { config = [], env = {}, seed } = {}) => {
+        sb.write('do/config', smaiConfig(config), 0o644);
+        if (seed) writeFileSync(store, JSON.stringify(seed));
+        writeFileSync(awsLog, '');
+        rmSync(`${store}.copies`, { force: true });
+        const r = runBash(join(sb.doDir, 'adapter'), args, sandboxEnv(sb, {
+            HOME: sb.root, FAKE_S3: store, AWS_LOG: awsLog, MLCC_SKIP_SECRET_DISCOVERY: '1',
+            STUB_IC_ENV: JSON.stringify({ [loraRankVar()]: '64' }), ...env
+        }), { timeout: 60000 });
+        const aws = readFileSync(awsLog, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
+        const ic = aws.filter(a => a[0] === 'sagemaker' && /^(create|update)-inference-component$/.test(a[1]));
+        allIcRequests.push(...ic);
+        const spec = (verb) => {
+            const c = ic.find(a => a[1] === verb);
+            return c ? JSON.parse(c[c.indexOf('--specification') + 1]) : null;
+        };
+        return { ...r, aws, ic, spec, s3: JSON.parse(readFileSync(store, 'utf8')) };
+    };
+    const conf = (name) => readFileSync(join(sb.doDir, 'adapters', `${name}.conf`), 'utf8');
+    const removeConf = (name) => rmSync(join(sb.doDir, 'adapters', `${name}.conf`), { force: true });
+
+    it('--from-tune <t>: the raw output is copied server-side to the canonical prefix and the IC ArtifactUrl is that prefix', () => {
+        const r = run(['add', 'tuned-sft', '--from-tune', 'sft', '--local'], { seed: seedRaw() });
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        assert.match(r.stdout, /--local \/ --no-wait no longer apply/);
+        const dest = canonical('tuned-sft');
+        const spec = r.spec('create-inference-component');
+        assert.strictEqual(spec.BaseInferenceComponentName, 'proj-base-ic');
+        assert.strictEqual(spec.Container.ArtifactUrl, dest);
+        assert.ok(dest.endsWith('/') && !dest.slice('s3://'.length).includes('//'), dest);
+        assert.deepStrictEqual(Object.keys(spec.Container), ['ArtifactUrl'], 'an adapter IC carries no image / env / compute of its own');
+        // Same files as the old validated stage-from-tune prefix (adapter_config.json at the top) + the manifest.
+        assert.deepStrictEqual(keysUnder(r.s3, dest), [...Object.keys(RAW_FILES), 'mlcc-adapter.json'].sort());
+        const m = JSON.parse(r.s3[`${dest.slice('s3://'.length)  }mlcc-adapter.json`]);
+        assert.strictEqual(m.source, `s3://${RAW}`);
+        assert.strictEqual(m.rank, 32);
+        assert.match(m.content_hash, /^sha256:[0-9a-f]{64}$/);
+        assert.ok(Object.keys(r.s3).some(k => k === `${RAW  }adapter_config.json`), 'the raw output is never moved');
+        assert.match(conf('tuned-sft'), new RegExp(`ADAPTER_WEIGHTS_URI="${dest}"`));
+        assert.match(conf('tuned-sft'), new RegExp(`ADAPTER_SOURCE_URI="s3://${RAW}"`));
+        assert.match(r.stdout, /Rank check: adapter r32 vs serving max_lora_rank 64/);
+    });
+
+    it('re-adding the same tune output is idempotent: promotion "unchanged", the old IC is replaced', () => {
+        const before = JSON.parse(readFileSync(store, 'utf8'));
+        const r = run(['add', 'tuned-sft', '--from-tune', 'sft']);
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        assert.match(r.stderr, /Promotion unchanged/);
+        assert.deepStrictEqual(r.s3, before, 'nothing rewritten');
+        assert.ok(r.aws.some(a => a[1] === 'delete-inference-component'), 'AC-1.7: re-tune replaces the IC');
+        assert.strictEqual(r.spec('create-inference-component').Container.ArtifactUrl, canonical('tuned-sft'));
+    });
+
+    it('a promotion that fails mid-copy creates no IC and leaves no manifest a later run could trust', () => {
+        const seed = seedRaw(JSON.parse(readFileSync(store, 'utf8')));
+        seed[`${RAW  }adapter_model.safetensors`] = 'tuned-weights-v2';
+        const r = run(['add', 'tuned-sft', '--from-tune', 'sft'], { seed, env: { FAKE_S3_FAIL_COPY_AT: '2' } });
+        assert.notStrictEqual(r.code, 0);
+        assert.match(r.stderr, /injected copy failure/);
+        assert.ok(!r.aws.some(a => a[1] === 'create-inference-component'), 'no IC points at a half-written prefix');
+        const dest = canonical('tuned-sft');
+        assert.ok(!keysUnder(r.s3, dest).includes('mlcc-adapter.json'), 'the previous manifest was dropped before the rewrite');
+        // The retry copies again (not "unchanged") and completes the prefix.
+        const again = run(['add', 'tuned-sft', '--from-tune', 'sft']);
+        assert.strictEqual(again.code, 0, again.stdout + again.stderr);
+        assert.match(again.stderr, /Promotion copied/);
+        assert.strictEqual(again.s3[`${dest.slice('s3://'.length)  }adapter_model.safetensors`], 'tuned-weights-v2');
+    });
+
+    it('--from-weights <prefix> (no trailing slash) is accepted and promoted', () => {
+        const r = run(['add', 'w-prefix', '--from-weights', `s3://${RAW.replace(/\/$/, '')}`], { seed: seedRaw() });
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        const dest = canonical('w-prefix');
+        assert.strictEqual(r.spec('create-inference-component').Container.ArtifactUrl, dest);
+        assert.ok(keysUnder(r.s3, dest).includes('adapter_config.json'));
+    });
+
+    it('--from-weights <flat .tar.gz> is extracted: loose files at the top of the prefix, no archive', () => {
+        const tgz = `${ART_B}/mlcc-screen-in/adapter.tar.gz`;
+        const r = run(['add', 'w-tar', '--from-weights', `s3://${tgz}`], { seed: { [tgz]: tarball('flat') } });
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        const dest = canonical('w-tar');
+        assert.strictEqual(r.spec('create-inference-component').Container.ArtifactUrl, dest);
+        assert.deepStrictEqual(keysUnder(r.s3, dest), ['adapter_config.json', 'adapter_model.safetensors', 'mlcc-adapter.json']);
+        assert.strictEqual(r.s3[`${dest.slice('s3://'.length)  }adapter_model.safetensors`], 'tar-weights');
+    });
+
+    it('--from-weights <.tar.gz with a top-level folder> is refused before any IC or S3 write', () => {
+        const tgz = `${ART_B}/mlcc-screen-in/nested.tar.gz`;
+        const r = run(['add', 'w-nested', '--from-weights', `s3://${tgz}`], { seed: { [tgz]: tarball('nested') } });
+        assert.notStrictEqual(r.code, 0);
+        assert.match(r.stderr, /no adapter_config\.json at its top level.*my-adapter\/adapter_config\.json/s);
+        assert.strictEqual(r.ic.length, 0, 'no IC is created for an unservable layout');
+        assert.deepStrictEqual(keysUnder(r.s3, canonical('w-nested')), []);
+    });
+
+    it('--from-weights <canonical prefix without a slash> is used as-is, normalized to ONE trailing slash (no copy)', () => {
+        const dest = canonical('tuned-sft');
+        const before = JSON.parse(readFileSync(store, 'utf8'));
+        removeConf('canon');
+        const r = run(['add', 'canon', '--from-weights', dest.replace(/\/$/, '')]);
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        assert.strictEqual(r.spec('create-inference-component').Container.ArtifactUrl, dest);
+        assert.deepStrictEqual(r.s3, before);
+    });
+
+    it('--from-hub publishes the loose PEFT files (no tarball, no repo metadata) and the IC loads that prefix', () => {
+        const r = run(['add', 'hub-a', '--from-hub', 'org/some-adapter'], { seed: {} });
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        const dest = canonical('hub-a');
+        assert.strictEqual(r.spec('create-inference-component').Container.ArtifactUrl, dest);
+        assert.deepStrictEqual(keysUnder(r.s3, dest), ['README.md', 'adapter_config.json', 'adapter_model.safetensors', 'mlcc-adapter.json']);
+        assert.strictEqual(JSON.parse(r.s3[`${dest.slice('s3://'.length)  }mlcc-adapter.json`]).source, 'hf://org/some-adapter');
+    });
+
+    it('update --from-weights promotes the new weights and points the IC at the canonical prefix', () => {
+        const tgz = `${ART_B}/mlcc-screen-in/v2.tar.gz`;
+        const seed = { ...JSON.parse(readFileSync(store, 'utf8')), [tgz]: tarball('flat') };
+        const r = run(['update', 'hub-a', '--from-weights', `s3://${tgz}`], { seed });
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        const dest = canonical('hub-a');
+        const spec = r.spec('update-inference-component');
+        assert.deepStrictEqual(spec, { Container: { ArtifactUrl: dest } });
+        assert.deepStrictEqual(keysUnder(r.s3, dest), ['adapter_config.json', 'adapter_model.safetensors', 'mlcc-adapter.json'],
+            'stale files of the previous version (README.md) are removed');
+        assert.match(conf('hub-a'), new RegExp(`ADAPTER_WEIGHTS_URI="${dest}"`));
+    });
+
+    it('remove deletes only the adapter IC; the canonical S3 prefix is kept', () => {
+        const before = JSON.parse(readFileSync(store, 'utf8'));
+        const r = run(['remove', 'tuned-sft']);
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        assert.ok(r.aws.some(a => a[1] === 'delete-inference-component' && a.includes('proj-adapter-tuned-sft')));
+        assert.deepStrictEqual(r.s3, before);
+        assert.ok(!existsSync(join(sb.doDir, 'adapters', 'tuned-sft.conf')));
+    });
+
+    it('promote --dry-run lists every key it would copy and where, and writes nothing', () => {
+        const seed = seedRaw();
+        const r = run(['promote', 'dry-sft', '--from-tune', 'sft', '--dry-run'], { seed });
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        assert.deepStrictEqual(r.s3, seed, 'read-only');
+        const dest = canonical('dry-sft');
+        for (const f of Object.keys(RAW_FILES)) {
+            assert.ok(r.stderr.includes(`copy   s3://${RAW}${f}  ->  ${dest}${f}`), f);
+        }
+        assert.ok(r.stderr.includes(`write  ${dest}mlcc-adapter.json`));
+        assert.match(r.stdout, /Dry run: nothing was written/);
+        assert.strictEqual(r.ic.length, 0);
+    });
+
+    it('--from-train records ADAPTER_SOURCE="train" exactly once', () => {
+        removeConf('trained-sft');
+        const r = run(['add', 'trained-sft', '--from-train', 'sft'], { seed: seedRaw() });
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        const lines = conf('trained-sft').split('\n').filter(l => l.startsWith('export ADAPTER_SOURCE='));
+        assert.deepStrictEqual(lines, ['export ADAPTER_SOURCE="train"']);
+    });
+
+    it('every adapter IC request carried a canonical prefix ArtifactUrl with one trailing slash', () => {
+        assert.ok(allIcRequests.length >= 6, `IC requests captured: ${allIcRequests.length}`);
+        for (const a of allIcRequests) {
+            const url = JSON.parse(a[a.indexOf('--specification') + 1]).Container.ArtifactUrl;
+            assert.match(url, /^s3:\/\/[^/]+\/.+\/\.mlcc-adapters\/proj\/[a-z0-9-]+\/$/, url);
         }
     });
 });
