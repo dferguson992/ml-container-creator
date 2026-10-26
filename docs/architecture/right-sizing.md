@@ -6,7 +6,7 @@ always agree:
 
 | Caller | When | Effect of a `block` |
 |---|---|---|
-| `./do/deploy` preflight | before any per-target create / apply, every target | stops the deploy (exit 1) unless `--ignore-sizing` |
+| `./do/deploy` preflight (also `./do/deploy --dry-run`, preflight only) | before any per-target create / apply, every target | stops the deploy (exit 1) unless `--ignore-sizing` |
 | `./do/validate` | on demand / in CI | reported as an error (exit 1) |
 | `do/adapter`, `do/tune`, `deploy.d/{eks,hyperpod-eks}` | LoRA rank decisions (Wave 6.1) | adapter load refused / rank derived |
 
@@ -43,6 +43,30 @@ overrides the Wave 6.1 LoRA rank / buffer refusal inside the `eks` and
 already deployed) and does **not** bypass right-sizing, so an ordinary redeploy
 still runs every check. The flag is parsed by `do/deploy` itself; it is not a
 generator parameter.
+
+### Preflight only: `--dry-run`
+
+`./do/deploy --dry-run` runs the same preflight (one shared function in
+`do/deploy`) after config resolution and prints its findings with the resolved
+configuration. It never creates, applies, or calls `deploy.d/<target>`.
+
+| Preflight result | `--dry-run` exit |
+|---|---|
+| fits / skip | 0 |
+| warn | 0 |
+| block | 1 |
+| block + `--ignore-sizing` | 0 (warning line printed) |
+
+The repeatable check after a generator or serving-config change:
+
+```bash
+mcc regenerate
+./do/deploy --dry-run
+```
+
+On an already-deployed project, `--dry-run` (with or without `--target` /
+`--force`) previews the saved configuration and runs the preflight. It does not
+switch focus, write `do/config`, or re-prompt.
 
 ## The catalogue
 
