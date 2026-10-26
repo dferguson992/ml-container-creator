@@ -1,6 +1,6 @@
 {
   "_comment": "Instance family \u2192 GPU driver version mapping for SageMaker inference fleet. Source: AWS docs (inference-gpu-drivers.html) + empirical validation. Updated quarterly or when AWS announces fleet driver updates.",
-  "_last_updated": "2026-09-10",
+  "_last_updated": "2026-10-26",
   "instance_families": {
     "g4dn": {
       "driver": "535.183",
@@ -60,18 +60,36 @@
     "trn2": null,
     "inf2": null,
     "g7": {
-      "driver": "570.86",
-      "cuda_native": "12.8",
+      "driver": "580",
+      "cuda_native": "13.0",
       "gpu": "RTX PRO 4500",
       "gpu_memory_gb": 32,
-      "inference_ami_version": "al2023-ami-sagemaker-inference-gpu-4-1"
+      "inference_ami_version": "al2023-ami-sagemaker-inference-gpu-4-1",
+      "_source": "https://docs.aws.amazon.com/sagemaker/latest/dg/inference-gpu-drivers.html (ml.g7.* / ml.g7e.* default row: driver 580, CUDA 13.0, al2023-ami-sagemaker-inference-gpu-4-1). AWS publishes the driver major only (580)."
     },
     "g7e": {
-      "driver": "570.86",
-      "cuda_native": "12.8",
+      "driver": "580",
+      "cuda_native": "13.0",
       "gpu": "RTX PRO Server 6000",
       "gpu_memory_gb": 96,
-      "inference_ami_version": "al2023-ami-sagemaker-inference-gpu-4-1"
+      "inference_ami_version": "al2023-ami-sagemaker-inference-gpu-4-1",
+      "_source": "https://docs.aws.amazon.com/sagemaker/latest/dg/inference-gpu-drivers.html (ml.g7.* / ml.g7e.* default row: driver 580, CUDA 13.0, al2023-ami-sagemaker-inference-gpu-4-1). AWS publishes the driver major only (580)."
+    },
+    "p6-b200": {
+      "driver": "580",
+      "cuda_native": "13.0",
+      "gpu": "B200",
+      "gpu_memory_gb": 179,
+      "inference_ami_version": "al2023-ami-sagemaker-inference-gpu-4-1",
+      "_source": "https://docs.aws.amazon.com/sagemaker/latest/dg/inference-gpu-drivers.html (driver/CUDA/AMI: ml.p6.* default row); https://docs.aws.amazon.com/ec2/latest/instancetypes/ac.html (GPU model + per-GPU memory). AWS publishes the driver major only (580)."
+    },
+    "p6-b300": {
+      "driver": "580",
+      "cuda_native": "13.0",
+      "gpu": "B300",
+      "gpu_memory_gb": 268,
+      "inference_ami_version": "al2023-ami-sagemaker-inference-gpu-4-1",
+      "_source": "https://docs.aws.amazon.com/sagemaker/latest/dg/inference-gpu-drivers.html (driver/CUDA/AMI: ml.p6.* default row); https://docs.aws.amazon.com/ec2/latest/instancetypes/ac.html (GPU model + per-GPU memory). AWS publishes the driver major only (580)."
     }
   },
   "ami_versions": {
@@ -89,8 +107,9 @@
       "cuda_native": "12.4"
     },
     "al2023-ami-sagemaker-inference-gpu-4-1": {
-      "driver": "570.86",
-      "cuda_native": "12.8"
+      "driver": "580",
+      "cuda_native": "13.0",
+      "_source": "https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_ProductionVariant.html (InferenceAmiVersion enum) + https://docs.aws.amazon.com/sagemaker/latest/dg/inference-gpu-drivers.html. AWS publishes the driver major only (580)."
     }
   },
   "cuda_to_min_driver": {
