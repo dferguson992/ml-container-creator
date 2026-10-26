@@ -9,7 +9,8 @@ the two old stage_adapter.py adapter schemes did):
 
   core bucket (profile key coreS3Bucket → CORE_S3_BUCKET)
     models/<org>/<base>/                                    staged base weights (do/stage)
-    models/<org>/<base>/.mlcc-adapters/<project>/<name>/    CANONICAL LoRA adapter + mlcc-adapter.json
+    models/<org>/<base>/.mlcc-adapters/<project>/<name>/    adapter HOME (one per name)
+        v<hash12>/                                          CANONICAL LoRA adapter VERSION + mlcc-adapter.json
     models/mlcc-<project>/<name>/                           full fine-tune + mlcc-model.json
     evaluators/<name>/                                      reward-function code backups
     staging-jobs/<job>/                                     Processing Job entrypoints
@@ -23,19 +24,27 @@ unmapped id fails fast (it is never guessed).
 
 Promotion copies a job's servable output (S3 → S3, server-side, the caller's
 credentials) into the canonical prefix with a manifest, idempotent on the
-source content hash. test/unit/s3-layout-path-drift.test.js enforces that no
+source content hash. A LoRA adapter is CONTENT-ADDRESSED (BL199): it lands in
+<home>/v<hash12>/ where hash12 is the first 12 hex digits of that content hash,
+so identical content is the same version ("unchanged") and different content is
+a NEW version directory. A version directory is never rewritten in place and old
+versions are never deleted automatically (an inference component may still
+reference one); `do/clean adapters` removes every version of its own project.
+Unversioned homes written before BL199 (and hand copies) stay valid canonical
+adapters for parse / load / remove and as --from-weights sources. test/unit/s3-layout-path-drift.test.js enforces that no
 other file assembles these paths; test/unit/test_s3_layout.py covers the module.
 
 CLI (JSON on stdout; exit 0 ok, 2 usage/unmapped, 3 refused, 1 AWS error):
     s3_layout.py resolve-base --model ID [--catalog FILE]
     s3_layout.py base-uri --bucket B --model ID [--catalog FILE]
-    s3_layout.py adapter-uri --bucket B --model ID --project P --name N [--catalog FILE]
+    s3_layout.py adapter-uri --bucket B --model ID --project P --name N [--catalog FILE]   (the HOME)
     s3_layout.py finetune-uri --bucket B --project P --name N
     s3_layout.py artifacts-uri --bucket B --project P --kind tune|train|optimize
     s3_layout.py evaluator-key --name N
-    s3_layout.py parse --uri U
+    s3_layout.py parse --uri U                       (adapter: versioned or unversioned home)
     s3_layout.py promote --source U --dest U --kind lora_adapter|full_model --project P --name N
                          --base-model ID [--source-job J] [--technique T] [--created-by C] [--region R]
+        → {"action", "dest", "version", "manifest"}; an adapter's dest is <home>/v<hash12>/
     s3_layout.py promote-plan --source U --dest U --kind K [--region R]   (read-only dry run)
     s3_layout.py publish-local --dir D --dest U --kind K --project P --name N --base-model ID --source S
     s3_layout.py manifest --uri U [--region R]
@@ -71,6 +80,12 @@ MANIFEST_SCHEMA = "mlcc-artifact/v1"
 # adapter subtree (R3.5). templates/code/serve carries this glob literally (it runs
 # inside the image, without do/lib); a conformance test asserts they agree.
 SERVE_SYNC_EXCLUDE = f"{ADAPTER_SUBDIR}/*"
+# BL199 content-addressed adapter versions: <home>/v<first 12 hex of the content hash>/.
+# The version segment is composed ONLY here (adapter_version / adapter_version_uri);
+# test/unit/s3-layout-path-drift.test.js enforces it.
+VERSION_PREFIX = "v"
+VERSION_HEX_LEN = 12
+_VERSION_SEGMENT = re.compile(rf"^{VERSION_PREFIX}[0-9a-f]{{{VERSION_HEX_LEN}}}$")
 
 _HF_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -121,8 +136,29 @@ def adapter_project_prefix(base_key_prefix: str, project: str) -> str:
 
 
 def adapter_prefix(base_key_prefix: str, project: str, name: str) -> str:
-    """<base prefix>/.mlcc-adapters/<project>/<name>/ — the canonical adapter home."""
+    """<base prefix>/.mlcc-adapters/<project>/<name>/ — the adapter HOME (its versions live under it)."""
     return f"{adapter_project_prefix(base_key_prefix, project)}{_segment(name, 'adapter name')}/"
+
+
+def is_version_segment(segment: str) -> bool:
+    """True for a content-addressed version directory name (v<hash12>)."""
+    return bool(_VERSION_SEGMENT.match(segment or ""))
+
+
+def adapter_version(content_hash_value: str) -> str:
+    """'sha256:<hex>' → 'v<first 12 hex>' — the content-addressed version segment."""
+    digest = (content_hash_value or "").split(":", 1)[-1].strip().lower()
+    if not re.fullmatch(rf"[0-9a-f]{{{VERSION_HEX_LEN},}}", digest):
+        raise LayoutError(f"cannot derive an adapter version from content hash '{content_hash_value}'")
+    return f"{VERSION_PREFIX}{digest[:VERSION_HEX_LEN]}"
+
+
+def adapter_version_uri(home_uri: str, content_hash_value: str) -> str:
+    """<home>/v<hash12>/ — the canonical, immutable location of one adapter version."""
+    parsed = parse_adapter_uri(home_uri)
+    if parsed is None:
+        raise LayoutError(f"not a canonical adapter prefix: {home_uri}")
+    return s3_uri(parsed["bucket"], f"{parsed['home']}{adapter_version(content_hash_value)}/")
 
 
 def finetune_prefix(project: str, name: str) -> str:
@@ -199,7 +235,13 @@ def model_id_from_base_prefix(key_prefix: str) -> str:
 
 
 def parse_adapter_uri(uri: str) -> dict | None:
-    """{bucket, base_prefix, base_model, project, name, prefix} for a canonical adapter URI."""
+    """{bucket, base_prefix, base_model, project, name, version, home, prefix} for a canonical adapter URI.
+
+    Accepts both forms: a content-addressed version <home>/v<hash12>/ (BL199) and an
+    unversioned home <...>/.mlcc-adapters/<project>/<name>/ (written before BL199, or
+    a hand copy) — `version` is '' for the latter. `home` is the name-level prefix,
+    `prefix` the exact prefix given (normalized to one trailing slash).
+    """
     try:
         bucket, key = split_uri(uri)
     except LayoutError:
@@ -208,7 +250,11 @@ def parse_adapter_uri(uri: str) -> dict | None:
     if ADAPTER_SUBDIR not in parts:
         return None
     i = parts.index(ADAPTER_SUBDIR)
-    if len(parts) != i + 3:
+    if len(parts) == i + 4 and is_version_segment(parts[i + 3]):
+        version = parts[i + 3]
+    elif len(parts) == i + 3:
+        version = ""
+    else:
         return None
     base = "/".join(parts[:i])
     return {
@@ -217,6 +263,8 @@ def parse_adapter_uri(uri: str) -> dict | None:
         "base_model": model_id_from_base_prefix(base),
         "project": parts[i + 1],
         "name": parts[i + 2],
+        "version": version,
+        "home": "/".join(parts[:i + 3]) + "/",
         "prefix": "/".join(parts) + "/",
     }
 
@@ -345,7 +393,7 @@ def build_manifest(*, kind: str, project: str, name: str, base_model: str, sourc
                    content_hash_value: str, source_job: str = "", technique: str = "",
                    created_by: str = "", adapter_config: dict | None = None,
                    base_revision: str | None = None, previous: dict | None = None,
-                   serving_copy_of: str = "") -> dict:
+                   serving_copy_of: str = "", version: str = "") -> dict:
     m = {
         "schema": MANIFEST_SCHEMA,
         "artifact_kind": kind,
@@ -360,6 +408,8 @@ def build_manifest(*, kind: str, project: str, name: str, base_model: str, sourc
         "created_by": created_by or None,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if version:
+        m["version"] = version  # BL199: the content-addressed directory this manifest sits in
     if kind == "lora_adapter":
         m.update(_adapter_config_facts(adapter_config))
     if previous and previous.get("content_hash") and previous.get("content_hash") != content_hash_value:
@@ -404,58 +454,110 @@ def _require_servable_adapter(kind: str, rels, source: str) -> None:
 
 
 def _invalidate_manifest(s3, bucket: str, root: str, previous: dict | None) -> None:
-    """Drop dest's manifest BEFORE the payload is rewritten.
+    """Drop dest's manifest BEFORE the payload is rewritten (full models only).
 
     The manifest marks a complete promotion and carries the content hash the
     idempotency check trusts. Without this, a promotion interrupted mid-copy would
     leave the PREVIOUS manifest next to a half-overwritten payload, and a later
     promote of the previous source would answer "unchanged" over mixed files.
+    A LoRA adapter never reaches this with a previous manifest: it is written to a
+    fresh content-addressed version directory (BL199).
     """
     if previous is not None:
         _delete_keys(s3, bucket, [root + m for m in MANIFEST_FILES])
 
 
+def _tarball_hash(s_key: str, head: dict) -> str:
+    return "sha256:" + hashlib.sha256(
+        f"{s_key.split('/')[-1]}\t{head.get('ContentLength')}\t{str(head.get('ETag') or '').strip(chr(34))}"
+        .encode("utf-8")).hexdigest()
+
+
+def _source_rel_skipped(source: str):
+    """A predicate for source-relative keys that are not payload.
+
+    Manifests are never payload. An UNVERSIONED canonical home used as a source
+    (pre-BL199 adapter or hand copy) may also hold content-addressed version
+    directories promoted into it later; those belong to other versions, not to it.
+    """
+    parsed = parse_adapter_uri(source)
+    nested_versions = parsed is not None and not parsed["version"]
+
+    def skip(rel: str) -> bool:
+        if not rel or rel.endswith("/") or rel.split("/")[-1] in MANIFEST_FILES:
+            return True
+        return nested_versions and "/" in rel and is_version_segment(rel.split("/", 1)[0])
+    return skip
+
+
+def _resolve_target(dest: str, kind: str, src_hash: str) -> tuple[str, str]:
+    """(target URI, version) for a promotion of content `src_hash` into `dest`.
+
+    full_model → dest itself (no version). lora_adapter → the content-addressed
+    version directory under dest's HOME (BL199); dest may be the home or a version
+    directory, but a version directory only ever receives the content it is named for.
+    """
+    if parse_adapter_uri(dest) is None and parse_finetune_uri(dest) is None:
+        raise LayoutError(f"refusing to promote into a non-canonical prefix: {dest}")
+    if kind != "lora_adapter":
+        return dest, ""
+    parsed = parse_adapter_uri(dest)
+    if parsed is None:
+        raise LayoutError(f"a LoRA adapter must be promoted into a canonical adapter prefix: {dest}")
+    version = adapter_version(src_hash)
+    if parsed["version"] and parsed["version"] != version:
+        raise LayoutError(f"refusing to write content {version} into version directory {dest}: "
+                          "a version directory is never rewritten (promote into the adapter home instead)")
+    return adapter_version_uri(s3_uri(parsed["bucket"], parsed["home"]), src_hash), version
+
+
+def _guard_version_dir(target: str, version: str, previous: dict | None, src_hash: str) -> None:
+    if version and previous is not None and previous.get("content_hash") != src_hash:
+        raise LayoutError(f"{target} already holds different content ({previous.get('content_hash')}); "
+                          "a version directory is never rewritten in place")
+
+
 def promote(s3, *, source: str, dest: str, kind: str, project: str, name: str, base_model: str,
             source_job: str = "", technique: str = "", created_by: str = "",
             serving_copy_of: str = "") -> dict:
-    """Publish `source` (an S3 prefix or a .tar.gz) to the canonical `dest` prefix.
+    """Publish `source` (an S3 prefix or a .tar.gz) to its canonical prefix.
 
-    Idempotent: when dest's manifest already records the source's content hash,
-    nothing is copied. Otherwise any existing manifest is removed first, every
-    payload object is copied server-side, stale dest objects (from an older
-    version of THIS artifact) are removed, and the manifest is written last (its
-    presence marks a complete promotion; an interrupted run leaves none).
+    full_model: into `dest` itself. lora_adapter (BL199): into the content-addressed
+    version directory <home of dest>/v<hash12>/ — identical content is the SAME
+    version ("unchanged", nothing copied); different content is a NEW directory and
+    every existing version is left untouched. A version directory is never rewritten
+    in place. Every payload object is copied server-side, stale objects of an
+    interrupted run of the same version are removed, and the manifest is written
+    last (its presence marks a complete promotion; an interrupted run leaves none).
     A lora_adapter source must have adapter_config.json at its top level.
-    Returns {"action": "copied"|"unchanged", "dest": dest, "manifest": {...}}.
+    Returns {"action": "copied"|"unchanged", "dest": <target>, "version", "manifest": {...}}.
     """
     if kind not in ("lora_adapter", "full_model"):
         raise LayoutError(f"unknown artifact kind '{kind}'")
-    d_bucket, d_key = split_uri(dest)
-    d_root = d_key.rstrip("/") + "/"
     if parse_adapter_uri(dest) is None and parse_finetune_uri(dest) is None:
         raise LayoutError(f"refusing to promote into a non-canonical prefix: {dest}")
     s_bucket, s_key = split_uri(source)
-    previous = read_manifest(s3, dest)
     tarball = s_key.endswith((".tar.gz", ".tgz"))
+    skip = _source_rel_skipped(source)
     if tarball:
-        head = s3.head_object(Bucket=s_bucket, Key=s_key)
-        src_hash = "sha256:" + hashlib.sha256(
-            f"{s_key.split('/')[-1]}\t{head.get('ContentLength')}\t{str(head.get('ETag') or '').strip(chr(34))}"
-            .encode("utf-8")).hexdigest()
+        src_hash = _tarball_hash(s_key, s3.head_object(Bucket=s_bucket, Key=s_key))
         src_objects: list[dict] = []
         src_manifest = None
     else:
         s_root = s_key.rstrip("/") + "/"
-        src_objects = list_objects(s3, s_bucket, s_root)
-        payload = [o for o in src_objects if o["Key"][len(s_root):].split("/")[-1] not in MANIFEST_FILES
-                   and not o["Key"].endswith("/")]
+        payload = [o for o in list_objects(s3, s_bucket, s_root) if not skip(o["Key"][len(s_root):])]
         if not payload:
             raise LayoutError(f"nothing to promote: {source} is empty or does not exist")
         src_manifest = read_manifest(s3, source)
         src_hash = (src_manifest or {}).get("content_hash") or content_hash(payload, s_root)
         src_objects = payload
+    target, version = _resolve_target(dest, kind, src_hash)
+    d_bucket, d_key = split_uri(target)
+    d_root = d_key.rstrip("/") + "/"
+    previous = read_manifest(s3, target)
     if previous and previous.get("content_hash") == src_hash:
-        return {"action": "unchanged", "dest": dest, "manifest": previous}
+        return {"action": "unchanged", "dest": target, "version": version, "manifest": previous}
+    _guard_version_dir(target, version, previous, src_hash)
 
     written: set[str] = set()
     adapter_cfg = None
@@ -513,34 +615,29 @@ def promote(s3, *, source: str, dest: str, kind: str, project: str, name: str, b
         content_hash_value=src_hash, source_job=source_job, technique=technique,
         created_by=created_by, adapter_config=adapter_cfg,
         base_revision=(src_manifest or {}).get("base_revision"), previous=previous,
-        serving_copy_of=serving_copy_of)
+        serving_copy_of=serving_copy_of, version=version)
     s3.put_object(Bucket=d_bucket, Key=d_root + manifest_name(kind),
                   Body=json.dumps(manifest, indent=2).encode("utf-8"), ContentType="application/json")
-    return {"action": "copied", "dest": dest, "manifest": manifest}
+    return {"action": "copied", "dest": target, "version": version, "manifest": manifest}
 
 
 def plan_promote(s3, *, source: str, dest: str, kind: str) -> dict:
     """READ-ONLY dry run of promote(): which keys would be copied where.
 
     Lists the source (a tarball is downloaded to a temp dir and its member list
-    read, never extracted), the destination's current objects and manifest, and
+    read, never extracted), the target's current objects and manifest, and
     reports the action promote() would take ("unchanged" | "copy" | "refused"),
-    every source → destination key, the stale destination keys it would delete,
-    and the manifest key it would write last. Makes no S3 write.
+    the target (for an adapter: the content-addressed version directory it would
+    create or reuse), every source → destination key, the stale target keys it
+    would delete, and the manifest key it would write last. Makes no S3 write.
     """
     if kind not in ("lora_adapter", "full_model"):
         raise LayoutError(f"unknown artifact kind '{kind}'")
     if parse_adapter_uri(dest) is None and parse_finetune_uri(dest) is None:
         raise LayoutError(f"refusing to plan a promotion into a non-canonical prefix: {dest}")
-    d_bucket, d_key = split_uri(dest)
-    d_root = d_key.rstrip("/") + "/"
     s_bucket, s_key = split_uri(source)
-    previous = read_manifest(s3, dest)
     if s_key.endswith((".tar.gz", ".tgz")):
-        head = s3.head_object(Bucket=s_bucket, Key=s_key)
-        src_hash = "sha256:" + hashlib.sha256(
-            f"{s_key.split('/')[-1]}\t{head.get('ContentLength')}\t{str(head.get('ETag') or '').strip(chr(34))}"
-            .encode("utf-8")).hexdigest()
+        src_hash = _tarball_hash(s_key, s3.head_object(Bucket=s_bucket, Key=s_key))
         tmp = tempfile.mkdtemp(prefix="mlcc-plan-")
         try:
             arc = os.path.join(tmp, "a.tar.gz")
@@ -554,8 +651,8 @@ def plan_promote(s3, *, source: str, dest: str, kind: str) -> dict:
         pairs = [(f"{source}#{r}", r) for r in rels]
     else:
         s_root = s_key.rstrip("/") + "/"
-        payload = [o for o in list_objects(s3, s_bucket, s_root)
-                   if o["Key"][len(s_root):].split("/")[-1] not in MANIFEST_FILES and not o["Key"].endswith("/")]
+        skip = _source_rel_skipped(source)
+        payload = [o for o in list_objects(s3, s_bucket, s_root) if not skip(o["Key"][len(s_root):])]
         src_manifest = read_manifest(s3, source)
         src_hash = (src_manifest or {}).get("content_hash") or content_hash(payload, s_root)
         pairs = [(s3_uri(s_bucket, o["Key"]), o["Key"][len(s_root):]) for o in payload]
@@ -567,6 +664,16 @@ def plan_promote(s3, *, source: str, dest: str, kind: str) -> dict:
             _require_servable_adapter(kind, (r for _, r in pairs), source)
         except LayoutError as exc:
             refused = str(exc)
+    target, version = _resolve_target(dest, kind, src_hash)
+    d_bucket, d_key = split_uri(target)
+    d_root = d_key.rstrip("/") + "/"
+    previous = read_manifest(s3, target)
+    if not refused:
+        try:
+            _guard_version_dir(target, version, None if (previous or {}).get("content_hash") == src_hash
+                               else previous, src_hash)
+        except LayoutError as exc:
+            refused = str(exc)
     targets = {d_root + r for _, r in pairs}
     stale = sorted(o["Key"] for o in list_objects(s3, d_bucket, d_root)
                    if o["Key"] not in targets and o["Key"][len(d_root):] not in MANIFEST_FILES)
@@ -576,6 +683,7 @@ def plan_promote(s3, *, source: str, dest: str, kind: str) -> dict:
         "refused": refused,
         "source": source,
         "dest": s3_uri(d_bucket, d_root),
+        "version": version,
         "content_hash": src_hash,
         "dest_content_hash": (previous or {}).get("content_hash"),
         "copies": [] if unchanged or refused else [{"from": f, "to": s3_uri(d_bucket, d_root + r)} for f, r in pairs],
@@ -586,11 +694,13 @@ def plan_promote(s3, *, source: str, dest: str, kind: str) -> dict:
 
 def publish_local(s3, *, local_dir: str, dest: str, kind: str, project: str, name: str,
                   base_model: str, source: str, created_by: str = "") -> dict:
-    """Upload a local adapter/model directory (e.g. a --from-hub download) to `dest`."""
+    """Upload a local adapter/model directory (e.g. a --from-hub download) to its canonical prefix.
+
+    A lora_adapter lands in the content-addressed version directory under dest's
+    home, exactly like promote() (BL199).
+    """
     if parse_adapter_uri(dest) is None and parse_finetune_uri(dest) is None:
         raise LayoutError(f"refusing to publish into a non-canonical prefix: {dest}")
-    d_bucket, d_key = split_uri(dest)
-    d_root = d_key.rstrip("/") + "/"
     rows, files = [], []
     for dirpath, _, fnames in os.walk(local_dir):
         for fn in fnames:
@@ -605,9 +715,13 @@ def publish_local(s3, *, local_dir: str, dest: str, kind: str, project: str, nam
         raise LayoutError(f"nothing to publish: {local_dir} is empty")
     _require_servable_adapter(kind, (rel for _, rel in files), source)
     src_hash = "sha256:" + hashlib.sha256("\n".join(sorted(rows)).encode("utf-8")).hexdigest()
-    previous = read_manifest(s3, dest)
+    target, version = _resolve_target(dest, kind, src_hash)
+    d_bucket, d_key = split_uri(target)
+    d_root = d_key.rstrip("/") + "/"
+    previous = read_manifest(s3, target)
     if previous and previous.get("content_hash") == src_hash:
-        return {"action": "unchanged", "dest": dest, "manifest": previous}
+        return {"action": "unchanged", "dest": target, "version": version, "manifest": previous}
+    _guard_version_dir(target, version, previous, src_hash)
     _invalidate_manifest(s3, d_bucket, d_root, previous)
     written = set()
     for full, rel in files:
@@ -626,10 +740,10 @@ def publish_local(s3, *, local_dir: str, dest: str, kind: str, project: str, nam
                 cfg = None
     manifest = build_manifest(kind=kind, project=project, name=name, base_model=base_model, source=source,
                               content_hash_value=src_hash, created_by=created_by, adapter_config=cfg,
-                              previous=previous)
+                              previous=previous, version=version)
     s3.put_object(Bucket=d_bucket, Key=d_root + manifest_name(kind),
                   Body=json.dumps(manifest, indent=2).encode("utf-8"), ContentType="application/json")
-    return {"action": "copied", "dest": dest, "manifest": manifest}
+    return {"action": "copied", "dest": target, "version": version, "manifest": manifest}
 
 
 def _delete_keys(s3, bucket: str, keys: list[str]) -> int:
@@ -660,7 +774,8 @@ def is_project_owned_key(key: str, project: str) -> bool:
         return True
     if ADAPTER_SUBDIR in parts:
         i = parts.index(ADAPTER_SUBDIR)
-        # models/<org>/<base>/.mlcc-adapters/<project>/<name>/<file...>
+        # models/<org>/<base>/.mlcc-adapters/<project>/<name>/[v<hash12>/]<file...>
+        # (every version of the project's adapters, and unversioned pre-BL199 homes)
         return i >= 2 and len(parts) >= i + 4 and parts[i + 1] == project
     return False
 
@@ -734,8 +849,12 @@ def _cli(argv: list[str]) -> int:
             # canonical_uri: the same prefix normalized to ONE trailing slash — what
             # an adapter IC ArtifactUrl must be (without it, an S3 prefix match also
             # takes sibling names like <name>-v2/; TROUBLESHOOTING "Failed to download").
+            # version: the content-addressed version segment ('' for an unversioned,
+            # pre-BL199 home); home_uri: the adapter's name-level home.
             _print({"adapter": pa, "finetune": pf,
-                    "canonical_uri": s3_uri(canon["bucket"], canon["prefix"]) if canon else ""})
+                    "canonical_uri": s3_uri(canon["bucket"], canon["prefix"]) if canon else "",
+                    "version": (pa or {}).get("version", ""),
+                    "home_uri": s3_uri(pa["bucket"], pa["home"]) if pa else ""})
         elif a.cmd == "promote":
             res = promote(_client(a.region or None), source=a.source, dest=a.dest, kind=a.kind,
                           project=a.project, name=a.name, base_model=resolve_base_id(a.base_model, cat()),

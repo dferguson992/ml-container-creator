@@ -18,8 +18,9 @@ Every servable adapter has ONE home in the core bucket, keyed by the base model 
 trained on (bucket consolidation Option D):
 
 ```
-s3://<coreS3Bucket>/models/<org>/<base>/.mlcc-adapters/<project>/<name>/   adapter files + mlcc-adapter.json
-s3://<coreS3Bucket>/models/mlcc-<project>/<name>/                         full fine-tune + mlcc-model.json
+s3://<coreS3Bucket>/models/<org>/<base>/.mlcc-adapters/<project>/<name>/            adapter home
+s3://<coreS3Bucket>/models/<org>/<base>/.mlcc-adapters/<project>/<name>/v<hash12>/  one adapter version + mlcc-adapter.json
+s3://<coreS3Bucket>/models/mlcc-<project>/<name>/                                  full fine-tune + mlcc-model.json
 s3://<artifactsS3Bucket>/<project>/tune|train|optimize/...                raw job output (never served as-is)
 ```
 
@@ -31,7 +32,14 @@ any other file assembles these paths.
 
 The manifest (`mlcc-adapter.json`) records the source URI, source job, technique, rank
 (`r` and `rank_pattern`), target modules, base model (+ revision when known), a content
-hash, who created it, and when. Promotion is idempotent on the content hash.
+hash, the `version`, who created it, and when.
+
+Adapters are content-addressed (BL199). Each promotion writes `v<hash12>/`, the first 12
+hex digits of the content hash, under the home. Identical content is the same version
+(`unchanged`, nothing copied). New content is a new directory, and existing versions are
+never rewritten or deleted automatically. Unversioned homes written before BL199, and
+hand copies, stay valid canonical adapters. See
+[S3 buckets and layout](s3-layout.md#content-addressed-adapter-versions-bl199).
 
 ### Producers
 
@@ -39,8 +47,8 @@ hash, who created it, and when. Promotion is idempotent on the content hash.
 |---|---|
 | `do/tune` (job completes, or `./do/tune status` resolves it) | Promotes `checkpoints/hf/` → canonical `tuned-<technique>[-<dataset>]`; `TUNE_ADAPTER_PATH_<T>` records the canonical URI, the raw path stays in `TUNE_OUTPUT_PATH_<T>` / `TUNE_OUTPUT_PATH_LATEST`. A full model goes to `models/mlcc-<project>/<name>/` and `TUNE_MODEL_PATH_<T>`. |
 | `do/train` | Same, as `trained-<technique>` (`TRAIN_ADAPTER_PATH_<T>` / `TRAIN_MODEL_PATH_<T>`; raw in `TRAIN_OUTPUT_PATH_<T>`). |
-| `do/adapter add --from-hub` | Downloads the repo and publishes the loose PEFT files straight to the canonical prefix. |
-| `do/adapter add --from-weights` / `--from-registry` / `--from-tune` / `--from-train` | Promotes the source (prefix or `.tar.gz`) to the canonical prefix before loading. |
+| `do/adapter add --from-hub` | Downloads the repo and publishes the loose PEFT files straight to a canonical version. |
+| `do/adapter add` / `update --from-weights` / `--from-registry` / `--from-tune` / `--from-train` | Promotes the source (prefix or `.tar.gz`) to a canonical version before loading. A canonical source (a version or an unversioned home) is used as-is. |
 | `do/adapter promote <name> --from-tune <t>` | Backfills a finished job (projects tuned before this change). `--update-config` repoints `TUNE_ADAPTER_PATH_<T>` and keeps the old value in `TUNE_ADAPTER_SOURCE_<T>`. |
 
 A promotion failure in `do/tune` / `do/train` never fails the job: the raw path stays the
@@ -57,9 +65,11 @@ credentials. The target descriptor (`templates/do/targets.d/<t>/manifest.json`) 
 
 | Target | Model mount | Adapter path in the pod |
 |---|---|---|
-| `hyperpod-eks` | operator S3 CSI mount of the IEC `modelLocation` (prefetch OFF when LoRA + S3 source) | `/opt/ml/model/.mlcc-adapters/<project>/<name>` |
+| `hyperpod-eks` | operator S3 CSI mount of the IEC `modelLocation` (prefetch OFF when LoRA + S3 source) | `/opt/ml/model/.mlcc-adapters/<project>/<name>/v<hash12>` (an unversioned home: `…/<name>`) |
 | `eks` | the S3 model mount (`EKS_MODEL_MOUNT=s3`, `STAGED_MODEL_PATH`) | same |
-| `realtime-inference` | none — each adapter is its own inference component | the IC loads the canonical S3 prefix directly |
+| `realtime-inference` | none — each adapter is its own inference component | the IC's `ArtifactUrl` is the canonical version (`…/<name>/v<hash12>/`) |
+
+The vLLM `lora_name` is always `<name>`. The version only changes the path that is loaded.
 
 `./do/adapter add <name> --from-*` on Kubernetes (`adapter_delivery.py deliver`):
 
@@ -67,21 +77,31 @@ credentials. The target descriptor (`templates/do/targets.d/<t>/manifest.json`) 
    Hugging Face / model-package source → `./do/stage` and redeploy; IEC still prefetching →
    `./do/deploy --target hyperpod-eks --force`; eks without the S3 mount → `EKS_MODEL_MOUNT=s3`.
 2. Rank pre-check against the LIVE limit (pod env → IEC env → engine default).
-3. A source that is not canonical is promoted to the canonical prefix of the adapter's base.
-4. A canonical adapter under THIS deployment's model prefix is loaded by path. No copy.
+3. A source that is not canonical is promoted under the canonical home of the adapter's
+   base. The promotion picks the version directory from the content hash, so the pod path
+   is printed after delivery. The dry-run plan reports `path: ""` and `path_home`.
+4. A canonical adapter under THIS deployment's model prefix is loaded by path, with no
+   copy. This covers both a version and an unversioned pre-BL199 home.
 5. A canonical adapter under a DIFFERENT prefix (for example the same base re-staged
-   elsewhere) is copied into this deployment's `.mlcc-adapters/<project>/<name>/` only when
-   the base id (and revision, when both are recorded) match; the copy's manifest carries
-   `serving_copy_of`. A different base is refused as incompatible.
-6. `load_lora_adapter` with the in-pod path on EVERY Running pod; per-pod results; exit 1
-   if any pod failed.
+   elsewhere) is copied into this deployment's `.mlcc-adapters/<project>/<name>/v<hash12>/`
+   only when the base id (and revision, when both are recorded) match. The copy has the
+   same version as its source, and its manifest carries `serving_copy_of`. A different
+   base is refused as incompatible.
+6. `load_lora_adapter` with the in-pod path on EVERY Running pod, with per-pod results.
+   It exits 1 if any pod failed.
 
-`./do/adapter remove <name>` unloads from every pod and deletes ONLY a serving copy it
-made (manifest has `serving_copy_of`). Canonical adapters are deleted only by
-`./do/clean adapters`, which deletes this project's `.mlcc-adapters/<project>/` under
-every base and `models/mlcc-<project>/` — never base weights, never another project's
-adapters. `do/stage` only adds objects (`aws s3 sync` without `--delete`), so re-staging a
-base keeps its adapters. The realtime container's model sync excludes `.mlcc-adapters/*`.
+`./do/adapter update <name> --from-*` runs the same delivery, then on every Running pod
+unloads `<name>` and loads the version's path under the same `lora_name`. New content is
+a new version path. The previous version stays intact on S3, so a pod that hasn't been
+swapped yet, or a scale-out, never reads half-replaced files. Identical content reloads
+the same path.
+
+`./do/adapter remove <name>` unloads from every pod and deletes ONLY the serving copies it
+made (every version whose manifest has `serving_copy_of`). Canonical adapters are deleted
+only by `./do/clean adapters`, which deletes this project's `.mlcc-adapters/<project>/`
+(every version) under every base and `models/mlcc-<project>/`. It never touches base
+weights or another project's adapters. `do/stage` only adds objects (`aws s3 sync`
+without `--delete`), so re-staging a base keeps its adapters. The realtime container's model sync excludes `.mlcc-adapters/*`.
 
 Cross-project visibility: a pod serving a base sees every project's adapters for that base
 on its mount. That is accepted for single-account MLCC; multi-tenancy is a non-goal.

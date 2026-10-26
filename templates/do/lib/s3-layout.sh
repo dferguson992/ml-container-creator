@@ -31,9 +31,11 @@ print("" if v is None else v)
 # Publish a finished job's servable output from the artifacts bucket to its
 # canonical home in the core bucket, with a manifest (source job, technique,
 # rank, base model, content hash, timestamp):
-#   adapter → <base prefix>/.mlcc-adapters/<project>/<name>/   (mlcc-adapter.json)
+#   adapter → <base prefix>/.mlcc-adapters/<project>/<name>/v<hash12>/   (mlcc-adapter.json;
+#             content-addressed, BL199: new content → a new version directory)
 #   model   → models/mlcc-<project>/<name>/                    (mlcc-model.json)
-# Idempotent on the source content hash. Sets PROMOTED_URI; leaves it empty on
+# Idempotent on the source content hash. Sets PROMOTED_URI (the location
+# s3_layout.py reports, never re-derived here); leaves it empty on
 # any failure (warned) so the caller keeps the raw path — a promotion problem
 # never fails the job that produced the output.
 PROMOTED_URI=""
@@ -62,16 +64,26 @@ _s3_layout_promote() {
     _dest=$(_s3_layout_field "${_dest_json}" uri)
     [ -n "${_dest}" ] || return 0
     echo "   📤 Promoting to the canonical prefix: ${_dest}"
+    # stderr is kept apart so stdout stays the JSON result; its "dest" is the
+    # promoted location (an adapter's content-addressed version <home>/v<hash12>/, BL199).
+    local _errf
+    _errf="$(mktemp)"
     if ! _out=$(_s3_layout promote --source "${_raw}" --dest "${_dest}" --kind "${_kind}" \
         --project "${PROJECT_NAME}" --name "${_name}" --base-model "${_base}" --source-job "${_job}" \
-        --technique "${_tech}" --created-by "${_by}" --region "${AWS_REGION:-}" 2>&1); then
+        --technique "${_tech}" --created-by "${_by}" --region "${AWS_REGION:-}" 2>"${_errf}"); then
         echo "   ⚠️  Promotion failed (the raw output stays the recorded path). Retry later with"
         echo "      ./do/adapter promote ${_name} --from-tune ${_tech} --update-config"
-        printf '%s\n' "${_out}" | sed 's/^/      /'
+        { printf '%s\n' "${_out}"; cat "${_errf}"; } | sed '/^[[:space:]]*$/d; s/^/      /'
+        rm -f "${_errf}"
         return 0
     fi
-    PROMOTED_URI="${_dest}"
-    echo "   ✅ Promoted ($(_s3_layout_field "${_out}" action)): ${_dest}"
+    rm -f "${_errf}"
+    PROMOTED_URI=$(_s3_layout_field "${_out}" dest)
+    if [ -z "${PROMOTED_URI}" ]; then
+        echo "   ⚠️  Promotion result unreadable (the raw output stays the recorded path): ${_out}"
+        return 0
+    fi
+    echo "   ✅ Promoted ($(_s3_layout_field "${_out}" action)): ${PROMOTED_URI}"
 }
 
 # _s3_layout_clean_project <force:true|false>

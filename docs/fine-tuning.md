@@ -103,7 +103,16 @@ When `do/tune` completes, it stores the output artifact path in `do/config` and 
 
 The `--from-tune` flag reads the output path from `do/config` automatically — no need to copy S3 URIs manually.
 
-When a tune completes, `do/tune` **promotes** the servable output from the artifacts bucket to its canonical home in the core bucket (adapters: `models/<org>/<base>/.mlcc-adapters/<project>/<name>/`; full models: `models/mlcc-<project>/<name>/`) with a manifest, and records that URI in `TUNE_ADAPTER_PATH_<TECHNIQUE>` / `TUNE_MODEL_PATH_<TECHNIQUE>` (the raw job output stays in `TUNE_OUTPUT_PATH_<TECHNIQUE>`). `do/adapter add` loads the canonical prefix on every target; a source that is not canonical yet is promoted first (a server-side S3 copy with your credentials). For projects tuned before this change, backfill with `./do/adapter promote <name> --from-tune <technique> --update-config`. See [S3 buckets & layout](architecture/s3-layout.md).
+When a tune completes, `do/tune` **promotes** the servable output from the artifacts bucket to its canonical home in the core bucket (adapters: `models/<org>/<base>/.mlcc-adapters/<project>/<name>/v<hash12>/`; full models: `models/mlcc-<project>/<name>/`) with a manifest, and records that URI in `TUNE_ADAPTER_PATH_<TECHNIQUE>` / `TUNE_MODEL_PATH_<TECHNIQUE>`. The raw job output stays in `TUNE_OUTPUT_PATH_<TECHNIQUE>`. `do/adapter add` loads the canonical version on every target. A source that isn't canonical yet is promoted first, with a server-side S3 copy that uses your credentials. For projects tuned before this change, backfill with `./do/adapter promote <name> --from-tune <technique> --update-config`. See [S3 buckets & layout](architecture/s3-layout.md).
+
+Adapter versions are content-addressed: `v<hash12>` is the first 12 hex digits of the adapter's content hash.
+
+- **Same files, same version.** Re-promoting or re-adding identical files is `unchanged`, and nothing is copied.
+- **New files, new version.** New content gets a new version directory, and older versions are never rewritten.
+- **`update` on realtime-inference.** `./do/adapter update <name>` points the adapter inference component at the new version's `ArtifactUrl`. When the content is unchanged, it sends no `UpdateInferenceComponent` call.
+- **`update` on hyperpod-eks / eks.** It unloads and reloads `<name>` from the new version's path on every pod.
+- **Rollback.** Run `./do/adapter update <name> --from-weights <previous version URI>`. The previous URI is printed by `update` and recorded in `do/adapters/<name>.conf`.
+- **Pre-versioning adapters.** Adapter prefixes promoted before versioning existed, and hand copies, keep working as-is.
 
 ### Adapter output (LoRA)
 

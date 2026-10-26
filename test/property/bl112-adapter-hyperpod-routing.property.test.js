@@ -118,8 +118,19 @@ describe('Feature: v18-w4-01-bl112 — do/adapter hyperpod-eks verb routing', ()
                     /load\)\s*\n\s*_lora_do_load "\$\{LORA_NAME\}" "\$\{_LORA_PATH\}"/.test(dispatch),
                     'ACTION=load must invoke the load helper with name + the mapped in-pod path'
                 );
-                assert.ok(/adapter_delivery\.py" local-path/.test(body) && /--uri "\$\{WEIGHTS_URI\}"/.test(body),
-                    'WEIGHTS_URI must be mapped through adapter_delivery.py local-path');
+                // Wave 6.1 Part B + BL199: WEIGHTS_URI goes to adapter_delivery.py deliver
+                // (dry-run plan, then promote / serving copy). The in-pod path comes
+                // from the plan, or from the delivery result once a promotion picked
+                // the content-addressed version. It never comes from the raw URI.
+                assert.ok(/--uri "\$\{WEIGHTS_URI\}"/.test(body), 'WEIGHTS_URI must be the delivery source');
+                assert.ok(/adapter_delivery\.py" deliver --dry-run/.test(body) &&
+                    /adapter_delivery\.py" deliver \\\s*\n\s*"\$\{_adapter_deliver_args\[@\]\}"/.test(body),
+                'WEIGHTS_URI must be planned and delivered through adapter_delivery.py deliver');
+                assert.ok(/_LORA_PATH=\$\(_adapter_json_get "\$\{_plan_out\}" path\)/.test(body) &&
+                    /_LORA_PATH=\$\(_adapter_json_get "\$\{_deliver_out\}" path\)/.test(body),
+                '_LORA_PATH must be the mapped in-pod path from the delivery plan / result');
+                assert.ok(!/_LORA_PATH="?\$\{WEIGHTS_URI\}/.test(body), 'the raw s3:// URI never becomes the load path');
+                assert.ok(/if \[ -z "\$\{_LORA_PATH\}" \]; then/.test(body), 'an unmapped path is refused before the engine');
                 assert.ok(
                     /_lora_helper_call RESULT load "\$\{_name\}" "\$\{_uri\}" "\$\{BASE_URL\}"/.test(dispatch) &&
                         LORA_HELPER_CALL_RE.test(dispatch),

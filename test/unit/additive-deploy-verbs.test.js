@@ -155,6 +155,10 @@ function k8sConfig(extra = []) {
 // The deployment's canonical adapter home (model prefix + .mlcc-adapters, from the
 // target descriptor) and the in-pod path it maps to.
 const PFX = 's3://core/models/m/.mlcc-adapters/proj';
+// BL199: parse an adapter URI with the ONE layout module (home_uri, version, canonical_uri).
+const LAYOUT_PY = join(REPO, 'templates/do/lib/python/s3_layout.py');
+const layoutParse = (uri) => JSON.parse(spawnSync('python3', [LAYOUT_PY, 'parse', '--uri', uri], { encoding: 'utf8' }).stdout);
+const reEsc = (x) => x.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
 const POD = '/opt/ml/model/.mlcc-adapters/proj';
 const URL = 'http://localhost:18080';
 describe('Wave 6 / 6.1 — do/adapter on Kubernetes: --from-* sources, local-path hot-load (BL169 / BL189)', function () {
@@ -211,14 +215,22 @@ describe('Wave 6 / 6.1 — do/adapter on Kubernetes: --from-* sources, local-pat
             env: { STUB_MODEL_LOCATION: 'models/org/m', FAKE_S3: state }
         });
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
-        assert.deepStrictEqual(r.calls, [`load tuned ${POD}/tuned ${URL}`]);
+        // BL199: loaded from the content-addressed version directory; lora_name stays <name>.
+        assert.strictEqual(r.calls.length, 1, r.calls.join('\n'));
+        const [verb, loraName, path, url] = r.calls[0].split(' ');
+        assert.deepStrictEqual([verb, loraName, url], ['load', 'tuned', URL]);
+        const version = path.slice(`${POD}/tuned/`.length);
+        assert.ok(path.startsWith(`${POD}/tuned/`) && layoutParse(`s3://core/models/org/m/.mlcc-adapters/proj/tuned/${version}/`).version === version, path);
         const after = JSON.parse(readFileSync(state, 'utf8'));
-        assert.ok(after['core/models/org/m/.mlcc-adapters/proj/tuned/adapter_model.safetensors'], 'payload promoted');
-        const m = JSON.parse(after['core/models/org/m/.mlcc-adapters/proj/tuned/mlcc-adapter.json']);
+        const vkey = `core/models/org/m/.mlcc-adapters/proj/tuned/${version}/`;
+        assert.ok(after[`${vkey}adapter_model.safetensors`], 'payload promoted');
+        const m = JSON.parse(after[`${vkey}mlcc-adapter.json`]);
         assert.strictEqual(m.base_model, 'org/m');
         assert.strictEqual(m.technique, 'sft');
+        assert.strictEqual(m.version, version);
         assert.ok(!m.serving_copy_of, 'the canonical home is not a serving copy');
         assert.match(r.stdout, /Promote: s3:\/\/zz-art\/proj\/tune\/sft\/j\/hf\/ → s3:\/\/core\/models\/org\/m\/\.mlcc-adapters\/proj\/tuned\//);
+        assert.ok(r.stdout.includes(`Pod path: ${path}`), r.stdout);
     });
     it('promote <name> --from-tune <t> --update-config backfills the canonical prefix and keeps the old value (bucket R3.7)', () => {
         sb.write('do/lib/profile.sh', '_require_bucket() { eval "[ -n \\"\\${$1:-}\\" ]"; }\n', 0o644);
@@ -234,13 +246,17 @@ describe('Wave 6 / 6.1 — do/adapter on Kubernetes: --from-* sources, local-pat
         });
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
         assert.deepStrictEqual(r.calls, [], 'promote never talks to the engine');
-        const canon = 's3://core/models/org/m/.mlcc-adapters/proj/dpo-a/';
-        assert.match(r.stdout, new RegExp(`Canonical: ${canon.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}`));
+        const home = 's3://core/models/org/m/.mlcc-adapters/proj/dpo-a/';
+        const canon = (r.stdout.match(/Canonical: (\S+)/) || [])[1];
+        assert.ok(canon, r.stdout);
+        const parsed = layoutParse(canon);
+        assert.strictEqual(parsed.home_uri, home);
+        assert.ok(parsed.version && canon === `${home}${parsed.version}/`, canon);
         const cfg = readFileSync(join(sb.doDir, 'config'), 'utf8');
-        assert.match(cfg, new RegExp(`export TUNE_ADAPTER_PATH_DPO="${canon}"`));
+        assert.match(cfg, new RegExp(`export TUNE_ADAPTER_PATH_DPO="${reEsc(canon)}"`));
         assert.match(cfg, new RegExp(`export TUNE_ADAPTER_SOURCE_DPO="${raw}"`));
         const after = JSON.parse(readFileSync(state, 'utf8'));
-        assert.strictEqual(JSON.parse(after['core/models/org/m/.mlcc-adapters/proj/dpo-a/mlcc-adapter.json']).rank, 64);
+        assert.strictEqual(JSON.parse(after[`${canon.slice('s3://'.length)}mlcc-adapter.json`]).rank, 64);
         sb.write('do/lib/profile.sh', '# stub profile.sh\n', 0o644);
     });
     it('remove unloads and deletes ONLY a serving copy it made; a canonical adapter is kept', () => {
@@ -248,8 +264,11 @@ describe('Wave 6 / 6.1 — do/adapter on Kubernetes: --from-* sources, local-pat
         const copy = 'core/models/org/m/.mlcc-adapters/proj/cp1/';
         const canon = 'core/models/org/m/.mlcc-adapters/proj/keep/';
         sb.write('fake-s3.json', JSON.stringify({
+            // An unversioned (pre-BL199) serving copy and a versioned one: both are copies.
             [`${copy}adapter_model.safetensors`]: 'w',
             [`${copy}mlcc-adapter.json`]: JSON.stringify({ serving_copy_of: 's3://core/models/x/y/.mlcc-adapters/proj/cp1/' }),
+            [`${copy}v0123456789ab/adapter_model.safetensors`]: 'w2',
+            [`${copy}v0123456789ab/mlcc-adapter.json`]: JSON.stringify({ serving_copy_of: 's3://core/models/x/y/.mlcc-adapters/proj/cp1/v0123456789ab/' }),
             [`${canon}adapter_model.safetensors`]: 'w',
             [`${canon}mlcc-adapter.json`]: JSON.stringify({ content_hash: 'sha256:x' })
         }), 0o644);
@@ -263,6 +282,42 @@ describe('Wave 6 / 6.1 — do/adapter on Kubernetes: --from-* sources, local-pat
         const after = JSON.parse(readFileSync(state, 'utf8'));
         assert.ok(!Object.keys(after).some(k => k.startsWith(copy)), 'serving copy deleted');
         assert.ok(after[`${canon}adapter_model.safetensors`], 'canonical adapter kept');
+    });
+    it('BL199: update with new content unloads + loads the NEW version path on every Running pod; the old version is kept', () => {
+        const state = join(sb.root, 'fake-s3.json');
+        sb.write('fake-s3.json', JSON.stringify({
+            'zz-art/proj/tune/sft/j/hf/adapter_config.json': '{"r": 16}',
+            'zz-art/proj/tune/sft/j/hf/adapter_model.safetensors': 'w1'
+        }), 0o644);
+        const opts = {
+            config: ['export TUNE_ADAPTER_PATH_SFT="s3://zz-art/proj/tune/sft/j/hf/"', 'export MODEL_NAME="org/m"',
+                'export TUNE_MODEL_ID="org/m"', 'export CORE_S3_BUCKET="core"'],
+            env: { STUB_MODEL_LOCATION: 'models/org/m', FAKE_S3: state, STUB_PODS: 'p0 p1' }
+        };
+        const add = run(['add', 'upd', '--from-tune', 'sft'], opts);
+        assert.strictEqual(add.code, 0, add.stdout + add.stderr);
+        const v1Path = add.calls[0].split(' ')[2];
+        assert.deepStrictEqual(add.calls, [`load upd ${v1Path} ${URL}`, `load upd ${v1Path} ${URL}`]);
+        const v1Key = `core/models/org/m/.mlcc-adapters/proj/upd/${v1Path.split('/').pop()}/`;
+        const v1Files = Object.entries(JSON.parse(readFileSync(state, 'utf8'))).filter(([k]) => k.startsWith(v1Key));
+        // Same content → the same version path (vLLM still swaps it: unload + load).
+        const same = run(['update', 'upd', '--from-tune', 'sft'], opts);
+        assert.strictEqual(same.code, 0, same.stdout + same.stderr);
+        assert.deepStrictEqual(same.calls, [`unload upd ${URL}`, `load upd ${v1Path} ${URL}`, `unload upd ${URL}`, `load upd ${v1Path} ${URL}`]);
+        // New content → a new v<hash12> directory, loaded under the SAME lora_name on each pod.
+        const s = JSON.parse(readFileSync(state, 'utf8'));
+        s['zz-art/proj/tune/sft/j/hf/adapter_model.safetensors'] = 'w2';
+        writeFileSync(state, JSON.stringify(s));
+        const upd = run(['update', 'upd', '--from-tune', 'sft'], opts);
+        assert.strictEqual(upd.code, 0, upd.stdout + upd.stderr);
+        const v2Path = upd.calls[1].split(' ')[2];
+        assert.notStrictEqual(v2Path, v1Path);
+        assert.strictEqual(layoutParse(`s3://core/models/org/m/.mlcc-adapters/proj/upd/${v2Path.split('/').pop()}/`).home_uri,
+            's3://core/models/org/m/.mlcc-adapters/proj/upd/');
+        assert.deepStrictEqual(upd.calls, [`unload upd ${URL}`, `load upd ${v2Path} ${URL}`, `unload upd ${URL}`, `load upd ${v2Path} ${URL}`]);
+        assert.match(upd.stdout, /2\/2 succeeded/);
+        const after = JSON.parse(readFileSync(state, 'utf8'));
+        assert.deepStrictEqual(Object.entries(after).filter(([k]) => k.startsWith(v1Key)), v1Files, 'the old version is untouched');
     });
     it('add --from-tune whose output is under the model prefix hot-loads it', () => {
         const r = run(['add', 'tuned', '--from-tune'], {
@@ -488,7 +543,7 @@ const loraRankVar = () => {
     const m = JSON.parse(readFileSync(join(REPO, 'templates/code/serve.d/vllm/manifest.json'), 'utf8'));
     return m.env_var_prefix + m.capability_map.lora_max_rank.suffix;
 };
-describe('Wave 6.1 Part B — do/adapter on realtime-inference: every source is promoted to the canonical prefix the adapter IC loads', function () {
+describe('Wave 6.1 Part B + BL199 — do/adapter on realtime-inference: every source is promoted to a content-addressed canonical version the adapter IC loads', function () {
     this.timeout(180000);
     const CORE_B = 'zz-core-smai';
     const ART_B = 'zz-art-smai';
@@ -509,7 +564,7 @@ describe('Wave 6.1 Part B — do/adapter on realtime-inference: every source is 
     let awsLog;
     const allIcRequests = [];
     const pyLayout = join(REPO, 'templates/do/lib/python/s3_layout.py');
-    // The canonical home, composed by the ONE layout module (never re-derived here).
+    // The canonical HOME, composed by the ONE layout module (never re-derived here).
     const canonical = (name) => JSON.parse(spawnSync('python3', [pyLayout, 'adapter-uri', '--bucket', CORE_B,
         '--model', TUNE_ID, '--project', 'proj', '--name', name, '--catalog', join(REPO, 'config/tune-catalog.json')],
     { encoding: 'utf8' }).stdout).uri;
@@ -579,14 +634,24 @@ describe('Wave 6.1 Part B — do/adapter on realtime-inference: every source is 
     const conf = (name) => readFileSync(join(sb.doDir, 'adapters', `${name}.conf`), 'utf8');
     const removeConf = (name) => rmSync(join(sb.doDir, 'adapters', `${name}.conf`), { force: true });
 
-    it('--from-tune <t>: the raw output is copied server-side to the canonical prefix and the IC ArtifactUrl is that prefix', () => {
+    // BL199: every IC ArtifactUrl is a content-addressed version <home>/v<hash12>/ of the home above.
+    const versionOf = (url, name) => {
+        const p = layoutParse(url);
+        assert.strictEqual(p.home_uri, canonical(name), url);
+        assert.ok(p.version && p.canonical_uri === url, `not a canonical version URI: ${url}`);
+        return p.version;
+    };
+    const filesUnder = (s, uri) => Object.fromEntries(Object.entries(s).filter(([k]) => k.startsWith(uri.slice('s3://'.length))));
+    const urls = {};
+
+    it('--from-tune <t>: the raw output is copied server-side to a content-addressed version and the IC ArtifactUrl is that version', () => {
         const r = run(['add', 'tuned-sft', '--from-tune', 'sft', '--local'], { seed: seedRaw() });
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
         assert.match(r.stdout, /--local \/ --no-wait no longer apply/);
-        const dest = canonical('tuned-sft');
         const spec = r.spec('create-inference-component');
+        const dest = spec.Container.ArtifactUrl;
+        const version = versionOf(dest, 'tuned-sft');
         assert.strictEqual(spec.BaseInferenceComponentName, 'proj-base-ic');
-        assert.strictEqual(spec.Container.ArtifactUrl, dest);
         assert.ok(dest.endsWith('/') && !dest.slice('s3://'.length).includes('//'), dest);
         assert.deepStrictEqual(Object.keys(spec.Container), ['ArtifactUrl'], 'an adapter IC carries no image / env / compute of its own');
         // Same files as the old validated stage-from-tune prefix (adapter_config.json at the top) + the manifest.
@@ -594,53 +659,64 @@ describe('Wave 6.1 Part B — do/adapter on realtime-inference: every source is 
         const m = JSON.parse(r.s3[`${dest.slice('s3://'.length)  }mlcc-adapter.json`]);
         assert.strictEqual(m.source, `s3://${RAW}`);
         assert.strictEqual(m.rank, 32);
+        assert.strictEqual(m.version, version);
         assert.match(m.content_hash, /^sha256:[0-9a-f]{64}$/);
         assert.ok(Object.keys(r.s3).some(k => k === `${RAW  }adapter_config.json`), 'the raw output is never moved');
-        assert.match(conf('tuned-sft'), new RegExp(`ADAPTER_WEIGHTS_URI="${dest}"`));
+        assert.match(conf('tuned-sft'), new RegExp(`ADAPTER_WEIGHTS_URI="${reEsc(dest)}"`));
         assert.match(conf('tuned-sft'), new RegExp(`ADAPTER_SOURCE_URI="s3://${RAW}"`));
         assert.match(r.stdout, /Rank check: adapter r32 vs serving max_lora_rank 64/);
+        urls.v1 = dest;
     });
 
-    it('re-adding the same tune output is idempotent: promotion "unchanged", the old IC is replaced', () => {
+    it('re-adding the same tune output is idempotent: promotion "unchanged" (same version), the old IC is replaced', () => {
         const before = JSON.parse(readFileSync(store, 'utf8'));
         const r = run(['add', 'tuned-sft', '--from-tune', 'sft']);
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
         assert.match(r.stderr, /Promotion unchanged/);
         assert.deepStrictEqual(r.s3, before, 'nothing rewritten');
         assert.ok(r.aws.some(a => a[1] === 'delete-inference-component'), 'AC-1.7: re-tune replaces the IC');
-        assert.strictEqual(r.spec('create-inference-component').Container.ArtifactUrl, canonical('tuned-sft'));
+        assert.strictEqual(r.spec('create-inference-component').Container.ArtifactUrl, urls.v1);
     });
 
-    it('a promotion that fails mid-copy creates no IC and leaves no manifest a later run could trust', () => {
+    it('a promotion of new content that fails mid-copy creates no IC and never touches the version in use', () => {
+        const v1Files = filesUnder(JSON.parse(readFileSync(store, 'utf8')), urls.v1);
         const seed = seedRaw(JSON.parse(readFileSync(store, 'utf8')));
         seed[`${RAW  }adapter_model.safetensors`] = 'tuned-weights-v2';
         const r = run(['add', 'tuned-sft', '--from-tune', 'sft'], { seed, env: { FAKE_S3_FAIL_COPY_AT: '2' } });
         assert.notStrictEqual(r.code, 0);
         assert.match(r.stderr, /injected copy failure/);
         assert.ok(!r.aws.some(a => a[1] === 'create-inference-component'), 'no IC points at a half-written prefix');
-        const dest = canonical('tuned-sft');
-        assert.ok(!keysUnder(r.s3, dest).includes('mlcc-adapter.json'), 'the previous manifest was dropped before the rewrite');
-        // The retry copies again (not "unchanged") and completes the prefix.
+        assert.deepStrictEqual(filesUnder(r.s3, urls.v1), v1Files, 'the previous version is untouched');
+        const home = canonical('tuned-sft').slice('s3://'.length);
+        const versions = [...new Set(Object.keys(r.s3).filter(k => k.startsWith(home)).map(k => k.slice(home.length).split('/')[0]))];
+        assert.strictEqual(versions.length, 2, versions.join(','));
+        const partial = versions.find(v => !r.s3[`${home}${v}/mlcc-adapter.json`]);
+        assert.ok(partial, 'the half-written new version has no manifest a later run could trust');
+        // The retry copies again (not "unchanged") and completes the NEW version.
         const again = run(['add', 'tuned-sft', '--from-tune', 'sft']);
         assert.strictEqual(again.code, 0, again.stdout + again.stderr);
         assert.match(again.stderr, /Promotion copied/);
-        assert.strictEqual(again.s3[`${dest.slice('s3://'.length)  }adapter_model.safetensors`], 'tuned-weights-v2');
+        const v2 = again.spec('create-inference-component').Container.ArtifactUrl;
+        assert.strictEqual(v2, `${canonical('tuned-sft')}${partial}/`);
+        assert.strictEqual(again.s3[`${v2.slice('s3://'.length)  }adapter_model.safetensors`], 'tuned-weights-v2');
+        assert.deepStrictEqual(filesUnder(again.s3, urls.v1), v1Files);
+        urls.v2 = v2;
     });
 
     it('--from-weights <prefix> (no trailing slash) is accepted and promoted', () => {
         const r = run(['add', 'w-prefix', '--from-weights', `s3://${RAW.replace(/\/$/, '')}`], { seed: seedRaw() });
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
-        const dest = canonical('w-prefix');
-        assert.strictEqual(r.spec('create-inference-component').Container.ArtifactUrl, dest);
+        const dest = r.spec('create-inference-component').Container.ArtifactUrl;
+        versionOf(dest, 'w-prefix');
         assert.ok(keysUnder(r.s3, dest).includes('adapter_config.json'));
     });
 
-    it('--from-weights <flat .tar.gz> is extracted: loose files at the top of the prefix, no archive', () => {
+    it('--from-weights <flat .tar.gz> is extracted: loose files at the top of the version, no archive', () => {
         const tgz = `${ART_B}/mlcc-screen-in/adapter.tar.gz`;
         const r = run(['add', 'w-tar', '--from-weights', `s3://${tgz}`], { seed: { [tgz]: tarball('flat') } });
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
-        const dest = canonical('w-tar');
-        assert.strictEqual(r.spec('create-inference-component').Container.ArtifactUrl, dest);
+        const dest = r.spec('create-inference-component').Container.ArtifactUrl;
+        versionOf(dest, 'w-tar');
         assert.deepStrictEqual(keysUnder(r.s3, dest), ['adapter_config.json', 'adapter_model.safetensors', 'mlcc-adapter.json']);
         assert.strictEqual(r.s3[`${dest.slice('s3://'.length)  }adapter_model.safetensors`], 'tar-weights');
     });
@@ -654,39 +730,91 @@ describe('Wave 6.1 Part B — do/adapter on realtime-inference: every source is 
         assert.deepStrictEqual(keysUnder(r.s3, canonical('w-nested')), []);
     });
 
-    it('--from-weights <canonical prefix without a slash> is used as-is, normalized to ONE trailing slash (no copy)', () => {
-        const dest = canonical('tuned-sft');
-        const before = JSON.parse(readFileSync(store, 'utf8'));
+    it('--from-weights <canonical version without a slash> is used as-is, normalized to ONE trailing slash (no copy)', () => {
+        // Re-seed the tuned-sft versions (the w-* tests replaced the store).
+        const seed = seedRaw();
+        for (const v of [urls.v1, urls.v2]) {
+            for (const f of [...Object.keys(RAW_FILES), 'mlcc-adapter.json']) seed[`${v.slice('s3://'.length)}${f}`] = 'x';
+        }
         removeConf('canon');
-        const r = run(['add', 'canon', '--from-weights', dest.replace(/\/$/, '')]);
+        const r = run(['add', 'canon', '--from-weights', urls.v2.replace(/\/$/, '')], { seed });
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
-        assert.strictEqual(r.spec('create-inference-component').Container.ArtifactUrl, dest);
-        assert.deepStrictEqual(r.s3, before);
+        assert.strictEqual(r.spec('create-inference-component').Container.ArtifactUrl, urls.v2);
+        assert.deepStrictEqual(r.s3, seed);
     });
 
-    it('--from-hub publishes the loose PEFT files (no tarball, no repo metadata) and the IC loads that prefix', () => {
+    it('backward compat: an UNVERSIONED canonical home (pre-BL199 / hand copy, no manifest) still loads, updates and removes', () => {
+        // Modeled on the live fresh-ai-ml .mlcc-adapters/<project>/sft-w6/: loose PEFT files, no mlcc-adapter.json.
+        const legacy = canonical('legacy-w6');
+        const seed = JSON.parse(readFileSync(store, 'utf8'));
+        seed[`${legacy.slice('s3://'.length)}adapter_config.json`] = RAW_FILES['adapter_config.json'];
+        seed[`${legacy.slice('s3://'.length)}adapter_model.safetensors`] = 'hand-copy';
+        removeConf('legacy-w6');
+        const add = run(['add', 'legacy-w6', '--from-weights', legacy.replace(/\/$/, '')], { seed });
+        assert.strictEqual(add.code, 0, add.stdout + add.stderr);
+        assert.strictEqual(add.spec('create-inference-component').Container.ArtifactUrl, legacy, 'used as-is');
+        assert.deepStrictEqual(add.s3, seed, 'no copy');
+        assert.match(conf('legacy-w6'), new RegExp(`ADAPTER_WEIGHTS_URI="${reEsc(legacy)}"`));
+        // Updating it from new weights moves the IC onto a versioned URI; the legacy files are untouched.
+        const s = JSON.parse(readFileSync(store, 'utf8'));
+        const legacyFiles = Object.fromEntries(Object.entries(s).filter(([k]) => k.startsWith(legacy.slice('s3://'.length))));
+        const upd = run(['update', 'legacy-w6', '--from-weights', `s3://${RAW}`], { seed: seedRaw(s) });
+        assert.strictEqual(upd.code, 0, upd.stdout + upd.stderr);
+        const v = upd.spec('update-inference-component').Container.ArtifactUrl;
+        versionOf(v, 'legacy-w6');
+        assert.match(upd.stdout, new RegExp(`Previous version \\(kept for rollback\\): ${reEsc(legacy)}`));
+        for (const [k, val] of Object.entries(legacyFiles)) assert.strictEqual(upd.s3[k], val, k);
+        // Rolling back to the legacy home is an update to that URI (a canonical source is used as-is).
+        const back = run(['update', 'legacy-w6', '--from-weights', legacy]);
+        assert.strictEqual(back.code, 0, back.stdout + back.stderr);
+        assert.strictEqual(back.spec('update-inference-component').Container.ArtifactUrl, legacy);
+        const rm = run(['remove', 'legacy-w6']);
+        assert.strictEqual(rm.code, 0, rm.stdout + rm.stderr);
+        assert.ok(rm.aws.some(a => a[1] === 'delete-inference-component' && a.includes('proj-adapter-legacy-w6')));
+        for (const [k, val] of Object.entries(legacyFiles)) assert.strictEqual(rm.s3[k], val, k);
+    });
+
+    it('--from-hub publishes the loose PEFT files (no tarball, no repo metadata) and the IC loads that version', () => {
         const r = run(['add', 'hub-a', '--from-hub', 'org/some-adapter'], { seed: {} });
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
-        const dest = canonical('hub-a');
-        assert.strictEqual(r.spec('create-inference-component').Container.ArtifactUrl, dest);
+        const dest = r.spec('create-inference-component').Container.ArtifactUrl;
+        versionOf(dest, 'hub-a');
         assert.deepStrictEqual(keysUnder(r.s3, dest), ['README.md', 'adapter_config.json', 'adapter_model.safetensors', 'mlcc-adapter.json']);
         assert.strictEqual(JSON.parse(r.s3[`${dest.slice('s3://'.length)  }mlcc-adapter.json`]).source, 'hf://org/some-adapter');
+        urls.hub1 = dest;
     });
 
-    it('update --from-weights promotes the new weights and points the IC at the canonical prefix', () => {
+    it('BL199: update with UNCHANGED content is a no-op — no UpdateInferenceComponent, conf unchanged', () => {
+        const before = conf('hub-a');
+        const r = run(['update', 'hub-a', '--from-weights', urls.hub1]);
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        assert.ok(!r.aws.some(a => a[1] === 'update-inference-component'), 'no byte-identical update is sent');
+        assert.match(r.stdout, /unchanged/);
+        assert.match(r.stdout, /No UpdateInferenceComponent was sent/);
+        assert.strictEqual(conf('hub-a'), before);
+        // Re-publishing the same Hub files is the same version, so also a no-op.
+        const hub = run(['update', 'hub-a', '--from-hub', 'org/some-adapter']);
+        assert.strictEqual(hub.code, 0, hub.stdout + hub.stderr);
+        assert.ok(!hub.aws.some(a => a[1] === 'update-inference-component'));
+    });
+
+    it('update with NEW content promotes a new version and points the IC at that NEW ArtifactUrl; the old version is kept', () => {
         const tgz = `${ART_B}/mlcc-screen-in/v2.tar.gz`;
         const seed = { ...JSON.parse(readFileSync(store, 'utf8')), [tgz]: tarball('flat') };
+        const oldFiles = filesUnder(seed, urls.hub1);
         const r = run(['update', 'hub-a', '--from-weights', `s3://${tgz}`], { seed });
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
-        const dest = canonical('hub-a');
         const spec = r.spec('update-inference-component');
+        const dest = spec.Container.ArtifactUrl;
+        versionOf(dest, 'hub-a');
+        assert.notStrictEqual(dest, urls.hub1, 'a NEW ArtifactUrl');
         assert.deepStrictEqual(spec, { Container: { ArtifactUrl: dest } });
-        assert.deepStrictEqual(keysUnder(r.s3, dest), ['adapter_config.json', 'adapter_model.safetensors', 'mlcc-adapter.json'],
-            'stale files of the previous version (README.md) are removed');
-        assert.match(conf('hub-a'), new RegExp(`ADAPTER_WEIGHTS_URI="${dest}"`));
+        assert.deepStrictEqual(keysUnder(r.s3, dest), ['adapter_config.json', 'adapter_model.safetensors', 'mlcc-adapter.json']);
+        assert.deepStrictEqual(filesUnder(r.s3, urls.hub1), oldFiles, 'the previous version (with its README.md) is untouched');
+        assert.match(conf('hub-a'), new RegExp(`ADAPTER_WEIGHTS_URI="${reEsc(dest)}"`));
     });
 
-    it('remove deletes only the adapter IC; the canonical S3 prefix is kept', () => {
+    it('remove deletes only the adapter IC; every version under the canonical home is kept', () => {
         const before = JSON.parse(readFileSync(store, 'utf8'));
         const r = run(['remove', 'tuned-sft']);
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
@@ -695,18 +823,26 @@ describe('Wave 6.1 Part B — do/adapter on realtime-inference: every source is 
         assert.ok(!existsSync(join(sb.doDir, 'adapters', 'tuned-sft.conf')));
     });
 
-    it('promote --dry-run lists every key it would copy and where, and writes nothing', () => {
+    it('promote --dry-run names the version directory and every key it would copy, and writes nothing', () => {
         const seed = seedRaw();
         const r = run(['promote', 'dry-sft', '--from-tune', 'sft', '--dry-run'], { seed });
         assert.strictEqual(r.code, 0, r.stdout + r.stderr);
         assert.deepStrictEqual(r.s3, seed, 'read-only');
-        const dest = canonical('dry-sft');
+        const dest = (r.stdout.match(/Destination: (\S+)/) || [])[1];
+        const version = versionOf(dest, 'dry-sft');
+        assert.ok(r.stderr.includes(`version: ${version}`), r.stderr);
         for (const f of Object.keys(RAW_FILES)) {
             assert.ok(r.stderr.includes(`copy   s3://${RAW}${f}  ->  ${dest}${f}`), f);
         }
         assert.ok(r.stderr.includes(`write  ${dest}mlcc-adapter.json`));
         assert.match(r.stdout, /Dry run: nothing was written/);
         assert.strictEqual(r.ic.length, 0);
+        // The real promotion lands exactly where the dry run said.
+        const real = run(['promote', 'dry-sft', '--from-tune', 'sft']);
+        assert.strictEqual(real.code, 0, real.stdout + real.stderr);
+        assert.ok(real.stdout.includes(`Canonical: ${dest}`), real.stdout);
+        const again = run(['promote', 'dry-sft', '--from-tune', 'sft', '--dry-run']);
+        assert.match(again.stderr, /action: unchanged/);
     });
 
     it('--from-train records ADAPTER_SOURCE="train" exactly once', () => {
@@ -717,12 +853,17 @@ describe('Wave 6.1 Part B — do/adapter on realtime-inference: every source is 
         assert.deepStrictEqual(lines, ['export ADAPTER_SOURCE="train"']);
     });
 
-    it('every adapter IC request carried a canonical prefix ArtifactUrl with one trailing slash', () => {
-        assert.ok(allIcRequests.length >= 6, `IC requests captured: ${allIcRequests.length}`);
+    it('every adapter IC request carried a canonical ArtifactUrl with one trailing slash (a version, except the legacy home)', () => {
+        assert.ok(allIcRequests.length >= 8, `IC requests captured: ${allIcRequests.length}`);
+        let versioned = 0;
         for (const a of allIcRequests) {
             const url = JSON.parse(a[a.indexOf('--specification') + 1]).Container.ArtifactUrl;
-            assert.match(url, /^s3:\/\/[^/]+\/.+\/\.mlcc-adapters\/proj\/[a-z0-9-]+\/$/, url);
+            const p = layoutParse(url);
+            assert.strictEqual(p.canonical_uri, url, url);
+            if (p.version) versioned += 1;
+            else assert.ok(url.endsWith('/legacy-w6/'), `only the pre-BL199 home is unversioned: ${url}`);
         }
+        assert.ok(versioned >= 6, `versioned ArtifactUrls: ${versioned}`);
     });
 });
 

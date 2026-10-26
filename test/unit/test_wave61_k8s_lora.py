@@ -53,7 +53,10 @@ def test_plan_promotes_a_raw_source_into_the_canonical_prefix_then_loads_by_path
                             BASE, core_bucket="core", adapter_base="huggingface-vlm-gemma-4-e4b-it")
     assert plan["promote_to"] == "s3://core/models/google/gemma-4-E4B-it/.mlcc-adapters/fresh-ai-ml/dpo-w6/"
     assert plan["copy_to"] == ""
-    assert plan["path"] == f"{DELIVERY['mount_path']}/.mlcc-adapters/fresh-ai-ml/dpo-w6"
+    # BL199: the promotion picks the content-addressed version, so the final path is
+    # only known after delivery; the plan names the home it will sit under.
+    assert plan["path"] == ""
+    assert plan["path_home"] == f"{DELIVERY['mount_path']}/.mlcc-adapters/fresh-ai-ml/dpo-w6"
 
 
 def test_plan_canonical_under_this_prefix_needs_no_copy():
@@ -69,7 +72,7 @@ def test_plan_copies_only_on_a_base_prefix_mismatch_with_the_same_base():
     plan = ad.plan_delivery("hyperpod-eks", uri, "fresh-ai-ml", "sft-w6", restaged,
                             deployment_model="google/gemma-4-E4B-it")
     assert plan["copy_to"] == "s3://core/models/mlcc-fresh-ai-ml/gemma-restaged/.mlcc-adapters/fresh-ai-ml/sft-w6/"
-    assert plan["path"] == f"{DELIVERY['mount_path']}/.mlcc-adapters/fresh-ai-ml/sft-w6"
+    assert plan["path"] == "" and plan["path_home"] == f"{DELIVERY['mount_path']}/.mlcc-adapters/fresh-ai-ml/sft-w6"
 
 
 def test_plan_refuses_an_incompatible_base_before_any_copy():
