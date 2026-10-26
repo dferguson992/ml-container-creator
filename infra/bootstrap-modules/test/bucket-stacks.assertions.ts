@@ -145,9 +145,12 @@ const summary: Record<string, unknown> = {};
             Statement: Match.arrayWith([Match.objectLike({
                 Sid: 'SecretsManagerRead',
                 Action: ['secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret'],
+                // BL212: containers resolve *_ARN at startup with this role, so it must
+                // also read the default generate-time secret names (mlcc-hf-token-<project>).
                 Resource: [
                     `arn:aws:secretsmanager:*:${ACCOUNT}:secret:mlcc/*`,
                     `arn:aws:secretsmanager:*:${ACCOUNT}:secret:ml-container-creator/*`,
+                    `arn:aws:secretsmanager:*:${ACCOUNT}:secret:mlcc-hf-token-*`,
                 ],
             })]),
         },
