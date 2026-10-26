@@ -299,7 +299,7 @@ All generated projects include these `do/` scripts:
 | `./do/run` | Run container locally on port 8080 |
 | `./do/test` | Test local container or deployed endpoint |
 | `./do/validate` | Target-aware pre-deploy checks: right-sizing (GPU memory fit), config consistency, the cluster contract on `hyperpod-eks` / `eks`, and SageMaker payload shapes on SageMaker targets (after `bootstrap sync-schemas`) |
-| `./do/deploy` | Deploy to the configured deployment target. Flags: `--optimize` (run `do/benchmark --recommend --apply` before deploying), `--no-optimize` (skip optimization), `--force-ic` (force new IC even if one exists), `--force` (redeploy an already-deployed target), `--ignore-sizing` (proceed past a right-sizing block), `--dry-run` (validate only) |
+| `./do/deploy` | Deploy to the configured deployment target. Flags: `--optimize` (run `do/benchmark --recommend --apply` before deploying), `--no-optimize` (skip optimization), `--force-ic` (force new IC even if one exists), `--force` (redeploy an already-deployed target), `--ignore-sizing` (proceed past a right-sizing block), `--dry-run` (resolved config + right-sizing preflight only; creates nothing) |
 | `./do/tune` | Fine-tune using SageMaker AI Managed Model Customization (serverless) |
 | `./do/train` | Custom training jobs with your own scripts and hyperparameters |
 | `./do/adapter` | LoRA adapter lifecycle (add, list, remove, update) |
@@ -442,6 +442,20 @@ To proceed anyway, pass `--ignore-sizing` (a warning line is printed). It also
 overrides the LoRA rank / buffer refusal in the `eks` and `hyperpod-eks` drivers.
 `--force` does not bypass right-sizing; it only redeploys a target that is already
 deployed.
+
+To run only the preflight (nothing is created, applied, or dispatched), use
+`--dry-run`. It prints the resolved configuration, then the same right-sizing
+findings a real deploy would print, and exits 1 on a block (0 with
+`--ignore-sizing`) or 0 when the configuration fits or only warns. After changing
+the generator or a serving setting, this is the repeatable check:
+```bash
+mcc regenerate                       # re-render do/ from the current generator
+./do/deploy --dry-run                # preflight-only: exit 0 fits/warn, 1 block
+./do/deploy --dry-run --ignore-sizing  # see the full output even when it blocks
+```
+`--dry-run` also works on a project that is already deployed. With or without
+`--target` or `--force`, it previews the saved configuration and runs the preflight,
+without switching focus or re-prompting.
 
 ### Pre-Deploy Optimization
 

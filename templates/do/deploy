@@ -228,7 +228,10 @@ while [ $# -gt 0 ]; do
             echo "                          focus without redeploying (updates DEPLOYMENT_TARGET)."
             echo "  --instance-type <type>  Instance type for deployment (skip instance-type prompt)"
             echo "  --status                Show deployment state for all targets; no deployment"
-            echo "  --dry-run               Show resolved config without deploying"
+            echo "  --dry-run               Show resolved config and run the right-sizing preflight"
+            echo "                          without deploying (creates/applies nothing). Exit 1 on a"
+            echo "                          sizing block (0 with --ignore-sizing). Preflight-only check"
+            echo "                          after regenerate: ./do/deploy --dry-run"
             echo "  --reconfigure           Re-prompt all deployment settings for active target"
             echo "  --force                 Redeploy a target that is already deployed (right-sizing"
             echo "                          checks still run)"
@@ -264,7 +267,7 @@ while [ $# -gt 0 ]; do
             echo "                          for the extra instance while it runs. Without it, deploy"
             echo "                          stops before applying and prints this command."
             echo "  --status                Show deployment state for all targets and exit"
-            echo "  --dry-run               Show resolved config and command without deploying"
+            echo "  --dry-run               Show resolved config, preflight, and command without deploying"
             echo ""
             echo "After a successful deploy, DEPLOYMENT_TARGET is written back to do/config."
             echo "Re-run without --target to switch focus to a different active deployment."
@@ -560,6 +563,7 @@ fi
 # If --target was provided and that target already has a deployment,
 # just switch focus without redeploying (CP-5: <1 second).
 _NEEDS_HELPER=0
+_DRY_RUN_DEPLOYED=0
 if [ -n "$FLAG_TARGET" ]; then
     # Map target to its status variable name
     # >>> GENERATED: switch-or-deploy target->status_var (scripts/codegen-target-guard.js; ADR-008) — DO NOT EDIT
@@ -573,7 +577,15 @@ if [ -n "$FLAG_TARGET" ]; then
     esac
     # <<< END GENERATED switch-or-deploy
 
-    if [ -n "$_STATUS_VAR" ] && [ -n "${!_STATUS_VAR:-}" ] && ! echo " ${DEPLOY_ARGS[*]:-} " | grep -qw -- "--force"; then
+    if [ -n "$_STATUS_VAR" ] && [ -n "${!_STATUS_VAR:-}" ] && [ "${FLAG_DRY_RUN:-0}" -eq 1 ]; then
+        # BL204: --dry-run on an already-deployed target previews its PERSISTED
+        # configuration and runs the right-sizing preflight. It neither switches
+        # focus (no do/config write) nor takes the --force / new-target path
+        # (which clears INSTANCE_TYPE and re-prompts) — with or without --force.
+        echo "ℹ️  ${FLAG_TARGET} is already deployed (${!_STATUS_VAR}); --dry-run previews its saved configuration and runs the preflight (nothing is written)."
+        _DRY_RUN_DEPLOYED=1
+    fi
+    if [ "${_DRY_RUN_DEPLOYED:-0}" -eq 0 ] && [ -n "$_STATUS_VAR" ] && [ -n "${!_STATUS_VAR:-}" ] && ! echo " ${DEPLOY_ARGS[*]:-} " | grep -qw -- "--force"; then
         # Existing deployment — switch focus only (FR-4.4, FR-4.5)
         _update_config DEPLOYMENT_TARGET "$FLAG_TARGET"
         # Resolve ENDPOINT_NAME and INSTANCE_TYPE from target-specific vars
@@ -611,12 +623,14 @@ if [ -n "$FLAG_TARGET" ]; then
         fi
         exit 0
     fi
-    # No existing deployment — fall through to deploy flow
-    _NEEDS_HELPER=1
-    # Deploying to a new target: clear INSTANCE_TYPE in config so the
-    # builder prompts fresh (a GPU instance from SMAI isn't for batch)
-    _update_config "INSTANCE_TYPE" ""
-    export INSTANCE_TYPE=""
+    if [ "${_DRY_RUN_DEPLOYED:-0}" -eq 0 ]; then
+        # No existing deployment — fall through to deploy flow
+        _NEEDS_HELPER=1
+        # Deploying to a new target: clear INSTANCE_TYPE in config so the
+        # builder prompts fresh (a GPU instance from SMAI isn't for batch)
+        _update_config "INSTANCE_TYPE" ""
+        export INSTANCE_TYPE=""
+    fi
 fi
 
 # Also check: target is set but required vars are missing (e.g.,
@@ -841,36 +855,9 @@ if [ "${_lora_on_for_target}" = "true" ] && [ -n "${HP_SPECULATIVE_ALGORITHM:-}"
     echo "⚠️ LoRA + speculative decoding may conflict — verify vLLM version supports both simultaneously"
 fi
 
-# ── Dry-run output (FR-3.6, CP-4) ────────────────────────────
-# Show resolved config and the command that would execute, without deploying.
-if [ "${FLAG_DRY_RUN:-0}" -eq 1 ]; then
-    echo "── Dry Run ──────────────────────────────────────────────"
-    echo ""
-    echo "Target: $DEPLOYMENT_TARGET"
-    echo "Script: ${SCRIPT_DIR}/deploy.d/${DEPLOYMENT_TARGET}"
-    echo ""
-    echo "Resolved configuration:"
-    for var in DEPLOYMENT_TARGET INSTANCE_TYPE ENDPOINT_NAME ENDPOINT_STRATEGY \
-               IC_GPU_COUNT INSTANCE_TYPES HP_CLUSTER_NAME HP_GPU_COUNT \
-               HP_NAMESPACE HP_REPLICAS HP_QUEUE ASYNC_S3_OUTPUT_PATH \
-               ASYNC_SNS_TOPIC ASYNC_MAX_CONCURRENT_INVOCATIONS BATCH_INPUT_PATH \
-               BATCH_OUTPUT_PATH BATCH_SPLIT_TYPE BATCH_STRATEGY BATCH_MAX_CONCURRENT; do
-        val="${!var:-}"
-        if [ -n "$val" ]; then
-            echo "  $var=$val"
-        fi
-    done
-    echo ""
-    echo "Would execute:"
-    echo "  source ${SCRIPT_DIR}/deploy.d/${DEPLOYMENT_TARGET} ${DEPLOY_ARGS[*]:-}"
-    echo ""
-    echo "── No changes made (dry run) ──────────────────────────"
-    exit 0
-fi
-
-# Resolve ENDPOINT_NAME from the target-specific var before dispatch.
-# Resolve ENDPOINT_NAME and INSTANCE_TYPE from target-specific vars before dispatch.
-# This ensures deploy.d/* scripts and do/test, do/logs use the right values.
+# Resolve ENDPOINT_NAME and INSTANCE_TYPE from target-specific vars. Runs BEFORE
+# the dry-run output and the right-sizing preflight (BL204) so both see the
+# values the deploy.d/* driver (and do/test, do/logs) will actually use.
 case "${DEPLOYMENT_TARGET}" in
     realtime-inference|managed-inference)
         export ENDPOINT_NAME="${SMAI_ENDPOINT_NAME:-${ENDPOINT_NAME:-}}"
@@ -900,30 +887,69 @@ esac
 # (exit 0) when the instance is not a catalogued GPU instance. Exit 2 = block:
 # stop (exit 1) unless --ignore-sizing. --force does NOT bypass it. stderr is
 # never swallowed. The k8s drivers then only ask for the rank VALUE (--quiet).
-if python3 "${SCRIPT_DIR}/lib/python/target_manifest.py" family "${DEPLOYMENT_TARGET}" >/dev/null 2>&1; then
-    echo "📏 Right-sizing preflight (${DEPLOYMENT_TARGET}, ${INSTANCE_TYPE:-no instance type})..."
-    _SIZING_RC=0
-    DEPLOYMENT_TARGET="${DEPLOYMENT_TARGET}" INSTANCE_TYPE="${INSTANCE_TYPE:-}" \
-        python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" check || _SIZING_RC=$?
-    case "${_SIZING_RC}" in
-        0) echo "✅ Right-sizing: fits." ;;
-        1) echo "⚠️  Right-sizing: warnings above; proceeding." ;;
-        2)
-            if [ "${FLAG_IGNORE_SIZING:-0}" -eq 1 ]; then
-                echo "⚠️  --ignore-sizing: proceeding despite the right-sizing block above (the deploy may fail at start)."
-            else
-                echo "❌ Right-sizing blocked this deploy (see the findings above). Nothing was created or applied." >&2
-                echo "   Apply a fix above, or override at your own risk: ./do/deploy --ignore-sizing" >&2
-                exit 1
-            fi
-            ;;
-        *) echo "⚠️  Right-sizing check could not run (exit ${_SIZING_RC}); proceeding without it." >&2 ;;
-    esac
-    export MLCC_SIZING_PREFLIGHT_DONE=1
+# BL204: ONE function, called by both --dry-run (preflight-only check) and the
+# real deploy, so the two can never disagree.
+_run_sizing_preflight() {
+    if python3 "${SCRIPT_DIR}/lib/python/target_manifest.py" family "${DEPLOYMENT_TARGET}" >/dev/null 2>&1; then
+        echo "📏 Right-sizing preflight (${DEPLOYMENT_TARGET}, ${INSTANCE_TYPE:-no instance type})..."
+        _SIZING_RC=0
+        DEPLOYMENT_TARGET="${DEPLOYMENT_TARGET}" INSTANCE_TYPE="${INSTANCE_TYPE:-}" \
+            python3 "${SCRIPT_DIR}/lib/python/right_sizing.py" check || _SIZING_RC=$?
+        case "${_SIZING_RC}" in
+            0) echo "✅ Right-sizing: fits." ;;
+            1) echo "⚠️  Right-sizing: warnings above; proceeding." ;;
+            2)
+                if [ "${FLAG_IGNORE_SIZING:-0}" -eq 1 ]; then
+                    echo "⚠️  --ignore-sizing: proceeding despite the right-sizing block above (the deploy may fail at start)."
+                else
+                    echo "❌ Right-sizing blocked this deploy (see the findings above). Nothing was created or applied." >&2
+                    echo "   Apply a fix above, or override at your own risk: ./do/deploy --ignore-sizing" >&2
+                    exit 1
+                fi
+                ;;
+            *) echo "⚠️  Right-sizing check could not run (exit ${_SIZING_RC}); proceeding without it." >&2 ;;
+        esac
+        export MLCC_SIZING_PREFLIGHT_DONE=1
+    fi
+    if [ "${FLAG_IGNORE_SIZING:-0}" -eq 1 ]; then
+        export MLCC_IGNORE_SIZING=1
+    fi
+}
+
+# ── Dry-run output (FR-3.6, CP-4; BL204 preflight-only check) ─────────────────
+# Show resolved config, the right-sizing preflight findings, and the command
+# that would execute — without creating, applying, or dispatching anything.
+# Exit 0 when the preflight fits / warns (or --ignore-sizing overrides a block);
+# exit 1 on a block (from _run_sizing_preflight).
+if [ "${FLAG_DRY_RUN:-0}" -eq 1 ]; then
+    echo "── Dry Run ──────────────────────────────────────────────"
+    echo ""
+    echo "Target: $DEPLOYMENT_TARGET"
+    echo "Script: ${SCRIPT_DIR}/deploy.d/${DEPLOYMENT_TARGET}"
+    echo ""
+    echo "Resolved configuration:"
+    for var in DEPLOYMENT_TARGET INSTANCE_TYPE ENDPOINT_NAME ENDPOINT_STRATEGY \
+               IC_GPU_COUNT INSTANCE_TYPES HP_CLUSTER_NAME HP_GPU_COUNT \
+               HP_NAMESPACE HP_REPLICAS HP_QUEUE ASYNC_S3_OUTPUT_PATH \
+               ASYNC_SNS_TOPIC ASYNC_MAX_CONCURRENT_INVOCATIONS BATCH_INPUT_PATH \
+               BATCH_OUTPUT_PATH BATCH_SPLIT_TYPE BATCH_STRATEGY BATCH_MAX_CONCURRENT; do
+        val="${!var:-}"
+        if [ -n "$val" ]; then
+            echo "  $var=$val"
+        fi
+    done
+    echo ""
+    _run_sizing_preflight
+    echo ""
+    echo "Would execute:"
+    echo "  source ${SCRIPT_DIR}/deploy.d/${DEPLOYMENT_TARGET} ${DEPLOY_ARGS[*]:-}"
+    echo ""
+    echo "── No changes made (dry run) ──────────────────────────"
+    exit 0
 fi
-if [ "${FLAG_IGNORE_SIZING:-0}" -eq 1 ]; then
-    export MLCC_IGNORE_SIZING=1
-fi
+
+# Real deploy: the same preflight, still before any create/apply / dispatch.
+_run_sizing_preflight
 
 # ── BL166: ensure the per-project MLflow experiment exists at first touch ──
 # Deploy is a lifecycle entry point too (OQ-1): a deploy-a-pre-existing-model flow

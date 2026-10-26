@@ -161,6 +161,77 @@ describe('Wave 8 — do/deploy right-sizing preflight (behavioral, bash 3.2)', f
         sb.cleanup();
     });
 
+    // ── BL204: --dry-run is the preflight-only check (same function, nothing created) ──
+    const cfg = () => readFileSync(join(sb.doDir, 'config'), 'utf8');
+
+    it('--dry-run on an oversized config prints the block and exits 1, with zero driver / aws / kubectl calls', () => {
+        setup('eks', small[0]);
+        const before = cfg();
+        const r = deploy(['--dry-run']);
+        assert.strictEqual(r.code, 1, r.stdout + r.stderr);
+        assert.match(r.stdout, /Dry Run/);
+        assert.match(r.stdout, /Resolved configuration:/);
+        assert.match(r.stdout, /Right-sizing preflight \(eks, /);
+        assert.match(r.stdout, /\[context-memory\].*over usable memory/);
+        assert.match(r.stderr, /Right-sizing blocked this deploy/);
+        assert.strictEqual(driverRan(), '', 'deploy.d driver must not run under --dry-run');
+        assert.strictEqual(calls(), '', 'no aws / kubectl call under --dry-run');
+        assert.strictEqual(cfg(), before, '--dry-run must not write do/config');
+        sb.cleanup();
+    });
+
+    it('--dry-run --ignore-sizing exits 0 with the warning line and still dispatches nothing', () => {
+        setup('eks', small[0]);
+        const r = deploy(['--dry-run', '--ignore-sizing']);
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        assert.match(r.stdout, /--ignore-sizing: proceeding despite the right-sizing block/);
+        assert.match(r.stdout, /No changes made \(dry run\)/);
+        assert.strictEqual(driverRan(), '');
+        assert.strictEqual(calls(), '');
+        sb.cleanup();
+    });
+
+    it('--dry-run on a fitting config exits 0, prints "fits", and keeps the dry-run output', () => {
+        setup('eks', big[0], 'export VLLM_MAX_MODEL_LEN="1024"');
+        const r = deploy(['--dry-run']);
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        assert.match(r.stdout, /Right-sizing: fits\./);
+        assert.match(r.stdout, new RegExp(`INSTANCE_TYPE=${big[0].replace(/\./g, '\\.')}`));
+        assert.match(r.stdout, /Would execute:\n {2}source .*deploy\.d\/eks/);
+        assert.match(r.stdout, /No changes made \(dry run\)/);
+        assert.ok(r.stdout.indexOf('Resolved configuration:') < r.stdout.indexOf('Right-sizing preflight'),
+            'preflight findings follow the resolved config');
+        assert.strictEqual(driverRan(), '');
+        assert.strictEqual(calls(), '');
+        sb.cleanup();
+    });
+
+    for (const extraArgs of [[], ['--force']]) {
+        it(`--dry-run --target on an already-deployed target ${extraArgs.join(' ') || '(no --force)'} runs the preflight instead of the "already deployed" short-circuit`, () => {
+            setup('eks', small[0], 'export DEPLOYMENT_TARGET_EKS_STATUS="Running"');
+            const before = cfg();
+            const r = deploy(['--dry-run', '--target', 'eks', ...extraArgs]);
+            assert.strictEqual(r.code, 1, r.stdout + r.stderr);
+            assert.match(r.stdout, /eks is already deployed \(Running\); --dry-run previews its saved configuration/);
+            assert.doesNotMatch(r.stdout, /Focused on eks/);
+            assert.match(r.stdout, /\[context-memory\].*over usable memory/);
+            assert.strictEqual(driverRan(), '');
+            assert.strictEqual(calls(), '');
+            assert.strictEqual(cfg(), before, 'no focus switch / INSTANCE_TYPE clear under --dry-run');
+            sb.cleanup();
+        });
+    }
+
+    it('without --dry-run, an already-deployed --target still short-circuits (unchanged)', () => {
+        setup('eks', small[0], 'export DEPLOYMENT_TARGET_EKS_STATUS="Running"');
+        const r = deploy(['--target', 'eks']);
+        assert.strictEqual(r.code, 0, r.stdout + r.stderr);
+        assert.match(r.stdout, /Focused on eks/);
+        assert.doesNotMatch(r.stdout, /Right-sizing preflight/);
+        assert.strictEqual(driverRan(), '');
+        sb.cleanup();
+    });
+
     it('a non-GPU (uncatalogued) instance is skipped, not blocked', () => {
         setup('realtime-inference', 'ml.m5.xlarge');
         const r = deploy([]);
