@@ -209,6 +209,12 @@ while [ $# -gt 0 ]; do
             FLAG_IGNORE_SIZING=1
             shift
             ;;
+        --allow-plaintext-secret)
+            # BL212: opt in to writing a plaintext HF_TOKEN / NGC_API_KEY (no *_ARN)
+            # into the SageMaker container Environment. Read by do/lib/secrets.sh.
+            export MLCC_ALLOW_PLAINTEXT_SECRET=true
+            shift
+            ;;
         --help|-h)
             echo "Usage: ./do/deploy [--target <mode>] [OPTIONS]"
             echo ""
@@ -239,6 +245,10 @@ while [ $# -gt 0 ]; do
             echo "                          (KV cache + weights over GPU memory, context limit, TP,"
             echo "                          dtype vs GPU, LoRA rank/buffer, ...). Prints a warning."
             echo "                          See docs/architecture/right-sizing.md"
+            echo "  --allow-plaintext-secret"
+            echo "                          Allow a plaintext HF_TOKEN / NGC_API_KEY (no *_ARN) in the"
+            echo "                          container Environment. Visible in SageMaker Describe* APIs"
+            echo "                          and CloudTrail; prefer HF_TOKEN_ARN / NGC_API_KEY_ARN."
             echo ""
             echo "Managed / Async Inference flags:"
             echo "  --endpoint-name <name>      Endpoint name (default: \${PROJECT_NAME}-ep)"
