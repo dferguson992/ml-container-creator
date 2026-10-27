@@ -27,6 +27,7 @@ CLI (one-shot, for bash callers):
     algorithm_map          — prints a JSON object
     dimension_map          — prints a JSON object
     metrics_endpoint       — prints a JSON object (or exits non-zero if absent)
+    metric_signals         — prints a JSON object ({} when the engine declares none)
     engine | hot_reload    — prints the raw value
     min_version            — prints the min_version string (or empty)
     version_features       — prints a JSON array
@@ -173,6 +174,29 @@ def quantization_methods(engine: str, serve_dir: str | None = None) -> list[str]
 def metrics_endpoint(engine: str, serve_dir: str | None = None) -> dict | None:
     """Return the engine's metrics_endpoint dict, or None if not declared."""
     return read_manifest(engine, serve_dir).get("metrics_endpoint")
+
+
+def metric_signals(engine: str, serve_dir: str | None = None) -> dict:
+    """Return the engine's `metric_signals` map (Wave 9 R2.1): abstract signal
+    name -> {type, name} or {type: ratio, num, den}. Returns {} when the engine
+    declares none or has no manifest (non-plugin engines), so callers simply get
+    no engine signals instead of an error."""
+    try:
+        return dict(read_manifest(engine, serve_dir).get("metric_signals") or {})
+    except ManifestNotFound:
+        return {}
+
+
+def list_engines(serve_dir: str | None = None) -> list[str]:
+    """Return the engine names that have a manifest in the first serve.d root
+    that exists, sorted (same resolution order as read_manifest)."""
+    for root in _candidate_serve_dirs(serve_dir):
+        if os.path.isdir(root):
+            return sorted(
+                d for d in os.listdir(root)
+                if os.path.isfile(os.path.join(root, d, "manifest.json"))
+            )
+    return []
 
 
 def engine_features(engine: str, serve_dir: str | None = None) -> dict:
@@ -545,6 +569,7 @@ _FIELD_PRINTERS = {
     "min_version": lambda m: m.get("min_version", ""),
     "version_features": lambda m: json.dumps(m.get("version_features", [])),
     "engine_features": lambda m: json.dumps(m.get("engine_features", {})),
+    "metric_signals": lambda m: json.dumps(m.get("metric_signals", {})),
 }
 
 

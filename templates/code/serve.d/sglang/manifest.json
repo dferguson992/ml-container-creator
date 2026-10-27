@@ -16,6 +16,12 @@
     "port": 8080,
     "format": "prometheus"
   },
+  "metric_signals": {
+    "kv_cache_util": { "type": "gauge", "name": "sglang:token_usage" },
+    "queue_depth_running": { "type": "gauge", "name": "sglang:num_running_reqs" },
+    "queue_depth_waiting": { "type": "gauge", "name": "sglang:num_queue_reqs" },
+    "prefix_cache_hit_rate": { "type": "gauge", "name": "sglang:cache_hit_rate" }
+  },
   "dimension_map": {
     "quantization": "QUANTIZATION",
     "tensor_parallel_degree": "TP_SIZE",

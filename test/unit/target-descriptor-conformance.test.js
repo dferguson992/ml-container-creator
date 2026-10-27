@@ -40,8 +40,10 @@ import {
     allDescriptors,
     statusVarToAnswerKey,
     adapterDelivery,
-    pricing
+    pricing,
+    observability
 } from '../../src/lib/target-manifest-reader.js';
+import { listServeEngines, metricSignals } from '../../src/lib/serve-manifest-reader.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..', '..');
@@ -345,5 +347,69 @@ describe('Wave 9 R7.1/R8.2 — pricing is declared in the descriptor and read by
         for (const c of SAGEMAKER_COMPONENTS) {
             assert.ok(!new RegExp(`['"]${c}['"]`).test(src), `pricing.py must not hardcode component ${c}`);
         }
+    });
+});
+
+describe('Wave 9 (R1/R6/R12, OQ-9.9) — observability + verbs.metrics are declared and read by every consumer', () => {
+    const py = process.env.MLCC_PYTHON || 'python3';
+    const STORES = ['cloudwatch-promql', 'amp', 'none'];
+    for (const d of descriptors) {
+        it(`${d.target} declares an observability block with a known store`, () => {
+            assert.ok(d.observability, `${d.target} must declare observability`);
+            assert.ok(STORES.includes(d.observability.store), d.observability.store);
+        });
+        it(`${d.target} verbs.metrics agrees with observability.store`, () => {
+            assert.strictEqual(typeof (d.verbs || {}).metrics, 'boolean', 'verbs.metrics must be declared');
+            assert.strictEqual(d.verbs.metrics, d.observability.store !== 'none',
+                'do/metrics applies exactly where a metrics store exists');
+        });
+        if (d.observability && d.observability.store !== 'none') {
+            it(`${d.target} store declares the selector, histogram form and dashboard`, () => {
+                assert.ok(Object.keys(d.observability.selector || {}).length > 0);
+                assert.ok(['native', 'classic'].includes(d.observability.histogram_form));
+                assert.ok(d.observability.dashboard);
+            });
+        }
+        if (d.observability && d.observability.store === 'amp') {
+            it(`${d.target} (amp) declares how to discover the workspace`, () => {
+                assert.ok(d.observability.amp_discovery && d.observability.amp_discovery.addon);
+                assert.ok(d.observability.amp_discovery.endpoint_key);
+            });
+        }
+    }
+    it('the Python reader (target_manifest.py observability) agrees with the Node reader', () => {
+        for (const d of descriptors) {
+            const r = spawnSync(py, [join(ROOT, 'templates/do/lib/python/target_manifest.py'), 'observability', d.target],
+                { encoding: 'utf8' });
+            assert.strictEqual(r.status, 0, r.stderr);
+            assert.deepStrictEqual(JSON.parse(r.stdout), observability(d.target), d.target);
+        }
+    });
+    it('the Python reader (serve_manifest.py metric_signals) agrees with the Node reader', () => {
+        const engines = listServeEngines();
+        assert.ok(engines.some((e) => Object.keys(metricSignals(e)).length > 0), 'some engine declares signals');
+        for (const engine of engines) {
+            const r = spawnSync(py, [join(ROOT, 'templates/do/lib/python/serve_manifest.py'), 'metric_signals', engine],
+                { encoding: 'utf8' });
+            assert.strictEqual(r.status, 0, r.stderr);
+            assert.deepStrictEqual(JSON.parse(r.stdout), metricSignals(engine), engine);
+        }
+    });
+    it('consumers derive the store from the descriptor instead of branching on target names', () => {
+        const strip = (t) => t.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+        for (const rel of ['templates/do/lib/python/gpu_metrics.py', 'templates/do/lib/python/endpoint_metrics.py']) {
+            const code = strip(read(rel));
+            for (const d of descriptors) {
+                // boto3.client('eks') is the AWS service name, not a target branch.
+                assert.ok(!new RegExp(`(?<!client\\()'${d.target}'`).test(code),
+                    `${rel} must not hardcode target '${d.target}'`);
+            }
+        }
+        const writer = read('templates/do/.benchmark_writer.py');
+        const fn = writer.slice(writer.indexOf('def _collect_gpu_signals('), writer.indexOf('def collect_level_context('));
+        for (const d of descriptors.filter((x) => x.target !== 'realtime-inference')) {
+            assert.ok(!fn.includes(`'${d.target}'`), `_collect_gpu_signals must not branch on '${d.target}'`);
+        }
+        assert.match(read('templates/do/metrics'), /target_manifest\.py" verbs/);
     });
 });

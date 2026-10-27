@@ -95,7 +95,7 @@ Where in the project lifecycle this script is intended to run. Used by the advis
 | `pre-deploy` | Before deploy | `do/validate` |
 | `publish` | Before deploy | `do/push`, `do/stage`, `do/register` |
 | `deploy` | Core action | `do/deploy` |
-| `monitor` | After deploy | `do/status`, `do/logs`, `do/test` |
+| `monitor` | After deploy | `do/status`, `do/logs`, `do/test`, `do/metrics` |
 | `post-deploy` | Ongoing | `do/benchmark`, `do/optimize`, `do/adapter` |
 | `teardown` | End of life | `do/clean` |
 | `training` | Parallel track | `do/tune`, `do/train` |
@@ -328,7 +328,7 @@ Warnings don't prevent the script from running. They surface in `agent-knowledge
 
 ## Current script registry
 
-The authoritative classification of all 24 `do/` scripts. This table is kept in
+The authoritative classification of all 25 `do/` scripts. This table is kept in
 sync with the shipped scripts by the conformance test
 (`test/unit/do-contract-conformance.test.js`, ADR-007), which fails if a script
 drifts from its contract.
@@ -351,6 +351,7 @@ drifts from its contract.
 | `do/test` | deployment-centric | deployment-active | monitor | all |
 | `do/logs` | deployment-centric | deployment-active | monitor | all |
 | `do/status` | deployment-centric | deployment-active | monitor | all |
+| `do/metrics` | deployment-centric | none (deployment-active enforced inline after the no-store skip) | monitor | all |
 | `do/clean` | deployment-centric | deployment-active | teardown | all |
 | `do/benchmark` | deployment-centric | deployment-active | post-deploy | all |
 | `do/optimize` | deployment-centric | deployment-active | post-deploy | realtime-inference, hyperpod-eks |

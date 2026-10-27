@@ -81,16 +81,20 @@ _bm_surface_stderr() {
 # hyperpod-eks/eks, AND the active engine's serve.d/<engine>/manifest.json
 # declares a metrics_endpoint (BL105), a background poller is spawned at
 # benchmark start (Req 1.1). It samples engine /metrics every 5s for the whole
-# run and writes peak/avg to benchmarks/.last_gpu_metrics.json at the end
-# (Req 2, 3). When no metrics_endpoint is declared, Phase 2 is silently skipped
+# run and writes peak/avg per pod to benchmarks/<job>/gpu_metrics-c<level>-<pod>.json
+# at the end (Req 2, 3; Wave 9 R6.2/R6.3: every Running pod, per job + level). When no metrics_endpoint is declared, Phase 2 is silently skipped
 # (Req 4.1). The port-forward is started before the poller (Req 7.1) and stopped
 # after benchmark end, on both normal and abnormal exit (Req 7.2).
 #
-# State shared between _phase2_start_poller and _phase2_stop_poller:
-_PHASE2_PF_PID=""        # kubectl port-forward PID
-_PHASE2_POLLER_PID=""    # phase2_poller.py PID
-_PHASE2_STOP_FILE=""     # sentinel file that signals the poller to stop
-_PHASE2_ACTIVE=false     # true once a poller has been spawned
+# State shared between _phase2_start_poller and _phase2_stop_poller
+# (Wave 9 R6.2: one port-forward + poller per Running pod, bash 3.2 arrays):
+_PHASE2_PF_PIDS=()       # kubectl port-forward PIDs
+_PHASE2_POLLER_PIDS=()   # phase2_poller.py PIDs
+_PHASE2_STOP_FILE=""     # sentinel file that signals every poller to stop
+_PHASE2_ACTIVE=false     # true once at least one poller has been spawned
+_PHASE2_SIDECAR_DIR=""   # benchmarks/<job>/ — per-pod sidecars for this level
+_PHASE2_LEVEL=""         # concurrency level the sidecars belong to
+_PHASE2_MAX_PODS=8       # cap on concurrent per-pod port-forwards
 
 # ── Spawn the poller (Req 1, 4, 7.1) ──────────────────────────────────────────
 # Resolves the metrics_endpoint from the engine manifest and, only if declared,
@@ -168,49 +172,72 @@ except Exception:
 
     kubectl cluster-info >/dev/null 2>&1 || return 0
 
-    # Discover the Running serving pod (empty → pod not Running → silent skip).
-    local _pod_name
-    _pod_name=$(kubectl get pods -n "${HP_NAMESPACE:-default}" \
+    # Wave 9 R6.2: discover EVERY Running serving pod (not just items[0]); the
+    # cap bounds the number of concurrent port-forwards. Empty → silent skip.
+    local _pods
+    _pods=$(kubectl get pods -n "${HP_NAMESPACE:-default}" \
         -l "app=${PROJECT_NAME}" \
         --field-selector=status.phase=Running \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || return 0
-    [ -z "${_pod_name}" ] && return 0
+        -o jsonpath='{.items[*].metadata.name}' 2>/dev/null) || return 0
+    [ -z "${_pods}" ] && return 0
 
-    # Req 7.1: start the port-forward BEFORE the poller.
-    local _local_port=18080
-    kubectl port-forward "pod/${_pod_name}" "${_local_port}:${_remote_port}" \
-        -n "${HP_NAMESPACE:-default}" >/dev/null 2>&1 &
-    _PHASE2_PF_PID=$!
-    sleep 3
-    if ! kill -0 "${_PHASE2_PF_PID}" 2>/dev/null; then
-        # Port-forward failed → non-fatal, do not spawn the poller (Error Handling).
-        _PHASE2_PF_PID=""
-        return 0
-    fi
-
-    # Req 1.1: spawn the background poller only after the port-forward is live.
+    # Wave 9 R6.3: per-job, per-level sidecars, one per pod. The writer merges
+    # them for this level; the fixed .last_gpu_metrics.json is only a display
+    # copy written at stop time and is never a write input.
+    _PHASE2_SIDECAR_DIR="${SCRIPT_DIR}/../benchmarks/${BENCHMARK_JOB_NAME:-unnamed}"
+    _PHASE2_LEVEL="${BENCHMARK_CONCURRENCY:-1}"
+    mkdir -p "${_PHASE2_SIDECAR_DIR}" 2>/dev/null || return 0
     _PHASE2_STOP_FILE="$(mktemp -t mlcc_phase2_stop.XXXXXX)"
     rm -f "${_PHASE2_STOP_FILE}" 2>/dev/null || true  # sentinel must not pre-exist
-    local _output="${SCRIPT_DIR}/../benchmarks/.last_gpu_metrics.json"
-    python3 "${_sd}/lib/python/phase2_poller.py" \
-        "http://localhost:${_local_port}" "${MODEL_SERVER}" "${_output}" \
-        --interval 5 --min-samples 5 --stop-file "${_PHASE2_STOP_FILE}" \
-        >/dev/null 2>&1 &
-    _PHASE2_POLLER_PID=$!
-    if ! kill -0 "${_PHASE2_POLLER_PID}" 2>/dev/null; then
-        # Req 1.2: poller failed to spawn → continue without Phase 2, warn.
-        echo "⚠️  Phase 2 metrics poller failed to spawn (non-fatal)" >&2
-        _PHASE2_POLLER_PID=""
-        kill "${_PHASE2_PF_PID}" 2>/dev/null || true
-        _PHASE2_PF_PID=""
-        return 0
+
+    local _pod _i=0 _local_port _pf_pid _poller_pid
+    for _pod in ${_pods}; do
+        [ "${_i}" -ge "${_PHASE2_MAX_PODS}" ] && break
+        # Ports 18180+i: clear of the eks load port-forward (HP_BENCHMARK_PORT,
+        # default 18080), which runs at the same time.
+        _local_port=$((18180 + _i))
+        # Req 7.1: start the port-forward BEFORE the poller.
+        kubectl port-forward "pod/${_pod}" "${_local_port}:${_remote_port}" \
+            -n "${HP_NAMESPACE:-default}" >/dev/null 2>&1 &
+        _pf_pid=$!
+        sleep 3
+        if ! kill -0 "${_pf_pid}" 2>/dev/null; then
+            # Port-forward failed → non-fatal, skip this pod (Error Handling).
+            _i=$((_i + 1))
+            continue
+        fi
+        _PHASE2_PF_PIDS+=("${_pf_pid}")
+        # Req 1.1: spawn the background poller only after the port-forward is live.
+        python3 "${_sd}/lib/python/phase2_poller.py" \
+            "http://localhost:${_local_port}" "${MODEL_SERVER}" \
+            "${_PHASE2_SIDECAR_DIR}/gpu_metrics-c${_PHASE2_LEVEL}-${_i}.json" \
+            --interval 5 --min-samples 5 --stop-file "${_PHASE2_STOP_FILE}" \
+            >/dev/null 2>&1 &
+        _poller_pid=$!
+        if kill -0 "${_poller_pid}" 2>/dev/null; then
+            _PHASE2_POLLER_PIDS+=("${_poller_pid}")
+            _PHASE2_ACTIVE=true
+        else
+            # Req 1.2: poller failed to spawn → continue without it, warn.
+            echo "⚠️  Phase 2 metrics poller failed to spawn for pod/${_pod} (non-fatal)" >&2
+        fi
+        _i=$((_i + 1))
+    done
+    if [ "${_PHASE2_ACTIVE}" != "true" ]; then
+        # Nothing spawned: tear down any live port-forwards now.
+        local _p
+        for _p in ${_PHASE2_PF_PIDS[@]+"${_PHASE2_PF_PIDS[@]}"}; do
+            kill "${_p}" 2>/dev/null || true
+        done
+        _PHASE2_PF_PIDS=()
+        rm -f "${_PHASE2_STOP_FILE}" 2>/dev/null || true
+        _PHASE2_STOP_FILE=""
     fi
-    _PHASE2_ACTIVE=true
     return 0
 }
 
 # ── Stop the poller and port-forward (Req 3, 7.2) ─────────────────────────────
-# Signals the poller to stop (it aggregates + writes .last_gpu_metrics.json),
+# Signals the pollers to stop (each aggregates + writes its per-pod sidecar),
 # waits for it to finish, then stops the port-forward. Safe to call multiple
 # times and from an EXIT trap; runs regardless of how the benchmark ended.
 _phase2_stop_poller() {
@@ -219,33 +246,46 @@ _phase2_stop_poller() {
     fi
     _PHASE2_ACTIVE=false
 
-    # Signal the poller to stop via the sentinel file (Req 3.1: it writes on stop).
+    # Signal every poller to stop via the sentinel file (Req 3.1: each writes on stop).
     [ -n "${_PHASE2_STOP_FILE}" ] && : > "${_PHASE2_STOP_FILE}" 2>/dev/null || true
 
-    # Wait for the poller to finish writing (bounded so a hung poller cannot
-    # stall the benchmark). It should exit within ~1 interval of the sentinel.
-    if [ -n "${_PHASE2_POLLER_PID}" ]; then
-        local _waited=0
-        while kill -0 "${_PHASE2_POLLER_PID}" 2>/dev/null; do
+    # Wait for the pollers to finish writing (bounded so a hung poller cannot
+    # stall the benchmark). Each should exit within ~1 interval of the sentinel.
+    local _pid _waited
+    for _pid in ${_PHASE2_POLLER_PIDS[@]+"${_PHASE2_POLLER_PIDS[@]}"}; do
+        _waited=0
+        while kill -0 "${_pid}" 2>/dev/null; do
             sleep 1
             _waited=$((_waited + 1))
             if [ ${_waited} -ge 15 ]; then
-                kill "${_PHASE2_POLLER_PID}" 2>/dev/null || true
+                kill "${_pid}" 2>/dev/null || true
                 break
             fi
         done
-        wait "${_PHASE2_POLLER_PID}" 2>/dev/null || true
-        _PHASE2_POLLER_PID=""
-    fi
+        wait "${_pid}" 2>/dev/null || true
+    done
+    _PHASE2_POLLER_PIDS=()
 
-    # Req 7.2: stop the port-forward AFTER the poller has finished.
-    if [ -n "${_PHASE2_PF_PID}" ]; then
-        kill "${_PHASE2_PF_PID}" 2>/dev/null || true
-        _PHASE2_PF_PID=""
-    fi
+    # Req 7.2: stop the port-forwards AFTER the pollers have finished.
+    for _pid in ${_PHASE2_PF_PIDS[@]+"${_PHASE2_PF_PIDS[@]}"}; do
+        kill "${_pid}" 2>/dev/null || true
+    done
+    _PHASE2_PF_PIDS=()
 
     [ -n "${_PHASE2_STOP_FILE}" ] && rm -f "${_PHASE2_STOP_FILE}" 2>/dev/null || true
     _PHASE2_STOP_FILE=""
+
+    # Display copy for `do/benchmark --gpu-metrics` only (read-only view of the
+    # latest level, merged across pods). The Athena write never reads it (R6.3).
+    if [ -n "${_PHASE2_SIDECAR_DIR}" ]; then
+        local _sd _merged
+        _sd="$(dirname "${BASH_SOURCE[0]}")"
+        _merged=$(python3 "${_sd}/lib/python/gpu_metrics.py" merge-sidecars \
+            "${_PHASE2_SIDECAR_DIR}" "${_PHASE2_LEVEL:-1}" 2>/dev/null) || _merged=""
+        if [ -n "${_merged}" ] && [ "${_merged}" != "{}" ]; then
+            printf '%s\n' "${_merged}" > "${SCRIPT_DIR}/../benchmarks/.last_gpu_metrics.json" 2>/dev/null || true
+        fi
+    fi
     return 0
 }
 
@@ -349,7 +389,9 @@ _run_eks_aiperf_benchmark() {
         export KUBECONFIG="${KUBECONFIG_PATH}"
     fi
 
-    # Resolve the running serving pod by label.
+    # Resolve the running serving pod by label. This is the LOAD target (AIPerf
+    # drives one port-forwarded pod); the opt-in metrics scrape covers every
+    # Running pod separately (_phase2_start_poller, Wave 9 R6.2).
     local _EKS_POD _eks_pod_err
     # BL165: capture kubectl's stderr so an auth/connectivity error is shown
     # instead of being reported as "no running pod".
@@ -449,7 +491,7 @@ _run_eks_aiperf_benchmark() {
     local _EKS_RC=0
     "${_EKS_AIPERF_CMD[@]}" || _EKS_RC=$?
 
-    # Stop Phase 2 (aggregates + writes .last_gpu_metrics.json) before tearing
+    # Stop Phase 2 (aggregates + writes the per-pod sidecars) before tearing
     # down the load port-forward.
     _phase2_stop_poller || true
 
@@ -483,8 +525,9 @@ _run_eks_aiperf_benchmark() {
     if [ -n "${CI_BENCHMARK_RESULTS_BUCKET:-}" ] && [ -z "${_BENCHMARK_SINGLE_LEVEL:-}" ]; then
         echo ""
         echo "📊 Persisting benchmark results to Athena..."
-        local _EKS_GPU_METRICS_FILE="${SCRIPT_DIR}/../benchmarks/.last_gpu_metrics.json"
-        [ -f "${_EKS_GPU_METRICS_FILE}" ] || _EKS_GPU_METRICS_FILE=""
+        # Wave 9 R6.3: this run's per-pod, per-level sidecars (never the fixed
+        # benchmarks/.last_gpu_metrics.json, which may belong to another run).
+        local _EKS_GPU_METRICS_DIR="${_EKS_JOB_DIR}"
         # deployment_target=eks is carried through the --config-file (do/config
         # has DEPLOYMENT_TARGET=eks); the writer maps it to the Athena column and
         # derives the eks metrics_source branch from it (findings §5, R5).
@@ -503,7 +546,7 @@ _run_eks_aiperf_benchmark() {
             ${ADAPTER_ARG:+--adapter-name "${ADAPTER_ARG}"} \
             ${BENCHMARK_JOB_NAME:+--benchmark-job-name "${BENCHMARK_JOB_NAME}"} \
             ${BENCHMARK_RUN_NAME:+--run-name "${BENCHMARK_RUN_NAME}"} \
-            ${_EKS_GPU_METRICS_FILE:+--gpu-metrics-file "${_EKS_GPU_METRICS_FILE}"}; then
+            --gpu-metrics-dir "${_EKS_GPU_METRICS_DIR}"; then
             echo "✅ Benchmark results persisted to S3"
         else
             echo "⚠️  Failed to persist benchmark results to Athena (non-fatal)"
@@ -667,11 +710,13 @@ while [ $# -gt 0 ]; do
             echo "  • ENDPOINT_NAME must be set in do/config (written automatically after ./do/deploy)"
             echo "  • For HyperPod EKS: ENDPOINT_NAME and HP_CLUSTER_NAME must be set in do/config"
             echo ""
-            echo "HyperPod EKS — enhanced metrics:"
-            echo "  Set HP_BENCHMARK_METRICS_ENABLED=true in do/config to enable opt-in /metrics"
-            echo "  scrape (Phase 2). Adds prefix_cache_hit_rate and engine KV cache metrics."
-            echo "  Phase 1 (CloudWatch OTel) requires account-level OTel enrichment:"
-            echo "    aws cloudwatch start-otel-enrichment --region <region>"
+            echo "GPU / engine metrics (written to Athena with each run):"
+            echo "  realtime-inference: SageMaker AI detailed observability via CloudWatch PromQL"
+            echo "    (on by default for endpoint configs; needs cloudwatch:GetMetricData)."
+            echo "  hyperpod-eks: the HyperPod observability add-on's AMP workspace, all pods"
+            echo "    (needs aps:QueryMetrics). Fallback, and the only source on eks: set"
+            echo "    HP_BENCHMARK_METRICS_ENABLED=true for the opt-in engine /metrics scrape."
+            echo "  Live readout of the same signals: ./do/metrics --window <minutes>"
             echo ""
             echo "Typical workflow:"
             echo "  ./do/benchmark --workload multi-turn-chat    # Run benchmark"
@@ -820,10 +865,11 @@ if [ "${ARG_STATUS}" = true ]; then
                 if [ -n "${_WRITER_INPUT}" ]; then
                     echo ""
                     echo "   📊 Writing to Athena..."
-                    # BL108: the Phase 2 poller (spawned at benchmark start) writes
-                    # peak/avg to the fixed sidecar at run end. Use it when present.
-                    _GPU_METRICS_FILE="${SCRIPT_DIR}/../benchmarks/.last_gpu_metrics.json"
-                    [ -f "${_GPU_METRICS_FILE}" ] || _GPU_METRICS_FILE=""
+                    # Wave 9 R1.2 / R6.3: the resume path gets a run window too —
+                    # the writer reads the downloaded AIPerf start/end (else
+                    # DescribeAIBenchmarkJob times via --benchmark-job-name, which
+                    # also names the endpoint + IC). Scrape sidecars, if the
+                    # original run had the opt-in poller, are THIS job's own.
                     if python3 "$(dirname "${BASH_SOURCE[0]}")/.benchmark_writer.py" write \
                         --results-file "${_WRITER_INPUT}" \
                         --config-file "$(dirname "${BASH_SOURCE[0]}")/config" \
@@ -835,8 +881,9 @@ if [ "${ARG_STATUS}" = true ]; then
                         ${_STATUS_INSTANCE_TYPE:+--instance-type "${_STATUS_INSTANCE_TYPE}"} \
                         ${ADAPTER_ARG:+--adapter-name "${ADAPTER_ARG}"} \
                         ${ENDPOINT_NAME:+--endpoint-name "${ENDPOINT_NAME}"} \
+                        --benchmark-job-name "${JOB_NAME}" \
                         ${BENCHMARK_RUN_NAME:+--run-name "${BENCHMARK_RUN_NAME}"} \
-                        ${_GPU_METRICS_FILE:+--gpu-metrics-file "${_GPU_METRICS_FILE}"}; then
+                        --gpu-metrics-dir "${LOCAL_RESULTS_DIR}"; then
                         echo "   ✅ Results persisted to Athena"
                     else
                         echo "   ⚠️  Athena write failed (non-fatal)"
@@ -1825,18 +1872,27 @@ if [ -n "${BENCHMARK_CONCURRENCY_LEVELS:-}" ] && [ -z "${_BENCHMARK_SINGLE_LEVEL
                 if [ -z "${_LATEST_JOB_DIR}" ] || [ ! -d "${_LATEST_JOB_DIR}" ]; then
                     _LATEST_JOB_DIR=$(ls -td "${SCRIPT_DIR}/../benchmarks/${PROJECT_NAME}-benchmark-"* 2>/dev/null | head -1)
                 fi
-                if [ -n "${_LATEST_JOB_DIR}" ] && [ -d "${_LATEST_JOB_DIR}" ] && [ -f "${_LATEST_JOB_DIR}/output/profile_export.jsonl" ]; then
-                    cp "${_LATEST_JOB_DIR}/output/profile_export.jsonl" "${_ALL_RESULTS_DIR}/profile-concurrency-${_LEVEL}.jsonl"
-                elif [ -n "${_LATEST_JOB_DIR}" ] && [ -f "${_LATEST_JOB_DIR}/output/profile_export_aiperf.json" ]; then
-                    cp "${_LATEST_JOB_DIR}/output/profile_export_aiperf.json" "${_ALL_RESULTS_DIR}/results-concurrency-${_LEVEL}.json"
-                fi
-                # BL128 (W9 R10.1): also keep the level's AIPerf aggregate JSON next to
-                # its JSONL; the writer reads results-concurrency-<L>.json from the
-                # results dir for the Effective/Active columns (JSONL stays the metrics
-                # source — the aggregator only falls back to these JSONs without JSONL).
-                if [ -n "${_LATEST_JOB_DIR}" ] && [ -f "${_LATEST_JOB_DIR}/output/profile_export_aiperf.json" ] \
-                    && [ ! -f "${_ALL_RESULTS_DIR}/results-concurrency-${_LEVEL}.json" ]; then
-                    cp "${_LATEST_JOB_DIR}/output/profile_export_aiperf.json" "${_ALL_RESULTS_DIR}/results-concurrency-${_LEVEL}.json"
+                # Wave 9 R1.3: keep BOTH the per-request JSONL and the AIPerf
+                # aggregate (its start_time/end_time is this level's run window
+                # and its request_error_rate the level's error rate), plus the
+                # child job name and this level's scrape sidecars, so the writer
+                # gives every row its own window, identity and signals. The same
+                # results-concurrency-<L>.json feeds the BL128 Effective/Active
+                # columns (W9 R10.1); JSONL stays the metrics source — the
+                # aggregator only falls back to these JSONs without JSONL.
+                if [ -n "${_LATEST_JOB_DIR}" ] && [ -d "${_LATEST_JOB_DIR}" ]; then
+                    if [ -f "${_LATEST_JOB_DIR}/output/profile_export.jsonl" ]; then
+                        cp "${_LATEST_JOB_DIR}/output/profile_export.jsonl" "${_ALL_RESULTS_DIR}/profile-concurrency-${_LEVEL}.jsonl"
+                    fi
+                    if [ -f "${_LATEST_JOB_DIR}/output/profile_export_aiperf.json" ]; then
+                        cp "${_LATEST_JOB_DIR}/output/profile_export_aiperf.json" "${_ALL_RESULTS_DIR}/results-concurrency-${_LEVEL}.json"
+                    fi
+                    basename "${_LATEST_JOB_DIR}" > "${_ALL_RESULTS_DIR}/job-concurrency-${_LEVEL}.txt"
+                    for _gm_sidecar in "${_LATEST_JOB_DIR}"/gpu_metrics-c"${_LEVEL}"-*.json; do
+                        if [ -f "${_gm_sidecar}" ]; then
+                            cp "${_gm_sidecar}" "${_ALL_RESULTS_DIR}/"
+                        fi
+                    done
                 fi
             else
                 echo "⚠️  Benchmark at concurrency ${_LEVEL} failed (non-fatal, continuing)"
@@ -1891,6 +1947,8 @@ for f in sorted(glob.glob(os.path.join(results_dir, 'profile-concurrency-*.jsonl
         latencies, ttfts, itls, ttsts, out_tokens = [], [], [], [], []
         start_times, end_times, in_tokens = [], [], []
         prefill_tps, output_tps = [], []
+        # Wave 9 R3: AIPerf marks a failed request with a top-level 'error'.
+        error_count = sum(1 for r in records if r.get('error') is not None)
 
         for rec in records:
             meta = rec.get('metadata', {})
@@ -1935,6 +1993,7 @@ for f in sorted(glob.glob(os.path.join(results_dir, 'profile-concurrency-*.jsonl
             'request_throughput': req_throughput,
             'output_token_throughput': token_throughput,
             'total_requests': len(records),
+            'error_count': error_count,
             'duration_seconds': duration_s,
             'time_to_first_token': {
                 'avg': sum(ttfts)/len(ttfts) if ttfts else 0.0,
@@ -2016,11 +2075,11 @@ print(f'Combined {n_metrics} concurrency level results')
             }
             CONFIG_ID=$(_compute_config_id)
 
-            # Phase 2 (BL108): the background poller writes peak/avg to the fixed
-            # sidecar at each child run's end. Use it here when present.
-            _ML_GPU_METRICS_FILE="${SCRIPT_DIR}/../benchmarks/.last_gpu_metrics.json"
-            [ -f "${_ML_GPU_METRICS_FILE}" ] || _ML_GPU_METRICS_FILE=""
-
+            # Wave 9 R1.3 / R5.1 / R6.3: each level's window, child job name and
+            # scrape sidecars sit in ${_ALL_RESULTS_DIR} (copy step above); the
+            # writer resolves them per row. --endpoint-name / --ic-name scope the
+            # realtime PromQL selector (the writer falls back to each level's
+            # DescribeAIBenchmarkJob BenchmarkTarget when they are unset here).
             if python3 "$(dirname "${BASH_SOURCE[0]}")/.benchmark_writer.py" write \
                 --results-file "${_COMBINED_FILE}" \
                 --config-file "$(dirname "${BASH_SOURCE[0]}")/config" \
@@ -2030,15 +2089,10 @@ print(f'Combined {n_metrics} concurrency level results')
                 --region "${AWS_REGION:-${REGION}}" \
                 ${RESOLVED_INSTANCE_TYPE:+--instance-type "${RESOLVED_INSTANCE_TYPE}"} \
                 ${ADAPTER_ARG:+--adapter-name "${ADAPTER_ARG}"} \
-                ${_ML_GPU_METRICS_FILE:+--gpu-metrics-file "${_ML_GPU_METRICS_FILE}"} \
+                ${ENDPOINT_NAME:+--endpoint-name "${ENDPOINT_NAME}"} \
+                ${IC_NAME:+--ic-name "${IC_NAME}"} \
+                --gpu-metrics-dir "${_ALL_RESULTS_DIR}" \
                 ${BENCHMARK_RUN_NAME:+--run-name "${BENCHMARK_RUN_NAME}"}; then
-                # Persist GPU metrics into the per-run output dir for traceability
-                # (the fixed sidecar is already the poller's own output — leave it).
-                if [ -n "${_ML_GPU_METRICS_FILE:-}" ] && [ -f "${_ML_GPU_METRICS_FILE}" ]; then
-                    # Optional traceability copy — the Athena write already succeeded.
-                    _latest_bm_dir=$(ls -td "${SCRIPT_DIR}/../benchmarks/${BENCHMARK_JOB_NAME}" 2>/dev/null | head -1)
-                    [ -n "${_latest_bm_dir}" ] && cp "${_ML_GPU_METRICS_FILE}" "${_latest_bm_dir}/output/gpu_metrics.json" 2>/dev/null || true
-                fi
                 echo "✅ Multi-level benchmark results persisted to S3"
             else
                 echo "⚠️  Failed to persist multi-level benchmark results to Athena (non-fatal)"
@@ -2744,7 +2798,7 @@ while [ ${POLL_COUNT} -lt ${MAX_POLL_ATTEMPTS} ]; do
             echo "✅ Benchmark completed successfully!"
             BENCHMARK_RUN_END=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
             # BL108: benchmark end → stop the poller (it aggregates + writes
-            # .last_gpu_metrics.json), then stop the port-forward (Req 3.1, 7.2).
+            # its per-pod sidecar), then stop the port-forwards (Req 3.1, 7.2).
             _phase2_stop_poller || true
             break
             ;;
@@ -3125,10 +3179,9 @@ except Exception as e:
             _WRITER_INPUT="${RESULTS_FILE}"
         fi
 
-        # Phase 2 (BL108): the background poller (spawned at benchmark start,
-        # stopped at end) has written peak/avg to the fixed sidecar. Use it here.
-        _GPU_METRICS_FILE="${SCRIPT_DIR}/../benchmarks/.last_gpu_metrics.json"
-        [ -f "${_GPU_METRICS_FILE}" ] || _GPU_METRICS_FILE=""
+        # Wave 9 R6.3: the opt-in poller wrote THIS job's per-pod sidecars into
+        # benchmarks/<job>/ (merged per level by the writer). The run window is
+        # read by the writer from the AIPerf start/end in the downloaded results.
 
         # Best-effort: errors are logged but do not fail the benchmark script
         if python3 "$(dirname "${BASH_SOURCE[0]}")/.benchmark_writer.py" write \
@@ -3147,14 +3200,14 @@ except Exception as e:
             ${BENCHMARK_RUN_START:+--run-start "${BENCHMARK_RUN_START}"} \
             ${BENCHMARK_RUN_END:+--run-end "${BENCHMARK_RUN_END}"} \
             ${BENCHMARK_RUN_NAME:+--run-name "${BENCHMARK_RUN_NAME}"} \
-            ${_GPU_METRICS_FILE:+--gpu-metrics-file "${_GPU_METRICS_FILE}"}; then
+            --gpu-metrics-dir "${LOCAL_RESULTS_DIR}"; then
             echo "✅ Benchmark results persisted to S3"
         else
             echo "⚠️  Failed to persist benchmark results to Athena (non-fatal)"
             echo "   Results remain available locally in: benchmarks/${BENCHMARK_JOB_NAME}/"
         fi
-        # NOTE: do NOT remove ${_GPU_METRICS_FILE} — it is the fixed poller sidecar
-        # benchmarks/.last_gpu_metrics.json that `do/benchmark --gpu-metrics` reads.
+        # NOTE: benchmarks/.last_gpu_metrics.json is a display copy for
+        # `do/benchmark --gpu-metrics`; it is never passed to the writer.
     fi
 elif [ "${JOB_STATUS}" = "Failed" ]; then
     # Display failure reason

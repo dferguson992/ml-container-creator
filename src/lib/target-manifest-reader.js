@@ -133,6 +133,20 @@ export function pricing(target, targetsDir = TARGETS_D) {
 }
 
 /**
+ * The target's observability declaration (Wave 9 R1/R6/R12): where its serving
+ * metrics live ({store, histogram_form, selector, gpu_selector, fallback,
+ * dashboard, amp_discovery, copy_concurrency}). Node twin of
+ * target_manifest.observability(); a target without the block reads as
+ * {store: 'none'}.
+ * @returns {{store: string, histogram_form?: string, selector?: Object<string,string>, dashboard?: string}}
+ */
+export function observability(target, targetsDir = TARGETS_D) {
+    const d = getDescriptor(target, targetsDir);
+    const obs = d && d.observability ? { ...d.observability } : {};
+    if (!obs.store) obs.store = 'none';
+    return obs;
+}
+/**
  * The status_var -> answer_key map across all targets, for building
  * SHELL_VAR_TO_ANSWER's per-target status entries.
  * @returns {Object<string,string>}

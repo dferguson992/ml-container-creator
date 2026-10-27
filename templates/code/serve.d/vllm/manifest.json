@@ -18,6 +18,15 @@
     "port": 8080,
     "format": "prometheus"
   },
+  "metric_signals": {
+    "kv_cache_util": { "type": "gauge", "name": "vllm:kv_cache_usage_perc" },
+    "queue_depth_running": { "type": "gauge", "name": "vllm:num_requests_running" },
+    "queue_depth_waiting": { "type": "gauge", "name": "vllm:num_requests_waiting" },
+    "prefix_cache_hit_rate": { "type": "ratio", "num": "vllm:prefix_cache_hits_total", "den": "vllm:prefix_cache_queries_total" },
+    "spec_decode_acceptance_rate": { "type": "ratio", "num": "vllm:spec_decode_num_accepted_tokens_total", "den": "vllm:spec_decode_num_draft_tokens_total" },
+    "ttft_seconds": { "type": "histogram", "name": "vllm:time_to_first_token_seconds" },
+    "e2e_seconds": { "type": "histogram", "name": "vllm:e2e_request_latency_seconds" }
+  },
   "dimension_map": {
     "quantization": "QUANTIZATION",
     "tensor_parallel_degree": "TENSOR_PARALLEL_SIZE",

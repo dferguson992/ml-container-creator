@@ -277,9 +277,17 @@ describe('Plain-EKS AIPerf benchmark', () => {
                 'sets the multi-level marker');
         });
 
-        it('.benchmark_writer.py labels an eks run engine_metrics_only (metrics_source branch)', () => {
-            assert.ok(/deployment_target == 'eks' and has_engine/.test(writerSrc),
-                'writer must have a plain-eks metrics_source branch');
+        it('.benchmark_writer.py labels an eks run engine_metrics_only (derived from the descriptor)', () => {
+            // Wave 9: provenance is keyed by the descriptor's observability block,
+            // not a per-target branch — eks declares store none + fallback
+            // engine-scrape, and a scrape-only row is engine_metrics_only.
+            const eks = JSON.parse(readFileSync(path.join(REPO, 'templates/do/targets.d/eks/manifest.json'), 'utf8'));
+            assert.strictEqual(eks.observability.store, 'none');
+            assert.strictEqual(eks.observability.fallback, 'engine-scrape');
+            assert.ok(/_SCRAPE_PROVENANCE = 'engine_metrics_only'/.test(writerSrc),
+                'scrape-only provenance must be engine_metrics_only');
+            assert.ok(/obs\.get\('fallback'\) == 'engine-scrape'/.test(writerSrc),
+                'the writer must read the scrape fallback from the descriptor');
         });
     });
 

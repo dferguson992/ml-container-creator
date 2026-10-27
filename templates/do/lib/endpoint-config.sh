@@ -204,8 +204,9 @@ create_endpoint_config() {
     #   or ContainerDefinition for create-model). CreateEndpointConfig has NO
     #   container-metrics option, and MetricsEndpoint has no Port member.
     #
-    # Account-level OTel enrichment (aws cloudwatch start-otel-enrichment) is a
-    # user prerequisite for PromQL queries and is NOT performed here.
+    # Account-level OTel enrichment (aws cloudwatch start-otel-enrichment) is NOT
+    # what gates detailed-observability data (verified Wave 9: vLLM + DCGM series
+    # flow with enrichment Stopped); it only mirrors classic-only metrics to OTel.
 
     # Optional: async inference config
     if [ -n "${ASYNC_INFERENCE_CONFIG:-}" ]; then

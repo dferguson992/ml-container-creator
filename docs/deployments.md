@@ -305,7 +305,8 @@ All generated projects include these `do/` scripts:
 | `./do/adapter` | LoRA adapter lifecycle (add, list, remove, update) |
 | `./do/add-ic` | Add an inference component to an existing endpoint |
 | `./do/benchmark` | Run latency and throughput benchmarks via SageMaker AI Benchmarking |
-| `./do/status` | Check endpoint and inference component status |
+| `./do/status` | Check endpoint and inference component status (IC copies as current/desired, plus a one-line pointer to the native metrics dashboard) |
+| `./do/metrics` | Serving-metrics readout over the last N minutes (`--window`, default 15): server-side TTFT / e2e p50/p99, queue, KV cache, GPU util, per-copy concurrency; skip notice on targets without a metrics store. See [Benchmarking](benchmarking.md#gpu-engine-metrics) |
 | `./do/logs` | Tail logs (CloudWatch for SageMaker targets, kubectl for hyperpod-eks / eks) |
 | `./do/clean <target>` | Clean up resources (local, ecr, endpoint/hyperpod, codebuild, all) |
 | `./do/config` | Centralized configuration for all scripts (sourced, not executed) |

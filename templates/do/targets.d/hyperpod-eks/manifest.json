@@ -35,7 +35,21 @@
     "add-ic": false,
     "ci": false,
     "adapter": true,
-    "draft": true
+    "draft": true,
+    "metrics": true
+  },
+  "observability": {
+    "store": "amp",
+    "histogram_form": "classic",
+    "selector": { "deployment": "resource_name", "namespace": "namespace" },
+    "gpu_selector": { "deployment": "container", "namespace": "namespace" },
+    "fallback": "engine-scrape",
+    "dashboard": "hyperpod-amg",
+    "amp_discovery": {
+      "addon": "amazon-sagemaker-hyperpod-observability",
+      "endpoint_key": "ampWorkspace.prometheusEndpoint",
+      "amg_name_key": "amgWorkspace.workspaceName"
+    }
   },
   "answer_params": [
     { "answerKey": "target", "configVar": "DEPLOYMENT_TARGET", "flag": "--target", "roles": ["flag-input", "prompt-core"] },

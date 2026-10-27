@@ -22,8 +22,10 @@
     "add-ic": false,
     "ci": false,
     "adapter": false,
-    "draft": false
+    "draft": false,
+    "metrics": false
   },
+  "observability": { "store": "none" },
   "answer_params": [
     { "answerKey": "target", "configVar": "DEPLOYMENT_TARGET", "flag": "--target", "roles": ["flag-input", "prompt-core"] },
     { "answerKey": "instance_type", "configVar": "INSTANCE_TYPE", "flag": "--instance-type", "roles": ["flag-input", "prompt-core"] },
