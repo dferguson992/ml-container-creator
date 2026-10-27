@@ -36,7 +36,8 @@ All settings centralized in `do/config`. Override via environment variables.
 | `./do/validate` | Target-aware pre-deploy checks (right-sizing, config, cluster contract, SageMaker payloads); `--format json` for CI |
 | `./do/run` | Run container locally (docker run) |
 | `./do/logs` | Tail CloudWatch logs for endpoint |
-| `./do/status` | Show endpoint/IC status and health |
+| `./do/status` | Show endpoint/IC status and health (IC copies as current/desired) |
+| `./do/metrics` | Serving-metrics readout for the deployed endpoint (`--window <minutes>`, `--target`, `--json`) |
 | `./do/clean` | Clean up AWS resources (endpoint, ECR, CodeBuild) |
 | `./do/ci` | Run full CI pipeline (build → push → deploy → test) |
 | `./do/config` | Display resolved configuration |

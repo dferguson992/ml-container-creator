@@ -358,7 +358,9 @@ class TestGpuMetricsReader:
         _gpu.main([f])
         out = capsys.readouterr().out
         assert 'HP_BENCHMARK_METRICS_ENABLED' in out
-        assert 'start-otel-enrichment' in out
+        # Wave 9: OTel enrichment is NOT what gates detailed-observability data.
+        assert 'start-otel-enrichment' not in out
+        assert 'detailed observability' in out
 
     def test_missing_file_exit_0(self, tmp_path, capsys):
         rc = _gpu.main([str(tmp_path / 'nope.jsonl')])
@@ -388,9 +390,11 @@ class TestNaColumnClassification:
     def test_gpu_columns_not_na_for_cloudwatch_only(self):
         assert _gpu._is_na_column('gpu_utilization_avg', 'cloudwatch_only') is False
 
-    def test_engine_columns_na_for_cloudwatch_only(self):
+    def test_engine_columns_available_for_cloudwatch_only(self):
+        # Wave 9: realtime CloudWatch PromQL carries the vLLM engine series.
         for col in ('prefix_cache_hit_rate', 'queue_depth_running_avg'):
-            assert _gpu._is_na_column(col, 'cloudwatch_only') is True
+            assert _gpu._is_na_column(col, 'cloudwatch_only') is False
+            assert _gpu._is_na_column(col, 'amp') is False
 
     def test_engine_columns_na_for_none(self):
         assert _gpu._is_na_column('prefix_cache_hit_rate', 'none') is True
@@ -419,14 +423,16 @@ class TestPrintFullNa:
             if 'GPU utilization' in line:
                 assert 'N/A' in line
 
-    def test_prefix_hit_shows_na_for_cloudwatch_only(self, tmp_path, capsys):
+    def test_prefix_hit_is_missing_not_na_for_cloudwatch_only(self, tmp_path, capsys):
+        # Wave 9: realtime CloudWatch PromQL carries the vLLM engine series, so an
+        # absent prefix-cache rate there is "no data" (—), not structurally N/A.
         f = self._write(tmp_path, {'metrics': {
             'gpu_utilization_avg': 70.0, 'metrics_source': 'cloudwatch_only'}})
         _gpu.main([f])
         out = capsys.readouterr().out
         for line in out.splitlines():
             if 'Prefix cache hit rate' in line:
-                assert 'N/A' in line
+                assert 'N/A' not in line
             if 'GPU utilization avg' in line:
                 # Phase 1 value present → not N/A.
                 assert 'N/A' not in line

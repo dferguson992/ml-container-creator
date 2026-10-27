@@ -337,7 +337,14 @@ class TestBenchmarkWriterUnchanged:
     # column list, Pricing-API cost + instance_count + Bedrock columns, BL128
     # AIPerf aggregates, Glue partition reconcile; INSTANCE_PRICING_USD_PER_HOUR
     # deleted. Deliberate, spec-mandated writer change; pin updated.
-    _EXPECTED_SHA256 = "b8767404b719f2c74cf01c0e02d704e686c34600f854b67c67c86d314afde604"
+    #
+    # Re-pinned (Wave 9 half 9A, owner-approved spec v2-w9-01 R1/R3-R6): the writer
+    # now fills existing columns with real values — per-level run window + store
+    # signals (CloudWatch PromQL / HyperPod AMP) with provenance keyed by the
+    # descriptor store, real error_rate, the .mlcc/instances.json catalog path,
+    # benchmark_job_name on the write path, and per-job/per-level scrape sidecars
+    # (--gpu-metrics-dir). Re-pinned again after merging 9B into 9A (both halves applied).
+    _EXPECTED_SHA256 = "bcf4cfca89e15393461af75991870911c2fd07f6d081b3b79d13085d24a75afe"
 
     def test_writer_hash_unchanged(self):
         with open(_WRITER_PATH, "rb") as f:
@@ -345,3 +352,64 @@ class TestBenchmarkWriterUnchanged:
         assert digest == self._EXPECTED_SHA256, (
             ".benchmark_writer.py changed — BL082/BL108 Req 6 forbids modifying it."
         )
+
+
+# ── Wave 9 R2.4 / R6.2: window ratios + multi-pod scrape wiring ───────────────
+
+
+class TestWindowRatios:
+    """Counter-pair ratios are computed over the RUN WINDOW from the first and
+    last sample's raw counters — never as a mean of lifetime ratios."""
+
+    def _s(self, hits, queries, lifetime_ratio):
+        return {'kv_cache_util_avg': 0.1, 'prefix_cache_hit_rate': lifetime_ratio,
+                '_counters': {'prefix_cache_hit_rate': [hits, queries]}}
+
+    def test_ratio_is_the_window_delta(self):
+        # Lifetime ratios are ~0 (11031 queries before the run, 0 hits), but the
+        # run itself hit 60 of 100 queries.
+        out = phase2_poller.aggregate([self._s(0, 11031, 0.0), self._s(30, 11081, 0.0027),
+                                       self._s(60, 11131, 0.0054)], min_samples=1)
+        assert out['prefix_cache_hit_rate'] == pytest.approx(0.6)
+
+    def test_single_counter_sample_is_unknown_not_lifetime(self):
+        out = phase2_poller.aggregate([self._s(250, 1000, 0.25)], min_samples=1)
+        assert 'prefix_cache_hit_rate' not in out
+
+    def test_no_denominator_growth_is_unknown(self):
+        out = phase2_poller.aggregate([self._s(5, 100, 0.05), self._s(5, 100, 0.05)], min_samples=1)
+        assert 'prefix_cache_hit_rate' not in out
+
+    def test_gauge_ratio_without_counters_is_still_the_mean(self):
+        out = phase2_poller.aggregate([{'prefix_cache_hit_rate': 0.2}, {'prefix_cache_hit_rate': 0.4}],
+                                      min_samples=1)
+        assert out['prefix_cache_hit_rate'] == pytest.approx(0.3)
+
+    def test_counters_never_leak_into_the_sidecar(self):
+        out = phase2_poller.aggregate([self._s(0, 10, 0.0), self._s(5, 20, 0.25)], min_samples=1)
+        assert '_counters' not in out
+
+
+class TestMultiPodScrapeWiring:
+    """do/benchmark scrapes EVERY Running pod (cap) into per-job, per-level
+    sidecars; nothing in the start path writes the fixed display file."""
+
+    _BENCH = os.path.join(_REPO_ROOT, "templates", "do", "benchmark")
+
+    def _start_fn(self):
+        text = open(self._BENCH, encoding='utf-8').read()
+        start = text.index('_phase2_start_poller() {')
+        return text[start:text.index('\n}\n', start)]
+
+    def test_all_running_pods_not_items0(self):
+        fn = self._start_fn()
+        assert "{.items[*].metadata.name}" in fn
+        assert "{.items[0].metadata.name}" not in fn
+        assert '_PHASE2_MAX_PODS' in fn
+
+    def test_sidecar_is_per_job_level_and_pod(self):
+        fn = self._start_fn()
+        assert 'benchmarks/${BENCHMARK_JOB_NAME' in fn
+        assert 'gpu_metrics-c${_PHASE2_LEVEL}-${_i}.json' in fn
+        code = [line for line in fn.splitlines() if not line.strip().startswith('#')]
+        assert not any('.last_gpu_metrics' in line for line in code)

@@ -199,6 +199,11 @@ derived from the descriptor.
 7. **Declare verb support** — for each `do/` verb, set its `@mlcc-script` `targets:`
    or add a `_restrict_targets` / `_contract_violation` guard (exit 3). Keep the
    verb's descriptor `verbs` map in step 1 in agreement.
+8. **Declare the metrics store** (Wave 9) — the descriptor's `observability` block
+   (`store: cloudwatch-promql | amp | none`, plus `selector`, `histogram_form`,
+   `dashboard` for a real store) and `verbs.metrics` (must equal `store != none`).
+   `do/benchmark`'s GPU/engine columns, `do/metrics` and the `do/status` dashboard
+   line derive from it; a target with `store: none` gets the `do/metrics` skip notice.
 
 Everything else — the guard's status-var case, `do-config.js` `SHELL_VAR_TO_ANSWER`,
 `regenerate`'s `RUNTIME_OWNED_VARS`, `deploy_schema.py`'s `SCHEMAS` / `STATUS_VARS`

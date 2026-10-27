@@ -22,7 +22,19 @@
     "add-ic": true,
     "ci": true,
     "adapter": true,
-    "draft": false
+    "draft": false,
+    "metrics": true
+  },
+  "observability": {
+    "store": "cloudwatch-promql",
+    "histogram_form": "native",
+    "selector": {
+      "endpoint": "aws.sagemaker.endpoint.name",
+      "variant": "aws.sagemaker.variant.name",
+      "inference_component": "aws.sagemaker.inference_component.name"
+    },
+    "dashboard": "sagemaker-ai-insights",
+    "copy_concurrency": { "namespace": "AWS/SageMaker", "metric": "ConcurrentRequestsPerCopy", "dimension": "InferenceComponentName" }
   },
   "answer_params": [
     { "answerKey": "target", "configVar": "DEPLOYMENT_TARGET", "flag": "--target", "roles": ["flag-input", "prompt-core"] },

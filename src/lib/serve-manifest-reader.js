@@ -264,6 +264,20 @@ export function engineFeature(engine, feature, serveDir = SERVE_D) {
 }
 
 /**
+ * The engine's `metric_signals` map (Wave 9 R2.1): abstract signal name to
+ * `{type, name}` or `{type: 'ratio', num, den}`. Returns {} when the engine
+ * declares none. Node twin of serve_manifest.metric_signals(), used by the
+ * serve-manifest signal conformance test.
+ * @param {string} engine
+ * @param {string} [serveDir]
+ * @returns {Object<string, {type: string, name?: string, num?: string, den?: string}>}
+ */
+export function metricSignals(engine, serveDir = SERVE_D) {
+    const manifest = readManifest(engine, serveDir);
+    return (manifest && manifest.metric_signals) || {};
+}
+
+/**
  * The engine's Tier-1 capability map (ADR-010), with each capability's env var
  * already prefixed. Tier 1 is the minimal set MLCC computes and injects (model,
  * tensor-parallel degree, LoRA + companions); everything else is Tier-2 prefix

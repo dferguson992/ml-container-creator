@@ -176,46 +176,63 @@ Default when no `--threshold` is specified: all four metrics at 10%.
 
 ---
 
-## Enhanced GPU & Engine Metrics (v1.7)
+## GPU & Engine Metrics
 
-Beyond the core AIPerf benchmark metrics (throughput, latency, TTFT, ITL), MLCC can
-collect GPU utilization, KV cache usage, queue depth, and prefix cache hit rate from
-your running endpoint and record them alongside benchmark results in Athena.
+Beyond the client-side AIPerf numbers (throughput, latency, TTFT, ITL), every
+benchmark row carries GPU utilization, KV-cache usage, queue depth and prefix-cache
+hit rate for the **measured load window**, read from the AWS-native metrics store of
+the deployment target. Collection is non-fatal: a signal with no samples is `NULL`
+in Athena (never `0`), and a metrics failure never fails the benchmark.
 
-Collection works in two phases. Both are non-fatal — missing metrics produce `null`
-Athena values; they never block the benchmark from completing.
+Where the numbers come from is declared, not hardcoded:
 
-### Phase 1 — CloudWatch OTel (realtime-inference, all engines)
+- the store, label selector and dashboard: `observability` in
+  `templates/do/targets.d/<target>/manifest.json`;
+- the engine metric names: `metric_signals` in
+  `templates/code/serve.d/<engine>/manifest.json` (vLLM and SGLang today; other
+  engines get the DCGM GPU signals only).
 
-SageMaker AI detailed observability forwards native vLLM and SGLang engine metrics to
-CloudWatch via an AWS-managed OTel collector. After a benchmark run completes,
-`do/benchmark` queries these metrics via SigV4-authenticated PromQL at
-`monitoring.<region>.amazonaws.com` and writes them to Athena.
+| Target | Store | How MLCC reads it | `metrics_source` |
+|---|---|---|---|
+| `realtime-inference` | SageMaker AI detailed observability (CloudWatch) | PromQL at `https://monitoring.<region>.amazonaws.com/api/v1/query`, SigV4 `monitoring` | `cloudwatch_only` |
+| `hyperpod-eks` | HyperPod observability add-on → Amazon Managed Service for Prometheus | PromQL at the add-on's AMP workspace, SigV4 `aps`, all pods | `amp` |
+| `hyperpod-eks` (no add-on / no series) | — | opt-in port-forward `/metrics` scrape (fallback) | `engine_metrics_only` |
+| `eks` | — | opt-in port-forward `/metrics` scrape | `engine_metrics_only` |
+| any | both a store and the scrape contributed | | `both` |
+| any | nothing collected | | `none` |
 
-**What gets collected:**
+### The run window
 
-| Athena column | OTel metric | Notes |
-|---|---|---|
-| `gpu_utilization_avg` / `_max` | `DCGM_FI_DEV_GPU_UTIL` | Available on all GPU endpoints |
-| `gpu_memory_util_avg` | `DCGM_FI_DEV_MEM_COPY_UTIL` | GPU memory copy utilization |
-| `kv_cache_util_avg` | `KVCacheUtilization` | vLLM + SGLang only |
-| `queue_depth_waiting_avg` | `QueueDepth` | Requests waiting in queue |
-| `metrics_source` | — | Provenance: `cloudwatch` / `engine_metrics` / `both` / `none` |
+Every query is evaluated at the end of the window that load actually ran, per
+concurrency level:
 
-`prefix_cache_hit_rate` is **not** available via CloudWatch — Phase 2 only (see below).
+1. `start_time` / `end_time` from that level's AIPerf `profile_export_aiperf.json`
+   (AIPerf writes them as UTC ISO timestamps);
+2. else `DescribeAIBenchmarkJob` `StartTime` / `EndTime` (wider: includes job
+   provisioning);
+3. else the time `do/benchmark` created and saw the job finish.
 
-#### Prerequisites
+A concurrency sweep keeps each level's AIPerf aggregate, child job name and scrape
+sidecars, so every row gets its own window, `benchmark_job_name` and signals.
+`./do/benchmark --status` (completing a job that was interrupted) gets the same
+window from the downloaded results or the job's times. Gauges are averaged (and
+maxed) over the window; queue depth is summed across series; prefix-cache hit rate and
+speculative-decoding acceptance are `increase(hits) / increase(queries)` over the
+window, never lifetime counters. The PromQL range limit caps a window at 24 h.
 
-**1. Enable account-level OTel enrichment** (one-time per account/region):
+### realtime-inference
 
-```bash
-aws cloudwatch start-otel-enrichment --region <your-region>
-```
+SageMaker AI detailed observability publishes the container's Prometheus metrics and
+per-GPU DCGM metrics to CloudWatch under their **raw names** (`vllm:kv_cache_usage_perc`,
+`vllm:num_requests_waiting`, `vllm:prefix_cache_hits_total`, `DCGM_FI_DEV_GPU_UTIL`, ...),
+labelled with `aws.sagemaker.endpoint.name`, `aws.sagemaker.variant.name` and
+`aws.sagemaker.inference_component.name`. MLCC selects them with
+`{__name__="vllm:...", 'aws.sagemaker.endpoint.name'="<endpoint>", ...}`.
 
-**2. Make sure detailed observability is on for the endpoint config** —
-`MetricsConfig.EnableDetailedObservability` [defaults to true](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_MetricsConfig.html)
-for endpoint configs created after June 17, 2026, so a fresh `./do/deploy` needs no extra
-setting. Older endpoint configs default to false; redeploy to get a new config:
+`MetricsConfig.EnableDetailedObservability`
+[defaults to true](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_MetricsConfig.html)
+for endpoint configs created after June 17, 2026, so a fresh `./do/deploy` needs no
+extra setting. Older endpoint configs default to false; redeploy to get a new config:
 
 ```bash
 aws sagemaker describe-endpoint-config --endpoint-config-name <config-name> \
@@ -223,29 +240,13 @@ aws sagemaker describe-endpoint-config --endpoint-config-name <config-name> \
 ./do/deploy   # only if the query above prints false or None
 ```
 
-**3. Run a benchmark** — metrics are collected after the job completes:
+Account-level OTel enrichment (`aws cloudwatch start-otel-enrichment`) is **not**
+needed: the detailed-observability series flow with it stopped. It only mirrors
+classic-only metrics into OTel.
 
-```bash
-./do/benchmark --workload multi-turn-chat
-```
-
-#### Verifying Phase 1 is working
-
-Check the `metrics_source` field in the result:
-
-```bash
-cat benchmarks/*/output/profile_export.jsonl | python3 -c "
-import sys, json
-for line in sys.stdin:
-    r = json.loads(line)
-    keys = ['gpu_utilization_avg', 'kv_cache_util_avg', 'queue_depth_waiting_avg', 'metrics_source']
-    print({k: r.get(k) for k in keys})
-"
-```
-
-- `metrics_source: "cloudwatch"` + non-null values → Phase 1 working ✅
-- `metrics_source: "none"` → OTel enrichment not enabled, endpoint not redeployed, or
-  detailed observability not yet collecting (can take a few minutes after first deploy)
+The default `MetricPublishFrequencyInSeconds` is 60 s, so a run shorter than a few
+minutes has few samples per signal. Use a workload with at least ~3 minutes of load
+when you want these columns populated.
 
 !!! note "BYOC metrics path"
     For custom (BYOC) containers, SageMaker scrapes Prometheus metrics at the default path
@@ -258,64 +259,93 @@ for line in sys.stdin:
     `ContainerDefinition`). `CreateEndpointConfig` has no `ContainerMetricsConfig` option,
     and the port is always 8080.
 
----
+### hyperpod-eks
 
-### Phase 2 — Engine `/metrics` scrape (HyperPod EKS, opt-in)
+When the `amazon-sagemaker-hyperpod-observability` EKS add-on is installed, MLCC reads
+the AMP workspace named in the add-on configuration (`ampWorkspace.prometheusEndpoint`)
+after the run. vLLM series are selected by `resource_name="<PROJECT_NAME>"` and
+`namespace`; DCGM series by `container="<PROJECT_NAME>"`. This covers **every pod of the
+deployment**; histograms there are classic (`_bucket` + `le`). It needs no port-forward
+and no opt-in.
 
-For HyperPod EKS deployments, you can additionally scrape the engine's Prometheus
-`/metrics` endpoint directly (port-forwarded from the serving pod) to collect raw
-vLLM/SGLang gauges — including `prefix_cache_hit_rate`, which is not available via
-CloudWatch.
-
-**Enable in `do/config`:**
+Without the add-on (or when it has no series for the run), the engine scrape is the
+fallback. Enable it in `do/config`:
 
 ```bash
 export HP_BENCHMARK_METRICS_ENABLED=true
 ```
 
-**What gets collected (additive to Phase 1):**
+### Engine `/metrics` scrape (fallback; `eks`, `hyperpod-eks`)
 
-| Athena column | vLLM metric | SGLang metric |
-|---|---|---|
-| `kv_cache_util_avg` | `vllm:kv_cache_usage_perc` | `sglang:token_usage` |
-| `prefix_cache_hit_rate` | computed from `prefix_cache_queries` + `prefix_cache_hits` | `sglang:cache_hit_rate` |
-| `queue_depth_waiting_avg` | `vllm:num_requests_waiting` | `sglang:num_queue_reqs` |
+With `HP_BENCHMARK_METRICS_ENABLED=true`, `do/benchmark` port-forwards **every Running
+pod** of the deployment (up to 8) and samples the engine's metrics endpoint (path and
+port from the serve manifest's `metrics_endpoint`) every 5 s for the whole run. Each pod
+writes its own sidecar, `benchmarks/<job>/gpu_metrics-c<level>-<pod>.json`; the writer
+merges them per level (queue depth summed across pods, utilization averaged). The scrape
+has no GPU series, so `gpu_*` columns stay `NULL` on scrape-only rows.
+`benchmarks/.last_gpu_metrics.json` is a display copy for `./do/benchmark --gpu-metrics`
+only; it is never written to Athena.
 
-When both phases run, `metrics_source` is `"both"`. Phase 2 values override Phase 1
-for overlapping columns when non-null.
+### Other benchmark columns the writer fills
 
----
+| Column | Source |
+|---|---|
+| `error_rate` | AIPerf `request_error_rate` (a percent in AIPerf; stored as 0–1), else errored records / total records from `profile_export.jsonl`. `0.0` for an all-success run, `NULL` when unknown. |
+| `gpu_count`, `gpu_type`, `gpu_memory_gb` | the instance catalog the generator copies to `.mlcc/instances.json` |
+| `benchmark_job_name` | the managed benchmark job (per level in a sweep), so `--set-baseline` / `--compare-baseline` can find the row |
 
-### HyperPod EKS — Phase 1 gap
+### IAM actions
 
-Phase 1 (CloudWatch OTel) currently only applies to `realtime-inference` endpoints. HyperPod
-EKS deployments go through the `InferenceEndpointConfig` CRD operator, which provisions the
-underlying compute outside of the standard `CreateEndpointConfig` path — so the
-detailed-observability defaults that realtime-inference endpoint configs get don't apply here.
+| Action | Used for |
+|---|---|
+| `cloudwatch:GetMetricData`, `cloudwatch:ListMetrics` | realtime PromQL queries and the per-copy concurrency readout |
+| `aps:QueryMetrics` | HyperPod AMP queries |
+| `sagemaker:DescribeCluster`, `eks:DescribeAddon` | finding the AMP workspace |
+| `sagemaker:DescribeAIBenchmarkJob` | the run window fallback and the endpoint / IC behind a job |
+| `grafana:ListWorkspaces` | the HyperPod dashboard pointer (`do/metrics`, `do/status`) |
 
-**What this means in practice:**
-- HyperPod EKS benchmarks rely on **Phase 2 only** for engine metrics: set `HP_BENCHMARK_METRICS_ENABLED=true` in `do/config`.
-- `gpu_utilization_avg`, `kv_cache_util_avg`, and `queue_depth_waiting_avg` will be `null` on HyperPod EKS unless Phase 2 is enabled.
-- `prefix_cache_hit_rate` requires Phase 2 on both targets.
+All of these are read-only. A missing permission leaves the affected columns `NULL`
+with one warning per run.
 
----
+### Live readout: `do/metrics`
 
-### Athena columns added in v1.7
+`./do/metrics` prints the same signals for a deployed endpoint over the last N minutes,
+plus a pointer to the native dashboard:
+
+```bash
+./do/metrics                 # last 15 minutes
+./do/metrics --window 60     # last hour (1-1440)
+./do/metrics --json          # machine-readable
+```
+
+It shows server-side TTFT and end-to-end latency p50/p99, queue waiting avg/max,
+running avg, KV-cache avg/max, GPU utilization avg and, on `realtime-inference`,
+per-copy concurrency (CloudWatch `ConcurrentRequestsPerCopy`). A signal with no samples
+prints `no data`. The dashboard pointer is the CloudWatch console path (Insights →
+SageMaker AI) for `realtime-inference`, and the Amazon Managed Grafana workspace URL for
+`hyperpod-eks` when the add-on names one that exists (else the AMP workspace id). Targets
+without a store (`eks`, `async-inference`, `batch-transform`) print a skip notice and
+exit 0. `./do/status` shows the same dashboard pointer as one line, and inference
+component copies as `current/desired`.
+
+### Athena columns
 
 | Column | Type | Description |
 |---|---|---|
-| `gpu_utilization_avg` | DOUBLE | Average GPU compute utilization (%) over benchmark window |
+| `gpu_utilization_avg` | DOUBLE | Average GPU compute utilization (%) over the run window |
 | `gpu_utilization_max` | DOUBLE | Peak GPU compute utilization (%) |
 | `gpu_memory_util_avg` | DOUBLE | Average GPU memory copy utilization (%) |
+| `gpu_memory_used_avg_gb` | DOUBLE | Average GPU framebuffer used (GiB; DCGM reports MiB) |
 | `kv_cache_util_avg` | DOUBLE | Average KV cache utilization (0–1) |
 | `kv_cache_util_max` | DOUBLE | Peak KV cache utilization (0–1) |
-| `prefix_cache_hit_rate` | DOUBLE | Prefix/prompt cache hit ratio (0–1); Phase 2 / `/metrics` only |
-| `queue_depth_waiting_avg` | DOUBLE | Average number of waiting requests |
-| `queue_depth_running_avg` | DOUBLE | Average number of actively running requests |
-| `metrics_source` | STRING | `cloudwatch` / `engine_metrics` / `both` / `none` |
+| `prefix_cache_hit_rate` | DOUBLE | Prefix cache hits / queries over the run window (0–1) |
+| `queue_depth_waiting_avg` | DOUBLE | Average number of waiting requests (all pods) |
+| `queue_depth_waiting_max` | DOUBLE | Peak number of waiting requests |
+| `queue_depth_running_avg` | DOUBLE | Average number of running requests (all pods) |
+| `metrics_source` | STRING | `cloudwatch_only` / `amp` / `engine_metrics_only` / `both` / `none` |
 
-These columns are `NULL` for benchmark runs on pre-v1.7 tables and for endpoints where
-neither phase collected data. Run `mcc bootstrap update` to migrate an existing Athena
+These columns are `NULL` for benchmark runs on pre-v1.7 tables and for runs where no
+source returned samples. Run `mcc bootstrap update` to migrate an existing Athena
 table — the CDK stack update adds the columns via Glue `UpdateTable` (idempotent).
 
 ---
@@ -474,11 +504,12 @@ supported — it would write `do/ic/default.conf`, a realtime-inference Inferenc
 artifact that does not apply to a plain-EKS Deployment. On `eks` it prints the
 recommendations and a clear message to edit `do/config` / the eks manifest by hand.
 
-**GPU & engine metrics (opt-in).** Set `HP_BENCHMARK_METRICS_ENABLED=true` to scrape the
-engine's Prometheus `/metrics` during the run and merge the GPU-efficiency columns into
-the Athena record. The Phase-2 poller resolves the cluster via `aws eks
-update-kubeconfig` for a plain-EKS cluster (not the HyperPod `describe-cluster` API), and
-an `eks` run with engine signals is labeled `engine_metrics_only` in `metrics_source`.
+**GPU & engine metrics (opt-in).** `eks` has no AWS-native metrics store, so set
+`HP_BENCHMARK_METRICS_ENABLED=true` to scrape the engine's Prometheus endpoint on every
+Running pod during the run and merge the engine columns into the Athena record (see "Engine `/metrics` scrape" under GPU & Engine Metrics above). The poller
+resolves the cluster via `aws eks update-kubeconfig` for a plain-EKS cluster (not the
+HyperPod `describe-cluster` API), and such a row is labeled `engine_metrics_only` in
+`metrics_source`. `./do/metrics` prints a skip notice on `eks`.
 
 ---
 

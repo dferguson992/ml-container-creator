@@ -559,8 +559,55 @@ def _cost_columns(cost_context, output_tps, model_name, adapter_name, region, is
     return cols, reason, bedrock
 
 
+# BL086 signal column groups (GPU / DCGM vs engine). Shared by enrich_records and
+# _collect_gpu_signals.
+_CW_KEYS = (
+    'gpu_utilization_avg', 'gpu_utilization_max',
+    'gpu_memory_used_avg_gb', 'gpu_memory_util_avg',
+)
+_ENGINE_KEYS = (
+    'kv_cache_util_avg', 'kv_cache_util_max', 'prefix_cache_hit_rate',
+    'queue_depth_running_avg', 'queue_depth_waiting_avg', 'queue_depth_waiting_max',
+)
+
+
+def _error_rate_from_aiperf(value):
+    """AIPerf ``request_error_rate`` → ratio 0-1, or None when unusable.
+
+    AIPerf 0.13 reports it as ``{"unit": "%", "avg": <percent>}`` (verified on
+    live AIPerf output: 1 errored of 100 requests → {"unit": "%", "avg": 1.0}).
+    A bare number or a dict without a percent unit is taken as a ratio.
+    """
+    if isinstance(value, dict):
+        avg = value.get('avg')
+        if not isinstance(avg, (int, float)) or isinstance(avg, bool):
+            return None
+        unit = str(value.get('unit') or '').strip()
+        return float(avg) / 100.0 if unit == '%' else float(avg)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def resolve_error_rate(metric, total_requests):
+    """R3.1: AIPerf ``request_error_rate`` when the level's aggregate has it,
+    else errored records / total records. All-success → 0.0; unknown → None."""
+    explicit = metric.get('error_rate')
+    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+        return float(explicit)
+    from_aiperf = _error_rate_from_aiperf(metric.get('request_error_rate'))
+    if from_aiperf is not None:
+        return from_aiperf
+    if 'error_count' in metric and total_requests and total_requests > 0:
+        try:
+            return float(metric.get('error_count') or 0) / float(total_requests)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def enrich_records(config, results, run_timestamp=None, instance_catalog=None, gpu_metrics=None,
-                   cost_context=None, aiperf_aggregates=None):
+                   cost_context=None, aiperf_aggregates=None, gpu_metrics_by_concurrency=None):
     """Build enriched records from config context and benchmark results.
 
     Each metrics entry becomes one enriched record with all Athena columns populated.
@@ -585,6 +632,9 @@ def enrich_records(config, results, run_timestamp=None, instance_catalog=None, g
             kept in the record's private '_cost_reason').
         aiperf_aggregates: Optional {concurrency | '*': columns} from
             find_aiperf_aggregates() (BL128 R10). Missing → NULL columns.
+        gpu_metrics_by_concurrency: Optional {concurrency: signals} (Wave 9
+            R1.3): per-level signals collected over each level's own window. A
+            level present here uses its own dict instead of ``gpu_metrics``.
 
     Returns:
         list of enriched record dicts (one per concurrency level).
@@ -633,35 +683,35 @@ def enrich_records(config, results, run_timestamp=None, instance_catalog=None, g
     # Get metrics from results
     metrics = results.get('metrics', []) if isinstance(results, dict) else []
 
-    # ── GPU efficiency signals (BL086) ────────────────────────────────────────
-    # Merge collected signals (if any) and derive metrics_source provenance.
-    # The 11 new columns are additive/nullable: absent signals → None (NULL).
-    gpu_metrics = gpu_metrics or {}
-    _CW_KEYS = (
-        'gpu_utilization_avg', 'gpu_utilization_max',
-        'gpu_memory_used_avg_gb', 'gpu_memory_util_avg',
-    )
-    _ENGINE_KEYS = (
-        'kv_cache_util_avg', 'kv_cache_util_max', 'prefix_cache_hit_rate',
-        'queue_depth_running_avg', 'queue_depth_waiting_avg', 'queue_depth_waiting_max',
-    )
-    gpu_columns = {k: gpu_metrics.get(k) for k in (_CW_KEYS + _ENGINE_KEYS)}
+    # ── GPU efficiency signals (BL086; per level since Wave 9 R1.3) ───────────
+    # The 11 BL086 columns are additive/nullable: absent signals → None (NULL).
+    by_level = gpu_metrics_by_concurrency or {}
 
-    # Provenance: honor an explicit metrics_source from the caller, else derive
-    # from which signal groups actually contributed.
-    metrics_source = gpu_metrics.get('metrics_source')
-    if metrics_source is None:
-        _has_cw = any(gpu_metrics.get(k) is not None for k in _CW_KEYS)
-        _has_engine = any(gpu_metrics.get(k) is not None for k in _ENGINE_KEYS)
-        if _has_cw and _has_engine:
-            metrics_source = 'both'
-        elif _has_cw:
-            metrics_source = 'cloudwatch'
-        elif _has_engine:
-            metrics_source = 'engine_metrics'
-        else:
-            metrics_source = 'none'
-    gpu_columns['metrics_source'] = metrics_source
+    def _gpu_columns_for(level):
+        signals = by_level.get(level) if level in by_level else (gpu_metrics or {})
+        signals = signals or {}
+        cols = {k: signals.get(k) for k in (_CW_KEYS + _ENGINE_KEYS)}
+        # Provenance: honor an explicit metrics_source from the caller, else
+        # derive from which signal groups actually contributed.
+        source = signals.get('metrics_source')
+        if source is None:
+            _has_cw = any(signals.get(k) is not None for k in _CW_KEYS)
+            _has_engine = any(signals.get(k) is not None for k in _ENGINE_KEYS)
+            if _has_cw and _has_engine:
+                source = 'both'
+            elif _has_cw:
+                source = 'cloudwatch'
+            elif _has_engine:
+                source = 'engine_metrics'
+            else:
+                source = 'none'
+        cols['metrics_source'] = source
+        # Collected value for a column whose schema entry 9B owns (R10.2): put in
+        # the record so a schema that declares it persists it; a schema that does
+        # not simply ignores the key.
+        if signals.get('spec_decode_acceptance_rate') is not None:
+            cols['spec_decode_acceptance_rate'] = signals['spec_decode_acceptance_rate']
+        return cols
 
     # Helper: unwrap aiperf metric dicts to scalar values
     # Derived metrics: {'unit': 'requests/sec', 'avg': 9.57} → 9.57
@@ -676,8 +726,11 @@ def enrich_records(config, results, run_timestamp=None, instance_catalog=None, g
         concurrency = scalar(metric.get('concurrency', 0))
         throughput_rps = scalar(metric.get('request_throughput', 0.0))
         tokens_per_second = scalar(metric.get('output_token_throughput', 0.0))
-        error_count = metric.get('error_count', 0)
-        total_requests = scalar(metric.get('total_requests', 0))
+        total_requests = scalar(metric.get('total_requests', metric.get('request_count', 0)))
+        try:
+            gpu_columns = _gpu_columns_for(int(concurrency))
+        except (TypeError, ValueError):
+            gpu_columns = _gpu_columns_for(None)
         duration_seconds = scalar(metric.get('duration_seconds', 0), stat='avg')
         input_tokens_mean = metric.get('input_tokens_mean', 0)
         output_tokens_mean = metric.get('output_tokens_mean', 0)
@@ -686,11 +739,12 @@ def enrich_records(config, results, run_timestamp=None, instance_catalog=None, g
         ttft = metric.get('time_to_first_token', {})
         itl = metric.get('inter_token_latency', {})
 
-        # Error rate
-        error_rate = (error_count / total_requests) if total_requests > 0 else 0.0
+        # Error rate (R3.1): AIPerf request_error_rate, else errored/total; None
+        # (NULL) when neither is known — never a fabricated 0.0.
+        error_rate = resolve_error_rate(metric, total_requests)
 
         # Status based on error rate
-        if error_rate >= 1.0:
+        if error_rate is not None and error_rate >= 1.0:
             status = 'failed'
         else:
             status = 'completed'
@@ -786,7 +840,9 @@ def enrich_records(config, results, run_timestamp=None, instance_catalog=None, g
             'cost_per_1m_tokens': cost_cols['cost_per_1m_tokens'],
             'benchmark_duration_sec': metric.get('benchmark_duration_sec', duration_seconds),
             'run_type': run_type,
-            'benchmark_job_name': results.get('job_name', '') if isinstance(results, dict) else '',
+            # R5.1: a sweep level carries its own child job name; else the run's.
+            'benchmark_job_name': (metric.get('benchmark_job_name')
+                                   or (results.get('job_name', '') if isinstance(results, dict) else '')),
             'run_name': results.get('run_name', '') if isinstance(results, dict) else '',
             'mcc_version': mcc_version,
             'run_timestamp': run_timestamp.isoformat(),
@@ -797,7 +853,8 @@ def enrich_records(config, results, run_timestamp=None, instance_catalog=None, g
             # Wave 9: BL128 aggregates, spec-decode acceptance (R10.2), cost
             # inputs (R8.3) and the Bedrock comparison (R9.4).
             **aiperf_cols,
-            'spec_decode_acceptance_rate': gpu_metrics.get('spec_decode_acceptance_rate'),
+            # Per-level value (Wave 9 R1.3 / R2.4 window ratio); None → NULL.
+            'spec_decode_acceptance_rate': gpu_columns.get('spec_decode_acceptance_rate'),
             **cost_cols,
             # Private (not a Parquet column): feeds the printed cost summary.
             '_cost_reason': cost_reason,
@@ -1159,7 +1216,7 @@ def load_instance_catalog():
     """Load the instance catalog from the project-local .mlcc cache or the MLCC source tree.
 
     Resolution order:
-    1. <project_root>/.mlcc/instance-sizer-catalog.json  (populated by catalog_registration.py)
+    1. <project_root>/.mlcc/instances.json  (copied by src/app.js at generate time)
     2. <mlcc_source>/servers/lib/catalogs/instances.json (fallback for dev/test environment)
 
     Returns:
@@ -1167,8 +1224,10 @@ def load_instance_catalog():
     """
     this_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # 1. Project-local .mlcc cache: do/lib/python/ → do/ → project_root → .mlcc/
-    project_root = os.path.normpath(os.path.join(this_dir, '..', '..'))
+    # 1. Project-local .mlcc cache. This writer lives at
+    #    <project>/do/.benchmark_writer.py, so the project root is ONE level up
+    #    (R4.1: the old '..', '..' resolved past it and never found the file).
+    project_root = os.path.dirname(this_dir)
     mlcc_cache_path = os.path.join(project_root, '.mlcc', 'instances.json')
     try:
         with open(mlcc_cache_path, 'r') as f:
@@ -1180,7 +1239,7 @@ def load_instance_catalog():
     except (FileNotFoundError, json.JSONDecodeError, IOError):
         pass
 
-    # 2. MLCC source tree fallback (dev/test: templates/do/ → project root → servers/)
+    # 2. MLCC source tree fallback (dev/test: templates/do/ → templates/ → repo root)
     source_root = os.path.normpath(os.path.join(this_dir, '..', '..'))
     catalog_path = os.path.join(source_root, 'servers', 'lib', 'catalogs', 'instances.json')
     try:
@@ -1349,10 +1408,17 @@ def _parse_jsonl_to_metrics(jsonl_path, concurrency=None):
     output_tps = []
     start_times = []
     end_times = []
+    # R3: AIPerf marks a failed request with a top-level `error` object
+    # ({type, message, cause_chain}); successful records omit it. Errored
+    # records carry no latency metrics, so the latency stats below already
+    # exclude them.
+    error_count = 0
 
     for rec in records:
         meta = rec.get('metadata', {})
         metrics = rec.get('metrics', {})
+        if rec.get('error') is not None:
+            error_count += 1
 
         lat = _get_val(metrics, 'request_latency')
         if lat is not None:
@@ -1426,6 +1492,7 @@ def _parse_jsonl_to_metrics(jsonl_path, concurrency=None):
         'output_token_throughput': token_throughput,
         'total_token_throughput': (total_out_tokens + sum(input_tokens)) / duration_s if input_tokens else token_throughput,
         'total_requests': n,
+        'error_count': error_count,
         'request_count': n,
         'duration_seconds': duration_s,
         'time_to_first_token': {
@@ -1478,113 +1545,262 @@ def _parse_jsonl_to_metrics(jsonl_path, concurrency=None):
 # ── Command: write ────────────────────────────────────────────────────────────
 
 
-def _collect_gpu_signals(args, input_data):
-    """Assemble GPU efficiency signals for the benchmark record (BL086).
+# ── Wave 9 (R1, R6): per-level run window + store / scrape signals ───────────
 
-    Combines two sources (both non-fatal — any failure contributes no signals):
-      * CloudWatch (Phase 1): via gpu_metrics.collect_cloudwatch(), when the
-        endpoint name and run window are supplied.
-      * Engine /metrics (Phase 2): pre-collected JSON from --gpu-metrics-file,
-        produced by do/benchmark's port-forward scrape on HyperPod EKS.
+# metrics_source provenance, keyed by the target descriptor's
+# observability.store value (not by target name): which source contributed.
+_STORE_PROVENANCE = {'cloudwatch-promql': 'cloudwatch_only', 'amp': 'amp'}
+_SCRAPE_PROVENANCE = 'engine_metrics_only'
 
-    Returns a merged dict of signals plus a derived 'metrics_source' provenance
-    value. Provenance is target-aware, distinguishing "not collected" from
-    "structurally not applicable" for the deployment target:
-      * cloudwatch_only     — realtime-inference: Phase 1 collected, Phase 2 N/A.
-      * engine_metrics_only — hyperpod-eks: Phase 2 collected, Phase 1 N/A.
-      * both                — collected from both sources.
-      * none                — attempted both/neither, got nothing.
-    Never raises.
+_GM_MODULE = None
+# Window sources used by this write (printed once, R1.2).
+_WINDOW_SOURCES = set()
+_JOB_DESCRIPTIONS = {}
+
+
+def _load_gpu_metrics():
+    """Import do/lib/python/gpu_metrics.py (sibling lib of this writer)."""
+    global _GM_MODULE
+    if _GM_MODULE is None:
+        import importlib.util as _ilu
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib', 'python', 'gpu_metrics.py')
+        spec = _ilu.spec_from_file_location('gpu_metrics', path)
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _GM_MODULE = mod
+    return _GM_MODULE
+
+
+def _parse_time(value):
+    """AIPerf / ISO / epoch timestamp → aware UTC datetime, or None.
+
+    AIPerf 0.13 writes ``start_time``/``end_time`` as naive ISO strings in UTC
+    (verified: job created 15:22 EDT, start_time 19:25 UTC). Epoch numbers are
+    accepted in s / ms / us / ns by magnitude. Datetimes pass through.
     """
-    from datetime import datetime as _dt
-
-    signals = {}
-
-    # ── Phase 1: CloudWatch enrichment (all engines/targets) ───────────────
-    endpoint_name = getattr(args, 'endpoint_name', None)
-    run_start = getattr(args, 'run_start', None)
-    run_end = getattr(args, 'run_end', None)
-    if endpoint_name and run_start and run_end:
+    if value is None or value == '':
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        v = float(value)
+        if v > 1e17:      # nanoseconds
+            v /= 1e9
+        elif v > 1e14:    # microseconds
+            v /= 1e6
+        elif v > 1e11:    # milliseconds
+            v /= 1e3
         try:
-            import importlib.util as _ilu
-            _gm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib', 'python', 'gpu_metrics.py')
-            if not os.path.exists(_gm_path):
-                # do/ layout: this file lives in do/, helper in do/lib/python/
-                _gm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib', 'python', 'gpu_metrics.py')
-            _spec = _ilu.spec_from_file_location('gpu_metrics', _gm_path)
-            _gm = _ilu.module_from_spec(_spec)
-            _spec.loader.exec_module(_gm)
+            return datetime.fromtimestamp(v, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+        except ValueError:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return None
 
-            start_dt = _dt.fromisoformat(run_start.replace('Z', '+00:00'))
-            end_dt = _dt.fromisoformat(run_end.replace('Z', '+00:00'))
-            region = input_data.get('region', os.environ.get('AWS_REGION', ''))
 
-            cw = _gm.collect_cloudwatch(
-                endpoint_name,
-                getattr(args, 'variant_name', None) or 'AllTraffic',
-                getattr(args, 'ic_name', None) or '',
-                start_dt,
-                end_dt,
-                region,
-            )
-            if isinstance(cw, dict):
-                signals.update(cw)
-        except Exception:
-            pass  # Non-fatal: no CloudWatch signals.
+def level_artifacts(results_path, concurrency):
+    """Locate a level's AIPerf aggregate JSON and child job name (if any).
 
-    # ── Phase 2: engine /metrics (pre-collected JSON from bash scrape) ─────
+    * Sweep: ``<dir>/results-concurrency-<L>.json`` and ``<dir>/job-concurrency-<L>.txt``
+      (written by do/benchmark's per-level copy step).
+    * Single level: the sibling ``profile_export_aiperf.json`` of the JSONL, or
+      the results file itself when it IS the AIPerf aggregate.
+    Returns ``(aiperf_path_or_None, job_name_or_None)``.
+    """
+    if not results_path:
+        return None, None
+    d = os.path.dirname(os.path.abspath(results_path))
+    aiperf, job = None, None
+    try:
+        level = int(concurrency) if concurrency is not None else None
+    except (TypeError, ValueError):
+        level = None
+    if level is not None:
+        per_level = os.path.join(d, f'results-concurrency-{level}.json')
+        if os.path.isfile(per_level):
+            aiperf = per_level
+        try:
+            with open(os.path.join(d, f'job-concurrency-{level}.txt'), encoding='utf-8') as f:
+                job = f.read().strip() or None
+        except OSError:
+            job = None
+    if aiperf is None:
+        if results_path.endswith('.jsonl'):
+            sibling = os.path.join(d, 'profile_export_aiperf.json')
+            aiperf = sibling if os.path.isfile(sibling) else None
+        elif os.path.basename(results_path) == 'profile_export_aiperf.json':
+            aiperf = results_path
+    return aiperf, job
+
+
+def _load_json_quiet(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def describe_benchmark_job(job_name, region, client=None):
+    """Read-only DescribeAIBenchmarkJob (cached per run); {} on any error."""
+    if not job_name:
+        return {}
+    if job_name in _JOB_DESCRIPTIONS:
+        return _JOB_DESCRIPTIONS[job_name]
+    desc = {}
+    try:
+        if client is None:
+            import boto3
+            client = boto3.client('sagemaker', region_name=region or None)
+        desc = client.describe_ai_benchmark_job(AIBenchmarkJobName=job_name) or {}
+    except Exception:  # noqa: BLE001 — non-fatal: the next window source applies
+        desc = {}
+    _JOB_DESCRIPTIONS[job_name] = desc
+    return desc
+
+
+def resolve_run_window(aiperf_path=None, job_name=None, run_start=None, run_end=None,
+                       region=None, sm_client=None):
+    """R1.2 measured load window, in precedence order:
+
+    1. ``start_time``/``end_time`` of the level's AIPerf aggregate JSON;
+    2. ``DescribeAIBenchmarkJob`` ``StartTime``/``EndTime`` (includes job
+       provisioning, so it is wider than the load);
+    3. the bash ``--run-start/--run-end`` values.
+    Returns ``(start, end, source)``; all None when no source is usable.
+    """
+    if aiperf_path:
+        data = _load_json_quiet(aiperf_path) or {}
+        start, end = _parse_time(data.get('start_time')), _parse_time(data.get('end_time'))
+        if start and end and end > start:
+            return start, end, 'aiperf'
+    if job_name:
+        desc = describe_benchmark_job(job_name, region, sm_client)
+        start, end = _parse_time(desc.get('StartTime')), _parse_time(desc.get('EndTime'))
+        if start and end and end > start:
+            return start, end, 'benchmark-job'
+    start, end = _parse_time(run_start), _parse_time(run_end)
+    if start and end and end > start:
+        return start, end, 'run-start/run-end'
+    return None, None, None
+
+
+def _selector_values(store, args, input_data, job_desc, target):
+    """Role → value for the descriptor selector of this store."""
+    if store == 'cloudwatch-promql':
+        bt = ((job_desc or {}).get('BenchmarkTarget') or {}).get('Endpoint') or {}
+        ics = bt.get('InferenceComponents') or []
+        endpoint = getattr(args, 'endpoint_name', None) or bt.get('Identifier')
+        ic = getattr(args, 'ic_name', None) or (ics[0].get('Identifier') if ics else None)
+        values = {'endpoint': endpoint, 'inference_component': ic}
+        if getattr(args, 'variant_name', None):
+            values['variant'] = args.variant_name
+        return values if endpoint else {}
+    if store == 'amp':
+        namespace = input_data.get('hp_namespace')
+        if not namespace:
+            try:
+                optional = _load_gpu_metrics().target_manifest.read_manifest(target).get('optional_vars', {})
+                namespace = optional.get('HP_NAMESPACE')
+            except Exception:
+                namespace = None
+        deployment = input_data.get('project_name')
+        return {'deployment': deployment, 'namespace': namespace} if deployment else {}
+    return {}
+
+
+def _scrape_signals(args, concurrency):
+    """Engine-scrape fallback: an explicit --gpu-metrics-file, else this level's
+    per-pod sidecars in --gpu-metrics-dir (R6.3). The fixed
+    benchmarks/.last_gpu_metrics.json is never read here."""
+    out = {}
     gpu_metrics_file = getattr(args, 'gpu_metrics_file', None)
     if gpu_metrics_file:
+        data = _load_json_quiet(gpu_metrics_file) or {}
+        out = {k: v for k, v in data.items()
+               if k not in ('error', 'metrics_source', '_counters') and v is not None}
+    gpu_metrics_dir = getattr(args, 'gpu_metrics_dir', None)
+    if not out and gpu_metrics_dir and concurrency is not None:
         try:
-            with open(gpu_metrics_file, 'r') as f:
-                engine_signals = json.load(f)
-            if isinstance(engine_signals, dict):
-                # Only merge recognized numeric signal keys; ignore any error field.
-                for k, v in engine_signals.items():
-                    if k != 'error' and v is not None:
-                        signals[k] = v
+            gm = _load_gpu_metrics()
+            merged = gm.merge_sidecars(gm.sidecar_paths(gpu_metrics_dir, concurrency))
         except Exception:
-            pass  # Non-fatal: no engine signals.
+            merged = {}
+        out = {k: v for k, v in merged.items() if k != 'metrics_source' and v is not None}
+    return out
 
-    # ── Provenance (metrics_source) ────────────────────────────────────────
-    # Distinguish "not collected" from "structurally not applicable" for the
-    # deployment target:
-    #   * cloudwatch_only     — realtime-inference: Phase 1 CloudWatch collected,
-    #     Phase 2 engine /metrics not applicable (no pod access from SMAI).
-    #   * engine_metrics_only — hyperpod-eks: Phase 2 engine /metrics collected,
-    #     Phase 1 CloudWatch not applicable (no OTel path for HyperPod CRD
-    #     endpoints).
-    #   * both                — collected from both sources.
-    #   * none                — attempted both/neither, got nothing.
-    _CW_KEYS = (
-        'gpu_utilization_avg', 'gpu_utilization_max',
-        'gpu_memory_used_avg_gb', 'gpu_memory_util_avg',
-    )
-    _ENGINE_KEYS = (
-        'kv_cache_util_avg', 'kv_cache_util_max', 'prefix_cache_hit_rate',
-        'queue_depth_running_avg', 'queue_depth_waiting_avg', 'queue_depth_waiting_max',
-    )
-    has_cw = any(signals.get(k) is not None for k in _CW_KEYS)
-    has_engine = any(signals.get(k) is not None for k in _ENGINE_KEYS)
 
-    deployment_target = (input_data.get('deployment_target') or '').strip().lower()
+def _has_signal(signals):
+    return any(signals.get(k) is not None
+               for k in (_CW_KEYS + _ENGINE_KEYS + ('spec_decode_acceptance_rate',)))
 
-    if has_cw and has_engine:
+
+def _collect_gpu_signals(args, input_data, concurrency=None, aiperf_path=None, job_name=None):
+    """Assemble GPU + engine signals for one benchmark level (BL086, Wave 9).
+
+    Store (from the target descriptor's ``observability``): realtime queries
+    CloudWatch PromQL, hyperpod-eks queries the add-on's AMP workspace — both
+    over this level's measured window (resolve_run_window). Fallback (when the
+    descriptor declares ``fallback: engine-scrape``): the opt-in port-forward
+    poller sidecars fill any signal the store did not return.
+
+    ``metrics_source`` provenance (table keyed by store, not target name):
+      * cloudwatch_only     — only the CloudWatch PromQL store contributed.
+      * amp                 — only the AMP store contributed.
+      * engine_metrics_only — only the engine scrape contributed.
+      * both                — the store and the scrape both contributed.
+      * none                — nothing was collected.
+    Never raises.
+    """
+    target = (input_data.get('deployment_target') or 'realtime-inference').strip().lower()
+    region = input_data.get('region') or os.environ.get('AWS_REGION', '')
+    try:
+        gm = _load_gpu_metrics()
+        obs = gm.target_manifest.observability(target)
+    except Exception:
+        gm, obs = None, {'store': 'none'}
+    store = obs.get('store', 'none')
+
+    store_signals = {}
+    if gm is not None and store in _STORE_PROVENANCE:
+        job = job_name or getattr(args, 'benchmark_job_name', None)
+        start, end, source = resolve_run_window(
+            aiperf_path, job, getattr(args, 'run_start', None), getattr(args, 'run_end', None), region)
+        need_target = store == 'cloudwatch-promql' and not (
+            getattr(args, 'endpoint_name', None) and getattr(args, 'ic_name', None))
+        job_desc = describe_benchmark_job(job, region) if (job and need_target) else {}
+        values = _selector_values(store, args, input_data, job_desc, target)
+        if values and start is None:
+            print('⚠️  No run window (no AIPerf start/end, job times or --run-start/--run-end); '
+                  'GPU/engine columns stay NULL', file=sys.stderr)
+        elif values:
+            _WINDOW_SOURCES.add(source)
+            try:
+                store_signals, _used = gm.collect_for_target(
+                    target, values, input_data.get('model_server'), start, end, region,
+                    hp_cluster_name=input_data.get('hp_cluster_name'))
+            except Exception:
+                store_signals = {}
+
+    scrape = _scrape_signals(args, concurrency) if obs.get('fallback') == 'engine-scrape' else {}
+
+    signals = dict(scrape)
+    signals.update(store_signals)
+    has_store, has_scrape = _has_signal(store_signals), _has_signal(scrape)
+    if has_store and has_scrape:
         signals['metrics_source'] = 'both'
-    elif deployment_target == 'hyperpod-eks' and has_engine:
-        signals['metrics_source'] = 'engine_metrics_only'
-    elif deployment_target == 'eks' and has_engine:
-        # Plain EKS (BL157): like hyperpod-eks, the Phase-2 poller scrapes the
-        # engine /metrics directly (no CloudWatch OTel path from a plain K8s
-        # Deployment), so an eks run with engine signals is engine_metrics_only.
-        # Without the eks branch an eks run falls through to the default below and
-        # is mislabeled 'none' even when the poller contributed signals.
-        signals['metrics_source'] = 'engine_metrics_only'
-    elif deployment_target == 'realtime-inference' and has_cw and not has_engine:
-        signals['metrics_source'] = 'cloudwatch_only'
+    elif has_store:
+        signals['metrics_source'] = _STORE_PROVENANCE[store]
+    elif has_scrape:
+        signals['metrics_source'] = _SCRAPE_PROVENANCE
     else:
         signals['metrics_source'] = 'none'
-
     return signals
 
 
@@ -1696,6 +1912,36 @@ def _public_records(records):
     return [{k: v for k, v in r.items() if not k.startswith('_')} for r in records]
 
 
+def collect_level_context(args, input_data, metrics, results_path):
+    """Per-level identity, error rate and signals for every metrics entry.
+
+    Mutates each metric in place with ``benchmark_job_name`` (a sweep level's
+    child job, R5.1) and ``request_error_rate`` (from that level's AIPerf JSON,
+    R3.1) when available, and returns ``{concurrency: signals}`` (R1.3).
+    """
+    by_level = {}
+    for metric in metrics or []:
+        if not isinstance(metric, dict):
+            continue
+        conc = metric.get('concurrency')
+        try:
+            level = int(conc.get('avg') if isinstance(conc, dict) else conc)
+        except (TypeError, ValueError):
+            level = None
+        aiperf_path, job = level_artifacts(results_path, level)
+        if job and not metric.get('benchmark_job_name'):
+            metric['benchmark_job_name'] = job
+        if aiperf_path and 'request_error_rate' not in metric:
+            agg = _load_json_quiet(aiperf_path) or {}
+            if agg.get('request_error_rate') is not None:
+                metric['request_error_rate'] = agg['request_error_rate']
+        if level is not None and level not in by_level:
+            by_level[level] = _collect_gpu_signals(args, input_data, level, aiperf_path, job)
+    if _WINDOW_SOURCES:
+        print(f"ℹ️  Metrics window source: {', '.join(sorted(_WINDOW_SOURCES))}", file=sys.stderr)
+    return by_level
+
+
 def cmd_write(args):
     """Validate, enrich, and write benchmark results to S3 as Parquet.
 
@@ -1778,9 +2024,11 @@ def cmd_write(args):
         emit_validation_error(errors)
         return  # Never reached, but explicit
 
-    # ── Collect GPU efficiency signals (BL086) ─────────────────────────────
+    # ── Collect GPU efficiency signals (BL086), per level (Wave 9 R1.3) ────
     # Non-fatal: any collection error yields no signals (metrics_source='none').
-    gpu_signals = _collect_gpu_signals(args, input_data)
+    # Also fills each level's child job name and AIPerf error rate (R3, R5).
+    gpu_by_level = collect_level_context(args, input_data, input_data['metrics'], results_path)
+    gpu_signals = next(iter(gpu_by_level.values())) if len(gpu_by_level) == 1 else {}
 
     # ── Dry-run mode: output enriched records as JSON, skip S3 ──────────────
     if args.dry_run:
@@ -1802,7 +2050,8 @@ def cmd_write(args):
             results_path, getattr(args, 'aiperf_dir', None),
             [m.get('concurrency') for m in input_data['metrics'] if isinstance(m, dict)])
         enriched_records = enrich_records(config_context, results_obj, timestamp, gpu_metrics=gpu_signals,
-                                          cost_context=cost_context, aiperf_aggregates=aiperf_aggs)
+                                          cost_context=cost_context, aiperf_aggregates=aiperf_aggs,
+                                          gpu_metrics_by_concurrency=gpu_by_level)
         cost_lines = _cost_summary(enriched_records)
 
         # Compute intended S3 path (use bucket if provided, else placeholder)
@@ -1832,6 +2081,10 @@ def cmd_write(args):
     results_obj = {'metrics': input_data['metrics']}
     if isinstance(benchmark_data, dict) and 'job_name' in benchmark_data:
         results_obj['job_name'] = benchmark_data['job_name']
+    # R5.1: the write path persists --benchmark-job-name too (previously only the
+    # dry-run path did, so every Athena row had benchmark_job_name = '').
+    if not results_obj.get('job_name') and getattr(args, 'benchmark_job_name', None):
+        results_obj['job_name'] = args.benchmark_job_name
     if getattr(args, 'run_name', None):
         results_obj['run_name'] = args.run_name
 
@@ -1840,7 +2093,8 @@ def cmd_write(args):
         results_path, getattr(args, 'aiperf_dir', None),
         [m.get('concurrency') for m in input_data['metrics'] if isinstance(m, dict)])
     enriched_records = enrich_records(config_context, results_obj, timestamp, gpu_metrics=gpu_signals,
-                                      cost_context=cost_context, aiperf_aggregates=aiperf_aggs)
+                                      cost_context=cost_context, aiperf_aggregates=aiperf_aggs,
+                                      gpu_metrics_by_concurrency=gpu_by_level)
 
     if not enriched_records:
         _error_exit("No records produced from benchmark metrics")
@@ -2023,6 +2277,11 @@ def _load_config_file(config_path):
                     'BASE_IMAGE': 'base_image',
                     'BASE_IMAGE_VERSION': 'base_image_version',
                     'BENCHMARK_CONCURRENCY': 'benchmark_concurrency',
+                    # Wave 9: store lookup inputs (engine metric names, AMP
+                    # discovery, AMP namespace selector).
+                    'MODEL_SERVER': 'model_server',
+                    'HP_CLUSTER_NAME': 'hp_cluster_name',
+                    'HP_NAMESPACE': 'hp_namespace',
                 }
                 # Also capture IC_ENV_* serving config vars
                 ic_env_map = {
@@ -2203,6 +2462,11 @@ def main():
     write_parser.add_argument(
         '--gpu-metrics-file', dest='gpu_metrics_file', default=None,
         help='Path to a JSON file of pre-collected engine /metrics signals (Phase 2 EKS scrape)'
+    )
+    write_parser.add_argument(
+        '--gpu-metrics-dir', dest='gpu_metrics_dir', default=None,
+        help='Directory of THIS run\'s per-pod, per-level scrape sidecars '
+             '(gpu_metrics-c<level>-<pod>.json); merged per level (Wave 9 R6.3)'
     )
 
     args = parser.parse_args()

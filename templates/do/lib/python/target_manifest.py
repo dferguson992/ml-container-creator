@@ -30,6 +30,7 @@ CLI (one-shot, for bash callers):
     adapter_delivery  — prints the JSON object (or {} when the target declares none)
     cluster_contract  — prints the JSON object (or {} when the target declares none)
     pricing           — prints the JSON pricing object (Wave 9 price resolver)
+    observability     — prints the JSON object (Wave 9: store, selector, dashboard ...)
     service_quota_usage — prints the Service Quotas usage suffix (or "")
     resolve           — resolves an alias to its canonical target name
 
@@ -212,6 +213,16 @@ def pricing(target: str, targets_dir: str | None = None) -> dict:
     return dict(read_manifest(target, targets_dir).get("pricing") or {})
 
 
+def observability(target: str, targets_dir: str | None = None) -> dict:
+    """Return the target's observability declaration (Wave 9 R1/R6/R12):
+    {store, histogram_form, selector, gpu_selector, fallback, dashboard,
+    amp_discovery, copy_concurrency}. A target without the block reads as
+    {"store": "none"} so callers degrade to "no store" instead of erroring."""
+    obs = dict(read_manifest(target, targets_dir).get("observability") or {})
+    obs.setdefault("store", "none")
+    return obs
+
+
 def service_quota_usage(target: str, targets_dir: str | None = None) -> str:
     """Return the SageMaker Service Quotas usage suffix for the target's
     instances (e.g. 'endpoint usage'), or '' when capacity is cluster-provided."""
@@ -219,7 +230,7 @@ def service_quota_usage(target: str, targets_dir: str | None = None) -> str:
 # ── CLI one-shot for bash callers ──────────────────────────────────────────────
 
 _ARRAY_FIELDS = {"aliases", "required_vars", "runtime_owned_vars"}
-_OBJECT_FIELDS = {"optional_vars", "verbs", "adapter_delivery", "cluster_contract", "pricing"}
+_OBJECT_FIELDS = {"optional_vars", "verbs", "adapter_delivery", "cluster_contract", "pricing", "observability"}
 _STRING_FIELDS = {
     "target",
     "status_var",

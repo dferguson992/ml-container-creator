@@ -19,6 +19,7 @@
     "runtime_owned_vars",
     "serving_config_source",
     "verbs",
+    "observability",
     "answer_params",
     "pricing"
   ],
@@ -136,14 +137,73 @@
     "verbs": {
       "type": "object",
       "additionalProperties": { "type": "boolean" },
-      "description": "Per-verb applicability for verbs that are target-restricted. true = the verb applies to this target; false = the verb refuses it (exit 3). Only verbs that vary by target need listing (optimize, add-ic, ci, adapter, draft). Verbs with `targets: all` are not listed.",
+      "description": "Per-verb applicability for verbs that are target-restricted. true = the verb applies to this target; false = the verb refuses it (exit 3). Only verbs that vary by target need listing (optimize, add-ic, ci, adapter, draft, metrics). Verbs with `targets: all` are not listed.",
       "properties": {
         "optimize": { "type": "boolean" },
         "add-ic": { "type": "boolean" },
         "ci": { "type": "boolean" },
         "adapter": { "type": "boolean" },
-        "draft": { "type": "boolean" }
+        "draft": { "type": "boolean" },
+        "metrics": { "type": "boolean", "description": "Wave 9 (OQ-9.9): do/metrics applies (the target has an observability store). Must equal observability.store != 'none'. Unlike the other verbs, do/metrics on a target where this is false prints a skip notice with the reason and exits 0 (R12.4) instead of a contract violation." }
       }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["store"],
+      "description": "Wave 9 (R1, R6, R12; ADR-008): where this target's serving metrics live and how to select them, so gpu_metrics.py (benchmark Phase 1 / AMP), endpoint_metrics.py (do/metrics) and do/status derive the store, label selector and dashboard pointer instead of branching on the target name. store cloudwatch-promql: SageMaker AI detailed observability, PromQL at monitoring.<region>.amazonaws.com/api/v1/query (SigV4 monitoring). store amp: the HyperPod observability add-on's Amazon Managed Service for Prometheus workspace (SigV4 aps), discovered via amp_discovery. store none: no AWS-native store; benchmark falls back to the engine scrape when `fallback` says so.",
+      "properties": {
+        "store": { "type": "string", "enum": ["cloudwatch-promql", "amp", "none"] },
+        "histogram_form": {
+          "type": "string",
+          "enum": ["native", "classic"],
+          "description": "native: histograms are OTel exponential (query the bare name). classic: Prometheus _bucket series with an `le` label."
+        },
+        "selector": {
+          "type": "object",
+          "description": "Role -> PromQL label name for the engine series (roles: endpoint, variant, inference_component, deployment, namespace). Values are supplied at query time from the project config.",
+          "additionalProperties": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.]*$" }
+        },
+        "gpu_selector": {
+          "type": "object",
+          "description": "Role -> PromQL label name for the DCGM GPU series, when they carry different labels than the engine series (HyperPod DCGM uses `container`).",
+          "additionalProperties": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.]*$" }
+        },
+        "fallback": {
+          "type": "string",
+          "enum": ["engine-scrape"],
+          "description": "engine-scrape: when the store is absent or returns no series, use the opt-in port-forward /metrics poller sidecars (HP_BENCHMARK_METRICS_ENABLED)."
+        },
+        "dashboard": {
+          "type": "string",
+          "enum": ["sagemaker-ai-insights", "hyperpod-amg"],
+          "description": "The native AWS dashboard do/metrics and do/status point at."
+        },
+        "amp_discovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["addon", "endpoint_key"],
+          "description": "store amp only: the EKS add-on whose configurationValues JSON names the AMP workspace (dotted key path to the Prometheus endpoint URL) and, optionally, the AMG workspace name.",
+          "properties": {
+            "addon": { "type": "string", "minLength": 1 },
+            "endpoint_key": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.]*$" },
+            "amg_name_key": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.]*$" }
+          }
+        },
+        "copy_concurrency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["namespace", "metric", "dimension"],
+          "description": "Classic CloudWatch metric for per-copy concurrency (do/metrics readout), read with GetMetricData.",
+          "properties": {
+            "namespace": { "type": "string", "minLength": 1 },
+            "metric": { "type": "string", "minLength": 1 },
+            "dimension": { "type": "string", "minLength": 1 }
+          }
+        }
+      },
+      "if": { "properties": { "store": { "enum": ["cloudwatch-promql", "amp"] } } },
+      "then": { "required": ["store", "histogram_form", "selector", "dashboard"] }
     },
     "answer_params": {
       "type": "array",

@@ -82,6 +82,25 @@
         "format": { "type": "string", "enum": ["prometheus", "json", "text"] }
       }
     },
+    "metric_signals": {
+      "type": "object",
+      "description": "Wave 9 (R2.1, ADR-008): the engine's Prometheus metric names for the abstract signals MLCC reads, so gpu_metrics.py (Phase 1 CloudWatch PromQL, HyperPod AMP, and the port-forward scrape) and do/metrics derive them instead of hardcoding per-engine names. Keys are MLCC-stable signal names (kv_cache_util, queue_depth_running, queue_depth_waiting, prefix_cache_hit_rate, spec_decode_acceptance_rate, ttft_seconds, e2e_seconds). gauge / counter / histogram signals carry `name` (counters include their `_total` suffix, as exported to CloudWatch and AMP). A `ratio` signal is a counter pair evaluated over the run window (increase(num) / increase(den)), never as a lifetime ratio. Declare only names verified against the engine; an engine without verified names omits the block.",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]*$" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type"],
+        "properties": {
+          "type": { "type": "string", "enum": ["gauge", "counter", "histogram", "ratio"] },
+          "name": { "type": "string", "pattern": "^[a-zA-Z_:][a-zA-Z0-9_:]*$" },
+          "num": { "type": "string", "pattern": "^[a-zA-Z_:][a-zA-Z0-9_:]*$" },
+          "den": { "type": "string", "pattern": "^[a-zA-Z_:][a-zA-Z0-9_:]*$" }
+        },
+        "if": { "properties": { "type": { "const": "ratio" } } },
+        "then": { "required": ["num", "den"], "not": { "required": ["name"] } },
+        "else": { "required": ["name"], "not": { "anyOf": [{ "required": ["num"] }, { "required": ["den"] }] } }
+      }
+    },
     "dimension_map": {
       "type": "object",
       "additionalProperties": { "type": "string", "minLength": 1 },

@@ -1210,7 +1210,9 @@ function _setExecutablePermissions(destDir) {
         'do/validate',
         // Wave 8: do/export was never made executable (`./do/export` failed with
         // "Permission denied" in every generated project).
-        'do/export'
+        'do/export',
+        // Wave 9 (OQ-9.9): serving-metrics readout verb.
+        'do/metrics'
     ];
 
     const shellScripts = defaultScripts;
