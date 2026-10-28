@@ -48,6 +48,8 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${SCRIPT_DIR}/lib/profile.sh"
 source "${SCRIPT_DIR}/lib/aws-preflight.sh"
+# _check_inference_ami (InferenceAmiVersion vs AWS instance-family table, BL209)
+source "${SCRIPT_DIR}/lib/endpoint-config.sh"
 
 # ── Profile-resolved variables (env var > profile > default) ──────────────────
 ROLE_ARN="${ROLE_ARN:-${_PROFILE_roleArn:-}}"
@@ -429,7 +431,10 @@ if [ -z "${SKIP_TO}" ]; then
     # Build production variant JSON (classic: includes ModelName, no execution-role-arn on endpoint config)
     VARIANT_JSON="[{\"VariantName\":\"AllTraffic\",\"ModelName\":\"${MODEL_NAME_SM}\",\"InstanceType\":\"${INSTANCE_TYPE}\",\"InitialInstanceCount\":1"
 
-    # Append InferenceAmiVersion if configured
+    # Append InferenceAmiVersion if configured (warn when AWS does not list it for the family, BL209)
+    if [ -n "${INFERENCE_AMI_VERSION:-}" ] && [ -n "${INSTANCE_TYPE:-}" ]; then
+        _check_inference_ami "${INSTANCE_TYPE}"
+    fi
     if [ -n "${INFERENCE_AMI_VERSION:-}" ]; then
         VARIANT_JSON="${VARIANT_JSON},\"InferenceAmiVersion\":\"${INFERENCE_AMI_VERSION}\""
         echo "   AMI version: ${INFERENCE_AMI_VERSION}"

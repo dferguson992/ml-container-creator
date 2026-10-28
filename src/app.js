@@ -907,6 +907,14 @@ function _writeGenerationParams(destDir, answers) {
             fs.copyFileSync(archSupportSrc, path.join(mlccDir, 'model-arch-support.json'));
         }
 
+        // Copy the AWS InferenceAmiVersion <-> instance-family table (BL209) so
+        // do/lib/python/inference_ami.py (called by do/lib/endpoint-config.sh)
+        // can validate INFERENCE_AMI_VERSION / pools without the MLCC source tree.
+        const fleetDriversSrc = path.join(GENERATOR_ROOT, 'servers', 'lib', 'catalogs', 'fleet-drivers.json');
+        if (fs.existsSync(fleetDriversSrc)) {
+            fs.copyFileSync(fleetDriversSrc, path.join(mlccDir, 'fleet-drivers.json'));
+        }
+
         // Copy serve-engine plugin manifests to .mlcc/serve.d/ so do/draft and
         // do/deploy can read engine capabilities (supported_algorithms,
         // env_var_prefix, dimension_map) at generation and deploy time. The

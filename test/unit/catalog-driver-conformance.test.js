@@ -19,9 +19,12 @@
  *   3. Every GPU model-server image (accelerator.type 'cuda') in
  *      model-servers.json carries min_driver_version; images without it pass
  *      the driver filter unconditionally. CPU images are excluded by data.
- *   4. Every AMI the CUDA_AMI_MAP in src/lib/cuda-resolver.js can produce, and
- *      every inference_ami_version a family entry names, resolves in
+ *   4. Every inference_ami_version a family entry names resolves in
  *      fleet-drivers.json ami_versions.
+ *   5. BL209: every GPU family resolves (resolveInferenceAmi, with every GPU
+ *      image's default AMI) to an AMI AWS lists for that family, and the
+ *      AWS allow-list data (default_families / override_families) is
+ *      self-consistent.
  *
  * Known gaps (GPU images that pre-date min_driver_version) are listed in
  * KNOWN_MISSING_MIN_DRIVER and SKIPPED with a reason rather than given
@@ -34,8 +37,7 @@ import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseInstanceFamily } from '../../servers/lib/image-filter.js';
-import { CUDA_AMI_MAP } from '../../src/lib/cuda-resolver.js';
+import { parseInstanceFamily, resolveInferenceAmi } from '../../servers/lib/image-filter.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CATALOGS = resolve(__dirname, '..', '..', 'servers', 'lib', 'catalogs');
@@ -163,15 +165,6 @@ describe('BL203 catalog driver conformance', () => {
     });
 
     describe('AMI versions resolve in fleet-drivers.json ami_versions', () => {
-        const producible = [...new Set(Object.values(CUDA_AMI_MAP))];
-        for (const ami of producible) {
-            it(`CUDA_AMI_MAP AMI '${ami}' has an ami_versions entry`, () => {
-                const entry = fleet.ami_versions[ami];
-                assert.ok(entry && entry.driver,
-                    `cuda-resolver.js can select '${ami}' but fleet-drivers.json ami_versions has no driver for it`);
-            });
-        }
-
         for (const [family, entry] of Object.entries(fleet.instance_families)) {
             if (!entry || !entry.inference_ami_version) continue;
             it(`family '${family}' inference_ami_version resolves and agrees on driver major`, () => {
@@ -180,6 +173,81 @@ describe('BL203 catalog driver conformance', () => {
                 // The family's driver comes from that AMI, so they must agree on the major.
                 assert.strictEqual(String(entry.driver).split('.')[0], String(ami.driver).split('.')[0],
                     `'${family}' driver ${entry.driver} disagrees with AMI ${entry.inference_ami_version} driver ${ami.driver}`);
+            });
+        }
+    });
+
+    describe('BL209: every GPU family resolves to an AWS-listed AMI', () => {
+        const amiEntries = Object.entries(fleet.ami_versions)
+            .filter(([name, entry]) => !name.startsWith('_') && entry && typeof entry === 'object');
+        const listedFor = (ami) => {
+            const entry = fleet.ami_versions[ami] || {};
+            return [...(entry.default_families || []), ...(entry.override_families || [])];
+        };
+        const driverMajor = (ami) => Number(String(fleet.ami_versions[ami].driver).split('.')[0]);
+        const gpuImageAmis = [...new Set(gpuImages
+            .map(({ img }) => img.defaults && img.defaults.inferenceAmiVersion)
+            .filter(Boolean))];
+
+        it('every AMI entry carries a sourced AWS allow-list', () => {
+            assert.ok(amiEntries.length > 0);
+            for (const [name, entry] of amiEntries) {
+                assert.ok(Array.isArray(entry.default_families) && Array.isArray(entry.override_families),
+                    `${name} needs default_families and override_families (AWS inference-gpu-drivers table)`);
+                assert.ok(entry.default_families.length + entry.override_families.length > 0,
+                    `${name} lists no instance family`);
+                assert.match(String(entry._source || ''), /docs\.aws\.amazon\.com/,
+                    `${name} allow-list must cite the AWS doc in _source`);
+                const both = entry.default_families.filter(f => entry.override_families.includes(f));
+                assert.deepStrictEqual(both, [], `${name} lists ${both} as both default and override`);
+            }
+        });
+
+        it('every GPU image default AMI is a known ami_versions entry', () => {
+            assert.ok(gpuImageAmis.length > 0, 'model-servers.json GPU images should declare a default AMI');
+            for (const ami of gpuImageAmis) {
+                assert.ok(fleet.ami_versions[ami], `GPU image default AMI '${ami}' is not in ami_versions`);
+            }
+        });
+
+        it('no family is the AWS default of two different driver generations', () => {
+            const defaultsByFamily = {};
+            for (const [name, entry] of amiEntries) {
+                for (const fam of entry.default_families) {
+                    (defaultsByFamily[fam] = defaultsByFamily[fam] || new Set()).add(driverMajor(name));
+                }
+            }
+            for (const [fam, majors] of Object.entries(defaultsByFamily)) {
+                assert.strictEqual(majors.size, 1,
+                    `family '${fam}' is the default of AMIs with driver majors ${[...majors]} — one AWS row only`);
+            }
+        });
+
+        for (const [family, entry] of Object.entries(fleet.instance_families)) {
+            if (!entry || !entry.inference_ami_version) continue;
+            it(`family '${family}' inference_ami_version is its AWS default AMI`, () => {
+                const ami = fleet.ami_versions[entry.inference_ami_version];
+                assert.ok(ami && (ami.default_families || []).includes(family),
+                    `'${family}' names ${entry.inference_ami_version} but that AMI does not list it as a default family`);
+            });
+        }
+
+        for (const family of gpuFamilies) {
+            const type = gpuInstanceTypes.find(([t]) => parseInstanceFamily(t) === family)[0];
+            it(`GPU family '${family}' resolves to an AWS-listed AMI for every GPU image default`, () => {
+                const allowed = amiEntries.filter(([name]) => listedFor(name).includes(family)).map(([name]) => name);
+                assert.ok(allowed.length > 0,
+                    `AWS lists no InferenceAmiVersion for '${family}' in fleet-drivers.json ami_versions`);
+                for (const imageAmi of gpuImageAmis) {
+                    const res = resolveInferenceAmi({ instanceType: type, imageAmi });
+                    assert.strictEqual(res.error, null);
+                    assert.ok(res.ami, `${type} with image AMI ${imageAmi} resolved to no AMI`);
+                    assert.ok(allowed.includes(res.ami),
+                        `${type} resolved to ${res.ami}, which AWS does not list for '${family}' (allowed: ${allowed})`);
+                    if (allowed.includes(imageAmi)) {
+                        assert.strictEqual(res.ami, imageAmi, 'an AWS-listed image default must be kept');
+                    }
+                }
             });
         }
     });
