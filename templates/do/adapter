@@ -619,7 +619,7 @@ if [ -n "${_ADAPTER_USE_VLLM_HOTLOAD}" ]; then
                 # A full_model from ANY source is refused (it is not hot-loadable
                 # as a LoRA); an UNKNOWN kind degrades to a content sniff.
                 _guard_artifact_kind "${RESOLVED_KIND}" "$(_additive_accepts_kind adapter)" \
-                    "A full fine-tuned model cannot be hot-loaded as a LoRA adapter. Full models aren't servable on ${DEPLOYMENT_TARGET} yet (do/add-pod, BL149, is deferred) — deploy it on realtime-inference with do/add-ic <name> --from-weights s3://..."
+                    "A full fine-tuned model cannot be hot-loaded as a LoRA adapter. $(_additive_kind_guidance full_model "${DEPLOYMENT_TARGET}")"
                 if [ -z "${RESOLVED_KIND}" ]; then
                     # Best-effort (never blocks): adapter_config.json ⇒ lora_adapter.
                     if [ "$(_additive_sniff_kind "${WEIGHTS_URI}")" = "lora_adapter" ]; then
@@ -676,8 +676,8 @@ if [ -n "${_ADAPTER_USE_VLLM_HOTLOAD}" ]; then
                 echo "  ./do/adapter update ectsum --from-weights s3://my-bucket/adapters/ectsum-v2/"
                 echo "  ./do/adapter remove ectsum"
                 echo ""
-                echo "A full fine-tuned model is refused here (not a LoRA). Full models on a cluster"
-                echo "are not supported yet (do/add-pod is deferred); use realtime-inference + do/add-ic."
+                echo "A full fine-tuned model is refused here (not a LoRA)."
+                echo "$(_additive_kind_guidance full_model "${DEPLOYMENT_TARGET:-}")"
                 echo ""
                 echo "Deprecated (still accepted, prints a notice):"
                 echo "  --weights s3://...                      → --from-weights s3://..."
@@ -1392,7 +1392,8 @@ _adapter_add() {
     fi
 
     # ── ADR-013 kind gate guidance (shared by every source below) ──────────
-    local _kind_guidance="A full fine-tuned model cannot be hot-loaded as a LoRA adapter — use do/add-ic <name> --from-tune (realtime) instead; full models on a cluster (do/add-pod) are not supported yet."
+    local _kind_guidance
+    _kind_guidance="A full fine-tuned model cannot be hot-loaded as a LoRA adapter. $(_additive_kind_guidance full_model "${DEPLOYMENT_TARGET:-}")"
     local _resolved_kind=""
 
     # ── Resolve --from-tune to weights_uri (shared resolver) ──────────────

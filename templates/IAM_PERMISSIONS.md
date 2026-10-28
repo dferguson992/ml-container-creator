@@ -71,6 +71,28 @@ If you use a custom role (`--role-arn`), ensure it has at minimum:
 
 Trust policy must allow `sagemaker.amazonaws.com` to assume the role.
 
+## HyperPod Training Role (`do/train` / `do/tune --backend hp-eks`)
+
+The training bootstrap module creates `mlcc-hp-train-role-<region>` (one per profile), assumed by
+HyperPod training pods through EKS Pod Identity (ServiceAccount `mlcc-train-sa`). Its ARN reaches
+the project as `MLCC_HP_TRAIN_ROLE_ARN`.
+
+- **Trust:** `pods.eks.amazonaws.com`, `sts:AssumeRole` + `sts:TagSession`, condition
+  `aws:SourceAccount` = your account.
+- **Core bucket (read):** `s3:GetObject` on `datasets/*` and `models/*`; `s3:ListBucket` limited
+  to those prefixes.
+- **Artifacts bucket (job output):** `s3:PutObject`, `s3:GetObject`, `s3:AbortMultipartUpload`,
+  `s3:ListMultipartUploadParts` on `*/train/*` and `*/tune/*`; `s3:ListBucket` on those prefixes.
+- **MLflow:** `sagemaker-mlflow:*` and `sagemaker:CallMlflowAppApi` on this account and region's
+  `mlflow-app/*`.
+- **Nothing else:** no Lambda, Bedrock, KMS, ECR or core-bucket write (promotion runs in the CLI).
+
+The cluster owner binds it once:
+`aws eks create-pod-identity-association --cluster-name <eks> --namespace <ns> --service-account mlcc-train-sa --role-arn <role> --region <region>`.
+The caller running `do/train --backend hp-eks` or `do/validate` also needs
+`eks:ListPodIdentityAssociations`, `eks:DescribePodIdentityAssociation` and
+`iam:SimulatePrincipalPolicy` (on `mlcc-hp-train-role-*`) for the cluster contract.
+
 ## CodeBuild Service Role
 
 Created automatically by `./do/submit` as `<%= codebuildProjectName %>-service-role`. Permissions:

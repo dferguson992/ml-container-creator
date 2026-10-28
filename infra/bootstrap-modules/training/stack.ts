@@ -145,6 +145,65 @@ export class MlccTrainingStack extends cdk.Stack {
         // The reward Lambda is created by `do/register evaluator --finalize` with the
         // caller's own credentials.)
 
+        // ── HyperPod EKS training role (Wave 11 R3, OQ-11.4) ─────────────────────
+        // `do/train --backend hp-eks` / `do/tune --backend hp-eks` run a
+        // HyperPodPyTorchJob under the ServiceAccount `mlcc-train-sa`. HyperPod pods
+        // get NO AWS credentials otherwise (F0 probe: IMDS closed, no association),
+        // so this role is the job's only identity. MLCC never creates the EKS Pod
+        // Identity association (ADR-012: cluster config is the owner's); it prints
+        // the one `aws eks create-pod-identity-association` command and the cluster
+        // contract verifies it before every hp-eks submit.
+        // ONE role per bootstrap profile (owner decision): the artifacts write is
+        // scoped to the per-project job-output subtrees (<project>/train/... and
+        // <project>/tune/...), not to one project, because IAM cannot bind a
+        // per-profile role to a single project without per-project roles.
+        // Least privilege: no Lambda, Bedrock, KMS (SSE-S3 buckets), ECR (the image
+        // pull is node-side) or core-bucket write (promotion stays in the CLI).
+        const hpTrainRole = new iam.Role(this, 'HpTrainRole', {
+            roleName: `mlcc-hp-train-role-${this.region}`,
+            // Pod Identity needs sts:TagSession alongside sts:AssumeRole.
+            assumedBy: new iam.ServicePrincipal('pods.eks.amazonaws.com')
+                .withSessionTags()
+                .withConditions({ StringEquals: { 'aws:SourceAccount': this.account } }),
+            description:
+                'EKS Pod Identity role for MLCC HyperPod training jobs (ServiceAccount '
+                + 'mlcc-train-sa): dataset/model read, train/tune artifact write, MLflow',
+        });
+        const artifactsArn = `arn:aws:s3:::${artifactsBucketName}`;
+        const hpTrainPolicy = new iam.Policy(this, 'HpTrainPolicy', {
+            statements: [
+                new iam.PolicyStatement({
+                    sid: 'ReadCoreDatasetsAndModels',
+                    actions: ['s3:GetObject'],
+                    resources: [`arn:aws:s3:::${coreBucketName}/datasets/*`, `arn:aws:s3:::${coreBucketName}/models/*`],
+                }),
+                new iam.PolicyStatement({
+                    sid: 'ListCoreDatasetsAndModels',
+                    actions: ['s3:ListBucket'],
+                    resources: [`arn:aws:s3:::${coreBucketName}`],
+                    conditions: { StringLike: { 's3:prefix': ['datasets/*', 'models/*'] } },
+                }),
+                new iam.PolicyStatement({
+                    sid: 'WriteTrainTuneArtifacts',
+                    actions: ['s3:PutObject', 's3:GetObject', 's3:AbortMultipartUpload', 's3:ListMultipartUploadParts'],
+                    resources: [`${artifactsArn}/*/train/*`, `${artifactsArn}/*/tune/*`],
+                }),
+                new iam.PolicyStatement({
+                    sid: 'ListTrainTuneArtifacts',
+                    actions: ['s3:ListBucket'],
+                    resources: [artifactsArn],
+                    conditions: { StringLike: { 's3:prefix': ['*/train/*', '*/tune/*'] } },
+                }),
+                // The MLflow App is created by provision-mlflow AFTER this stack, so
+                // its id is unknown here: scope to this account/region's apps.
+                new iam.PolicyStatement({
+                    sid: 'MlflowTracking',
+                    actions: ['sagemaker-mlflow:*', 'sagemaker:CallMlflowAppApi'],
+                    resources: [`arn:aws:sagemaker:${this.region}:${this.account}:mlflow-app/*`],
+                }),
+            ],
+        });
+        hpTrainPolicy.attachToRole(hpTrainRole);
         // Outputs
         new cdk.CfnOutput(this, 'TrainingBucketOutput', {
             value: bucketName,
@@ -168,6 +227,12 @@ export class MlccTrainingStack extends cdk.Stack {
         new cdk.CfnOutput(this, 'RewardLambdaRoleArnOutput', {
             value: rewardLambdaRole.roleArn,
             exportName: `mlcc-${profileName}-training-RewardLambdaRoleArn`,
+        });
+        // HpTrainRole ARN → moduleOutputs.training.HpTrainRoleArn → profile
+        // hpTrainRoleArn → MLCC_HP_TRAIN_ROLE_ARN (do/lib/profile.sh).
+        new cdk.CfnOutput(this, 'HpTrainRoleArnOutput', {
+            value: hpTrainRole.roleArn,
+            exportName: `mlcc-${profileName}-training-HpTrainRoleArn`,
         });
     }
 }

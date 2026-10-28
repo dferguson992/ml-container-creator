@@ -1221,6 +1221,8 @@ function _setExecutablePermissions(destDir) {
         'do/optimize',
         'do/status',
         'do/add-ic',
+        // Wave 11 (BL149): full fine-tune as its own IEC on hyperpod-eks.
+        'do/add-pod',
         'do/adapter',
         'do/tune',
         'do/train',

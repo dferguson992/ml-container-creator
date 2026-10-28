@@ -338,8 +338,9 @@ describe('Wave 6 / 6.1 — do/adapter on Kubernetes: --from-* sources, local-pat
         });
         assert.strictEqual(r.code, 3, r.stdout + r.stderr);
         assert.match(r.stdout, /Contract violation: artifact-kind/);
-        assert.match(r.stdout, /do\/add-ic/);
-        assert.match(r.stdout, /do\/add-pod/);
+        // Wave 11 R8.2: the guidance is derived from the ADR-013 tuple — on
+        // hyperpod-eks a full model is served by do/add-pod.
+        assert.match(r.stdout, /do\/add-pod <name>/);
         assert.deepStrictEqual(r.calls, [], 'nothing may be hot-loaded');
         assert.ok(!/Port-forward/.test(r.stdout), 'refusal precedes the port-forward');
     });

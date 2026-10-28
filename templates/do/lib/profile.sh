@@ -137,6 +137,13 @@ MLFLOW_APP_ARN="${MLFLOW_APP_ARN:-${_PROFILE_mlflowAppArn:-}}"
 # re-bootstrap the training module.
 MLCC_REWARD_LAMBDA_ROLE_ARN="${MLCC_REWARD_LAMBDA_ROLE_ARN:-${_PROFILE_rewardLambdaRoleArn:-}}"
 [ -n "${MLCC_REWARD_LAMBDA_ROLE_ARN}" ] && export MLCC_REWARD_LAMBDA_ROLE_ARN
+# Map the profile's hpTrainRoleArn (Wave 11 R3.2: the training bootstrap module's
+# Pod Identity role for HyperPod training jobs) to MLCC_HP_TRAIN_ROLE_ARN. The
+# hp-eks cluster contract (hyperpod_ops.py contract) checks the owner's
+# association for mlcc-train-sa points at exactly this role and prints the
+# create command otherwise. Empty when the training module predates the role.
+MLCC_HP_TRAIN_ROLE_ARN="${MLCC_HP_TRAIN_ROLE_ARN:-${_PROFILE_hpTrainRoleArn:-}}"
+[ -n "${MLCC_HP_TRAIN_ROLE_ARN}" ] && export MLCC_HP_TRAIN_ROLE_ARN
 
 # ── Profile secrets (BL076) ───────────────────────────────────────────────
 # Secret ARNs are stored in the active bootstrap profile's 'secrets' map.

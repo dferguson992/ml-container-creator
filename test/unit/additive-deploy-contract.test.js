@@ -20,7 +20,8 @@
  *         - no script passes a literal accepted kind to `_guard_artifact_kind`.
  *   R3.2/R8.5 the kind gate reads the table: full_model→do/adapter refused,
  *         lora_adapter→do/add-ic refused, unknown degrades.
- *   R3.4  the deferred do/add-pod (BL149) tuple is present-but-commented.
+ *   R3.4  do/add-pod (BL149, Wave 11 R8.1) landed: full_model × pod-apply, exposed by
+ *         hyperpod-eks only; plain eks keeps an honest deferred note (F6, post-2.0).
  */
 import { describe, it, before, after } from 'mocha';
 import assert from 'node:assert';
@@ -31,7 +32,7 @@ import {
 } from '../helpers/additive-sandbox.js';
 
 const CONTRACT_SRC = readFileSync(join(DO_SRC, 'lib/script-contract.sh'), 'utf8');
-const VERB_SCRIPTS = { adapter: 'adapter', 'add-ic': 'add-ic' };
+const VERB_SCRIPTS = { adapter: 'adapter', 'add-ic': 'add-ic', 'add-pod': 'add-pod' };
 const words = s => s.trim().split(/\s+/).filter(Boolean);
 
 describe('Wave 6 — additive-deploy contract table (ADR-013, R3)', function () {
@@ -184,14 +185,40 @@ describe('Wave 6 — additive-deploy contract table (ADR-013, R3)', function () 
         }
     });
 
-    it('R3.4: the deferred do/add-pod / pod-apply tuple is present but commented out', () => {
-        const start = CONTRACT_SRC.indexOf('# >>> ADDITIVE-DEPLOY CONTRACT');
-        const end = CONTRACT_SRC.indexOf('# <<< END ADDITIVE-DEPLOY CONTRACT');
-        assert.ok(start !== -1 && end > start, 'the contract must be ONE delimited block');
-        const block = CONTRACT_SRC.slice(start, end);
-        assert.match(block, /#\s*add-pod\)/, 'the add-pod verb arm must be present (commented)');
-        assert.match(block, /#.*pod-apply/, 'the pod-apply mechanism must be present (commented)');
-        assert.ok(!table.verbs.includes('add-pod'), 'add-pod stays deferred until BL149 lands');
+    it('R3.4 / R8.1: do/add-pod joined the contract as full_model × pod-apply', () => {
+        assert.ok(table.verbs.includes('add-pod'), 'add-pod is an additive verb');
+        assert.deepStrictEqual(table.kinds['add-pod'], ['full_model']);
+        assert.deepStrictEqual(table.verbMechs['add-pod'], ['pod-apply']);
+        // Every target that exposes pod-apply supports add-pod, and its descriptor says so.
+        for (const d of descriptors) {
+            const exposes = (table.targetMechs[d.target] || []).includes('pod-apply');
+            assert.strictEqual(table.supported['add-pod'][d.target] === 0, exposes, d.target);
+            assert.strictEqual(d.verbs['add-pod'], exposes, `${d.target} verbs.add-pod must equal the derived legality`);
+        }
+    });
+
+    it('R8.2: refusal guidance for a full model is derived per target (add-pod where it exists, the deferred note elsewhere)', () => {
+        for (const t of table.targets) {
+            const r = runContract(sb, `_additive_kind_guidance full_model ${t}`);
+            assert.strictEqual(r.code, 0, r.stderr);
+            const servers = table.verbs.filter(v => table.kinds[v].includes('full_model') && table.supported[v][t] === 0);
+            if (servers.length) {
+                servers.forEach(v => assert.ok(r.stdout.includes(`do/${v}`), `${t}: must name do/${v}`));
+            } else {
+                assert.match(r.stdout, /not servable on/);
+                assert.match(r.stdout, /planned: /);
+            }
+        }
+        const hp = runContract(sb, '_additive_kind_guidance full_model hyperpod-eks').stdout;
+        if (table.supported['add-pod']['hyperpod-eks'] === 0) assert.match(hp, /do\/add-pod/);
+    });
+
+    it('R8.2: no verb script carries a hand-written full-model refusal literal', () => {
+        for (const f of ['adapter', 'add-ic', 'add-pod']) {
+            const code = readFileSync(join(DO_SRC, f), 'utf8').split('\n').filter(l => !/^\s*#/.test(l)).join('\n');
+            assert.ok(!/do\/add-pod[^"]*(deferred|not supported yet)/.test(code), `do/${f} hardcodes the add-pod deferral`);
+            assert.ok(!/use realtime-inference \+ do\/add-ic/.test(code), `do/${f} hardcodes the full-model route`);
+        }
     });
 
     describe('kind gate driven by the table (R3.2 / R8.5)', () => {

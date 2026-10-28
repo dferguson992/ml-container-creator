@@ -26,6 +26,8 @@ CLI (one-shot, for bash callers):
     clean_script      — prints clean.d/<target>
     serving_config_source — prints kubernetes|sagemaker-ic
     aliases | required_vars | runtime_owned_vars — prints a JSON array
+    compute_backends  — prints the JSON array of training backends (first = default;
+                        ["smtj"] when the descriptor predates the field)
     optional_vars | verbs — prints a JSON object
     adapter_delivery  — prints the JSON object (or {} when the target declares none)
     cluster_contract  — prints the JSON object (or {} when the target declares none)
@@ -206,6 +208,12 @@ def cluster_contract(target: str, targets_dir: str | None = None) -> dict:
     """Return the target's read-only cluster-contract preflight declaration
     (Wave 8 R5.3: {script, entry}), or {} when the target has none."""
     return dict(read_manifest(target, targets_dir).get("cluster_contract") or {})
+def compute_backends(target: str, targets_dir: str | None = None) -> list[str]:
+    """Return the target's training compute backends (Wave 11 R1.1), in
+    preference order; the first entry is the default. A descriptor that predates
+    the field reads as ["smtj"] (every target can submit an SMTJ)."""
+    backends = read_manifest(target, targets_dir).get("compute_backends") or ["smtj"]
+    return [str(b) for b in backends]
 def pricing(target: str, targets_dir: str | None = None) -> dict:
     """Return the target's pricing declaration (Wave 9 R7.1/R8.2:
     {service, component?, instance_count: {basis, ...}}), or {} when absent.
@@ -291,6 +299,9 @@ def _cli(argv: list[str]) -> int:
         return 0
     if field in _ARRAY_FIELDS:
         print(json.dumps(manifest.get(field, [])))
+        return 0
+    if field == "compute_backends":
+        print(json.dumps(manifest.get(field) or ["smtj"]))
         return 0
     if field in _OBJECT_FIELDS:
         print(json.dumps(manifest.get(field, {})))

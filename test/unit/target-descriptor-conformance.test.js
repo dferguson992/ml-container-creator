@@ -42,6 +42,7 @@ import {
     adapterDelivery,
     pricing,
     observability,
+    computeBackends,
     scaleToZero
 } from '../../src/lib/target-manifest-reader.js';
 import { listServeEngines, metricSignals } from '../../src/lib/serve-manifest-reader.js';
@@ -414,6 +415,53 @@ describe('Wave 9 (R1/R6/R12, OQ-9.9) — observability + verbs.metrics are decla
         assert.match(read('templates/do/metrics'), /target_manifest\.py" verbs/);
     });
 });
+
+describe('Wave 11 R1.1 — compute_backends is declared per target and read the same by both readers', () => {
+    const KNOWN = ['smtj', 'hp-eks'];
+    const py = process.env.MLCC_PYTHON || 'python3';
+    for (const d of descriptors) {
+        it(`${d.target} declares a non-empty, known, duplicate-free compute_backends list`, () => {
+            assert.ok(Array.isArray(d.compute_backends) && d.compute_backends.length > 0, 'compute_backends required');
+            assert.strictEqual(new Set(d.compute_backends).size, d.compute_backends.length, 'no duplicates');
+            d.compute_backends.forEach((b) => assert.ok(KNOWN.includes(b), `unknown backend '${b}'`));
+        });
+        it(`${d.target} defaults to smtj (OQ-11.5: hp-eks is opt-in, never the default)`, () => {
+            assert.strictEqual(d.compute_backends[0], 'smtj');
+        });
+        it(`${d.target}: hp-eks is offered only where a cluster contract can verify it`, () => {
+            if (!d.compute_backends.includes('hp-eks')) return;
+            assert.strictEqual(d.family, 'kubernetes');
+            assert.ok(d.cluster_contract && d.cluster_contract.script, 'hp-eks needs a cluster_contract script');
+        });
+        it(`${d.target}: target_manifest.py compute_backends agrees with computeBackends()`, () => {
+            const r = spawnSync(py, [join(ROOT, 'templates/do/lib/python/target_manifest.py'), 'compute_backends', d.target],
+                { encoding: 'utf8' });
+            assert.strictEqual(r.status, 0, r.stderr);
+            assert.deepStrictEqual(JSON.parse(r.stdout), computeBackends(d.target));
+        });
+    }
+    it('at least one target offers the hp-eks backend (hyperpod-eks, BL148)', () => {
+        assert.ok(descriptors.some((d) => d.compute_backends.includes('hp-eks')));
+        assert.ok(computeBackends('hyperpod-eks').includes('hp-eks'));
+    });
+    it('every target declares verbs.add-pod explicitly (BL149; agreement with ADR-013 is in additive-deploy-contract)', () => {
+        for (const d of descriptors) {
+            assert.strictEqual(typeof (d.verbs || {})['add-pod'], 'boolean', `${d.target} verbs.add-pod`);
+        }
+    });
+    it('the schema requires compute_backends next to scale_to_zero and rejects an unknown backend (W10 + W11 merge)', () => {
+        const schema = JSON.parse(read('templates/do/targets.d/manifest.schema.json'));
+        assert.ok(schema.required.includes('compute_backends') && schema.required.includes('scale_to_zero'));
+        const validate = new Ajv({ allErrors: true, strict: false }).compile(schema);
+        const base = descriptors.find((d) => d.compute_backends.includes('hp-eks'));
+        assert.ok(validate(base), JSON.stringify(validate.errors));
+        assert.ok(!validate({ ...base, compute_backends: ['smtj', 'no-such-backend'] }), 'unknown backend must be invalid');
+        const without = { ...base };
+        delete without.compute_backends;
+        assert.ok(!validate(without), 'a descriptor without compute_backends must be invalid');
+    });
+});
+
 describe('Wave 10 (ADR-014 R1, R8.1) — scale_to_zero is declared on every target and read by both readers', () => {
     const py = process.env.MLCC_PYTHON || 'python3';
     const schema = JSON.parse(read('templates/do/targets.d/manifest.schema.json'));

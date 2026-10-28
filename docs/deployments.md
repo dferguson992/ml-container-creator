@@ -58,6 +58,28 @@ For existing [SageMaker AI HyperPod](https://aws.amazon.com/sagemaker/hyperpod/)
 
 The generated `do/config` file stores HyperPod-specific variables: `HP_CLUSTER_NAME`, `HP_NAMESPACE`, `HP_REPLICAS`, and — after a successful deployment — `ENDPOINT_NAME`.
 
+#### Serving a full fine-tune next to the base (`do/add-pod`)
+
+`./do/add-pod <name> --from-tune|--from-train|--from-weights s3://...|--from-registry <arn>`
+serves a **full** fine-tuned model as a second `InferenceEndpointConfig` named
+`<project>-<name>` (and a SageMaker endpoint of the same name), rendered from the project's own
+IEC template. A LoRA adapter is refused here; use `do/adapter`.
+
+- The weights must live under `models/mlcc-<project>/<name>/` in the core bucket; other sources
+  are promoted there first.
+- Its pods are labeled `app: <project>-<name>`, `mlcc.aws/project-name` and
+  `mlcc.aws/role: add-pod`, never `app: <project>`, so the base deployment's selectors don't see
+  them.
+- Before applying, it runs the read-only cluster contract (`free-gpus`, `local-queue`,
+  `s3-csi-role`) and right-sizing against the fine-tune's own `config.json`.
+  `--instance-group <g>` pins it with `nodeAffinity`; `--surge-node` adds one node when no node
+  has room (billed; the node stays while the pod runs).
+- `./do/add-pod --list`, `--status <name>` and `--remove <name>` manage it; state lives in
+  `do/pods/<name>.conf`. `./do/clean` also deletes every add-pod IEC (and the project's MLCC
+  HyperPodPyTorchJobs), by label.
+
+On plain `eks`, a full model has no additive verb yet (planned post-2.0); the refusal says so.
+
 #### Speculative decoding
 
 Speculative decoding is supported for vLLM and SGLang images on HyperPod EKS. See the dedicated guide: [Speculative Decoding on HyperPod EKS](hyperpod-speculative-decoding.md).

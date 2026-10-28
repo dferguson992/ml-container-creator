@@ -209,25 +209,30 @@ echo "📁 Ensuring namespace exists: ${HP_NAMESPACE}"
 # during the operator's model download and is not exposed to the container.
 # ─────────────────────────────────────────────────────────────────────────────
 
-if [ -n "${RESOLVED_HF_TOKEN:-}" ]; then
-    echo "🔑 Creating K8s Secret 'hf-token-secret' in namespace '${HP_NAMESPACE}'..."
-    kubectl create secret generic hf-token-secret \
-        --from-literal=token="${RESOLVED_HF_TOKEN}" \
-        --namespace "${HP_NAMESPACE}" \
-        --dry-run=client -o yaml | kubectl apply -f - 2>&1 || {
-        echo "⚠️  Warning: Could not create hf-token-secret (will continue)"
-        echo "   The pod may fail to pull gated models — set HF_TOKEN_ARN in do/config"
-    }
-    echo "✅ HuggingFace token secret ready"
-else
-    echo "   ⚠️  No HuggingFace token configured"
-    echo "   Set HF_TOKEN_ARN in do/config or run: mcc bootstrap add-secret hfToken <arn>"
-    echo "   (Continuing — token only required for gated HuggingFace models)"
-fi
+# Wave 11 (do/add-pod): MLCC_HP_RENDER_ONLY=<dir> runs this driver only up to the
+# IEC render (same derivation as a real deploy) and copies the manifests to <dir>;
+# it makes no cluster write (the base deployment already created both objects).
+if [ -z "${MLCC_HP_RENDER_ONLY:-}" ]; then
+    if [ -n "${RESOLVED_HF_TOKEN:-}" ]; then
+        echo "🔑 Creating K8s Secret 'hf-token-secret' in namespace '${HP_NAMESPACE}'..."
+        kubectl create secret generic hf-token-secret \
+            --from-literal=token="${RESOLVED_HF_TOKEN}" \
+            --namespace "${HP_NAMESPACE}" \
+            --dry-run=client -o yaml | kubectl apply -f - 2>&1 || {
+            echo "⚠️  Warning: Could not create hf-token-secret (will continue)"
+            echo "   The pod may fail to pull gated models — set HF_TOKEN_ARN in do/config"
+        }
+        echo "✅ HuggingFace token secret ready"
+    else
+        echo "   ⚠️  No HuggingFace token configured"
+        echo "   Set HF_TOKEN_ARN in do/config or run: mcc bootstrap add-secret hfToken <arn>"
+        echo "   (Continuing — token only required for gated HuggingFace models)"
+    fi
 
-echo "📁 Ensuring namespace exists: ${HP_NAMESPACE}"
-if ! kubectl create namespace "${HP_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - 2>&1; then
-    echo "⚠️  Warning: Could not create/verify namespace"
+    echo "📁 Ensuring namespace exists: ${HP_NAMESPACE}"
+    if ! kubectl create namespace "${HP_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - 2>&1; then
+        echo "⚠️  Warning: Could not create/verify namespace"
+    fi
 fi
 
 # ── Preflight: cluster inference capability (WARN, do not block) ──────────────
@@ -472,26 +477,11 @@ echo "   Instance type: ${HP_INSTANCE_TYPE:-<unset>}"
 echo "   GPU count (auto-detected): ${HP_GPU_COUNT}"
 echo "   CPU request: ${HP_CPU_REQUEST}  Memory request: ${HP_MEM_REQUEST}"
 
-# Portable variable-substitution shim.
-#
-# GNU envsubst only expands bare ${VAR}/$VAR references and does NOT understand
-# the ${VAR:-default} form — it would leave those placeholders verbatim, which
-# produces invalid YAML for kubectl. The CRD template (BL096) uses ${VAR:-N}
-# defaults for HP_INSTANCE_TYPE / HP_GPU_COUNT / HP_CPU_REQUEST / HP_MEM_REQUEST,
-# so we always route substitution through a perl pass that resolves BOTH the
-# ${VAR:-default} and the bare ${VAR} forms from the process environment. This is
-# deterministic across macOS/Linux and independent of whether gettext is present.
-envsubst() {
-    perl -pe '
-        # ${VAR:-default} → env value if set & non-empty, else the default.
-        s/\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]*)\}/
-            (defined $ENV{$1} && length $ENV{$1}) ? $ENV{$1} : $2/ge;
-        # bare ${VAR} → env value if defined, else leave the placeholder intact
-        # (so unrelated shell references are not silently dropped).
-        s/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/
-            defined $ENV{$1} ? $ENV{$1} : "\${$1}"/ge;
-    '
-}
+# Portable variable-substitution shim (envsubst) and the IEC render loop live in
+# lib/hp-iec-render.sh (Wave 11 R7.4), shared with do/add-pod so a second IEC is
+# rendered from the same template. The base render is byte-identical to the
+# former inline code (golden test: test/unit/hp-iec-render.test.js).
+source "${SCRIPT_DIR}/lib/hp-iec-render.sh"
 
 # ── Build spec.modelSourceConfig ──────────────────────────────────────────────
 # When the model has been staged to S3 (STAGED_MODEL_PATH in do/config), use the
@@ -825,69 +815,16 @@ export VLLM_EXTRA_ENVVARS
 # Render every manifest first (into a temp dir), decide whether the rollout can
 # schedule (Wave 6.1 R4), and only then apply.
 _HP_RENDER_DIR="$(mktemp -d)"
-_HP_RENDER_N=0
-for manifest in hyperpod/*.yaml; do
-    # envsubst first (expands ${ECR_IMAGE}, ${HP_INSTANCE_TYPE}, ${HP_*} defaults),
-    # then splice the multi-line modelSourceConfig block in place of the marker,
-    # preserving the marker line's indentation for every replacement line so the
-    # rendered YAML stays well-formed.
-    RENDERED=$(envsubst < "${manifest}")
-    RENDERED=$(MODEL_SOURCE_CONFIG="${MODEL_SOURCE_CONFIG}" \
-        HP_MODEL_NAME_OVERRIDE="${HP_MODEL_NAME_OVERRIDE}" \
-        HP_TIER1_ENVVARS="${HP_TIER1_ENVVARS}" \
-        printf '%s' "${RENDERED}" | \
-        MODEL_SOURCE_CONFIG="${MODEL_SOURCE_CONFIG}" \
-        HP_MODEL_NAME_OVERRIDE="${HP_MODEL_NAME_OVERRIDE}" \
-        HP_TIER1_ENVVARS="${HP_TIER1_ENVVARS}" \
-        python3 -c '
-import os, re, sys
-repl = os.environ.get("MODEL_SOURCE_CONFIG", "")
-extra_envvars = os.environ.get("VLLM_EXTRA_ENVVARS", "")
-tier1_envvars = os.environ.get("HP_TIER1_ENVVARS", "")
-name_override = os.environ.get("HP_MODEL_NAME_OVERRIDE", "")
-marker = "__MODEL_SOURCE_CONFIG__"
-envvars_marker = "__VLLM_EXTRA_ENVVARS__"
-tier1_marker = "__TIER1_ENVVARS__"
-# Rewrite the top-level spec.modelName only (2-space indent), leaving deeper
-# keys such as huggingFaceModel.modelId untouched.
-name_re = re.compile(r"^(  modelName:\s*).*$")
-out = []
-for line in sys.stdin.read().splitlines():
-    pos = line.find(marker)
-    epos = line.find(envvars_marker)
-    tpos = line.find(tier1_marker)
-    if pos >= 0:
-        indent = line[:pos]
-        for rl in repl.splitlines():
-            out.append(indent + rl)
-    elif tpos >= 0:
-        # ADR-010: splice the manifest-DERIVED Tier-1 env block (model / TP /
-        # LoRA-companion contract for the ACTIVE engine) at the marker indent.
-        # When empty (resolver unavailable) drop the marker so the YAML list
-        # stays well-formed.
-        indent = line[:tpos]
-        for rl in tier1_envvars.splitlines():
-            if rl.strip():
-                out.append(indent + rl)
-    elif epos >= 0:
-        # Splice Tier-2 prefix pass-through env vars at the marker indentation.
-        # When there are none, drop the marker line entirely so the YAML list
-        # stays well-formed.
-        indent = line[:epos]
-        for rl in extra_envvars.splitlines():
-            if rl.strip():
-                out.append(indent + rl)
-    elif name_override and name_re.match(line):
-        out.append("  modelName: \"%s\"" % name_override)
-    else:
-        out.append(line)
-sys.stdout.write("\n".join(out) + "\n")
-')
-    if echo "${RENDERED}" | grep -q '^kind:'; then
-        _HP_RENDER_N=$((_HP_RENDER_N + 1))
-        printf '%s\n' "${RENDERED}" > "${_HP_RENDER_DIR}/$(printf '%03d' "${_HP_RENDER_N}")-$(basename "${manifest}")"
-    fi
-done
+_hp_render_iec "${_HP_RENDER_DIR}" hyperpod || {
+    echo "❌ Failed to render the hyperpod manifests (template drift; see above)"
+    rm -rf "${_HP_RENDER_DIR}"
+    exit 3
+}
+if [ -n "${MLCC_HP_RENDER_ONLY:-}" ]; then
+    cp "${_HP_RENDER_DIR}"/* "${MLCC_HP_RENDER_ONLY}/"
+    rm -rf "${_HP_RENDER_DIR}"
+    return 0 2>/dev/null || exit 0
+fi
 
 # ── Contract preflight (Wave 6.1 R6; read-only, report only) ──────────────────
 # Mirrors the eks BL156 contract for hyperpod-eks: S3 CSI driver present, the

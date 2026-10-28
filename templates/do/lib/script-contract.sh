@@ -146,7 +146,7 @@ _restrict_targets() {
 # >>> ADDITIVE-DEPLOY CONTRACT (ADR-013) — the single source of truth.
 #
 # Additive deploy = putting an artifact onto an ALREADY-deployed endpoint/cluster
-# (do/adapter, do/add-ic; later do/add-pod). Three axes (ADR-013):
+# (do/adapter, do/add-ic, do/add-pod). Three axes (ADR-013):
 #   1. SOURCE   (--from-*)      → resolved uniformly by _resolve_additive_source
 #   2. KIND     (artifact_kind) → selects which VERB is legal   (_additive_verb_kinds)
 #   3. TARGET                   → selects only the load MECHANISM
@@ -159,13 +159,12 @@ _restrict_targets() {
 # Representation: bash-3.2-safe lookup functions (case statements), NOT
 # `declare -A`. script-contract.sh is sourced by every do/ script and those must
 # run under macOS's default /bin/bash 3.2, which has no associative arrays (same
-# constraint as do/tune's SET_KNOBS). The deferred do/add-pod (BL149) arms are
-# present but commented — it lands by uncommenting them, with no consumer edit.
+# constraint as do/tune's SET_KNOBS). do/add-pod (BL149, Wave 11) landed by
+# uncommenting its arms: pod-apply on hyperpod-eks; eks stays deferred (F6).
 
 # Every verb / target the contract knows (iteration order for the derivations).
 _additive_verbs() {
-    echo "adapter add-ic"
-    # echo "adapter add-ic add-pod"   # DEFERRED (BL149)
+    echo "adapter add-ic add-pod"
 }
 _additive_targets() {
     echo "realtime-inference hyperpod-eks eks"
@@ -176,7 +175,7 @@ _additive_verb_kinds() {
     case "${1:-}" in
         adapter) echo "lora_adapter" ;;
         add-ic)  echo "full_model" ;;
-        # add-pod) echo "full_model" ;;   # DEFERRED (BL149) — the full-model-on-cluster gap
+        add-pod) echo "full_model" ;;   # BL149: a full model as its own IEC on the cluster
         *) echo "" ;;
     esac
 }
@@ -186,7 +185,7 @@ _additive_verb_mechanisms() {
     case "${1:-}" in
         adapter) echo "vllm-hotload smai-ic" ;;   # vLLM hot-load (k8s) OR an SMAI adapter IC
         add-ic)  echo "smai-ic" ;;
-        # add-pod) echo "pod-apply" ;;           # DEFERRED (BL149)
+        add-pod) echo "pod-apply" ;;
         *) echo "" ;;
     esac
 }
@@ -195,9 +194,8 @@ _additive_verb_mechanisms() {
 _additive_target_mechanisms() {
     case "${1:-}" in
         realtime-inference) echo "smai-ic" ;;
-        hyperpod-eks)       echo "vllm-hotload" ;;   # + pod-apply when do/add-pod lands (BL149)
-        eks)                echo "vllm-hotload" ;;   # + pod-apply when do/add-pod lands (BL149)
-        # hyperpod-eks|eks) echo "vllm-hotload pod-apply" ;;   # DEFERRED (BL149)
+        hyperpod-eks)       echo "vllm-hotload pod-apply" ;;   # pod-apply: a second IEC (BL149)
+        eks)                echo "vllm-hotload" ;;   # + pod-apply when plain-eks add-pod lands (F6, post-2.0)
         *) echo "" ;;
     esac
 }
@@ -207,7 +205,7 @@ _additive_verb_usage() {
     case "${1:-}" in
         adapter) echo "do/adapter add <name> --from-tune (or --from-weights s3://...)" ;;
         add-ic)  echo "do/add-ic <name> --from-tune (or --from-weights s3://...)" ;;
-        # add-pod) echo "do/add-pod <name> --from-tune" ;;   # DEFERRED (BL149)
+        add-pod) echo "do/add-pod <name> --from-tune (or --from-weights s3://...)" ;;
         *) echo "do/${1:-}" ;;
     esac
 }
@@ -216,11 +214,41 @@ _additive_verb_usage() {
 # arm when that verb lands (its arms above get uncommented instead).
 _additive_deferred_note() {
     case "${1:-}" in
-        full_model) echo "do/add-pod (BL149, deferred to the cluster cohort)" ;;
+        full_model) echo "do/add-pod on eks (post-2.0)" ;;
         *) echo "" ;;
     esac
 }
 # <<< END ADDITIVE-DEPLOY CONTRACT
+
+# _additive_kind_guidance <kind> <target> — the refusal guidance for an artifact
+# kind, DERIVED from the contract above (R8.2): the usage of every verb that
+# serves the kind on the target, else the planned verb (_additive_deferred_note)
+# plus where the kind IS servable today. Replaces the hand-written literals in the
+# verb scripts so the text follows the tuple (ADR-013 R7 drift risk).
+_additive_kind_guidance() {
+    local _kind="$1" _target="${2:-}" _v _here="" _elsewhere="" _t _note
+    for _v in $(_additive_verbs); do
+        case " $(_additive_accepts_kind "${_v}") " in
+            *" ${_kind} "*) ;;
+            *) continue ;;
+        esac
+        if [ -n "$(_additive_mechanism_for "${_v}" "${_target}")" ]; then
+            _here="${_here:+${_here}; or }$(_additive_verb_usage "${_v}")"
+        else
+            for _t in $(_additive_targets); do
+                if [ -n "$(_additive_mechanism_for "${_v}" "${_t}")" ]; then
+                    _elsewhere="${_elsewhere:+${_elsewhere}; }$(_additive_verb_usage "${_v}") on ${_t}"
+                fi
+            done
+        fi
+    done
+    if [ -n "${_here}" ]; then
+        echo "On ${_target}, a ${_kind} goes through ${_here}."
+        return 0
+    fi
+    _note="$(_additive_deferred_note "${_kind}")"
+    echo "A ${_kind} is not servable on ${_target:-<unset>} yet${_note:+ (planned: ${_note})}${_elsewhere:+; today: ${_elsewhere}}."
+}
 
 # _additive_accepts_kind <verb> — echo the artifact kind(s) the verb accepts.
 # Feeds _guard_artifact_kind so no script passes a literal accepted kind.
