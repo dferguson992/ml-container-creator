@@ -143,6 +143,17 @@ Wave 5 (BL163/BL164/BL166/BL167) is NOT part of this epic, but it must not forec
   (shared helper), not a `do/adapter`-local arm — otherwise ADR-013 has to re-extract it. Recorded
   as a constraint on BL164's design so Wave 5 does not undermine the epic.
 
+## Amendment (Wave 11, BL149): `do/add-pod` enabled on hyperpod-eks
+
+The deferred `(full_model, {hyperpod-eks, eks}, pod-apply)` tuple landed for **hyperpod-eks
+only**: `_additive_verbs` = `adapter add-ic add-pod`; `add-pod` accepts `full_model` and drives
+`pod-apply`; hyperpod-eks exposes `vllm-hotload pod-apply`. Plain `eks` keeps `vllm-hotload` only
+(plain-eks add-pod is F6, post-2.0), and `_additive_deferred_note full_model` now says so. The
+descriptors declare `verbs.add-pod` (true on hyperpod-eks only), drift-tested against the derived
+legality in `test/unit/additive-deploy-contract.test.js`. The hand-written refusal literals in
+`do/adapter` are replaced by `_additive_kind_guidance <kind> <target>`, derived from the same
+block, so the guidance follows the tuple (risk R7).
+
 ## References
 
 - ADR-008 — deployment-target descriptor (the derive-don't-hardcode precedent for targets).

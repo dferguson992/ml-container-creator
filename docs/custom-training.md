@@ -360,6 +360,91 @@ project home. When MLflow is not configured, `do/train` submits exactly as befor
 
 ---
 
+## HyperPod EKS backend (`--backend hp-eks`)
+
+On a `hyperpod-eks` project, `do/train` can run the same plugin (`do/training/<technique>/`) as a
+single-node **HyperPodPyTorchJob** on your HyperPod cluster instead of a SageMaker training job.
+It is opt-in: the default backend is still SMTJ.
+
+!!! note "Behavior change (v2.0)"
+    Before v2.0, `do/train` on a `hyperpod-eks` project submitted a `batch/v1` Job whose volumes
+    nothing created, so it never ran. That path is gone. `do/train` now defaults to a SageMaker
+    training job on every target; pass `--backend hp-eks` to train on the cluster.
+
+The allowed backends come from the deployment target's descriptor
+(`templates/do/targets.d/<target>/manifest.json`, `compute_backends`; the first entry is the
+default). Asking for a backend the target doesn't offer stops with exit 3 and lists the allowed set.
+
+```bash
+./do/train --backend hp-eks --technique sft --dataset s3://<core-bucket>/datasets/my-sft/v1/
+./do/train --backend hp-eks --dry-run          # print the HyperPodPyTorchJob, apply nothing
+./do/train --status                            # one watcher pass; deletes a finished job
+./do/train --stop                              # delete the HyperPodPyTorchJob
+```
+
+### Cluster contract
+
+Before anything is written to the cluster, `do/train` runs the read-only cluster contract
+(`hyperpod_ops.py contract --verb train`). Any blocking finding exits 4 with the owner's fix;
+MLCC never installs operators, storage or identity on your cluster (ADR-012).
+
+| Element | Checks | Your fix |
+|---|---|---|
+| `training-operator` | the `hyperpodpytorchjobs.sagemaker.amazonaws.com` CRD and an Available training-operator Deployment in `aws-hyperpod` | install the `amazon-sagemaker-hyperpod-training-operator` EKS add-on |
+| `pod-identity` | an EKS Pod Identity association for `<namespace>/mlcc-train-sa` whose role is `MLCC_HP_TRAIN_ROLE_ARN`, plus an IAM simulation of the dataset read and the artifacts write | run the printed `aws eks create-pod-identity-association` command |
+| `scratch-volume` | the `fsx-claim` PVC is Bound, else a StorageClass (`--storage-class` or the cluster default) | create `fsx-claim` or a StorageClass |
+| `free-gpus` | a Ready GPU node in the chosen group with the GPUs free | free a node or name another `--instance-group` |
+| `local-queue` | only when `HP_QUEUE` is set: the Kueue LocalQueue exists | create the queue or unset `HP_QUEUE` |
+
+`do/validate` reports the same training elements, never above a warning.
+
+### Training identity (one-time, cluster owner)
+
+HyperPod training pods get **no AWS credentials** by default (instance metadata is closed to
+pods). The training bootstrap module creates one role per profile, `mlcc-hp-train-role-<region>`
+(trusted by `pods.eks.amazonaws.com`; dataset and model read, `train/` and `tune/` artifact
+write, MLflow App tracking). `do/lib/profile.sh` exports it as `MLCC_HP_TRAIN_ROLE_ARN`.
+Binding it to the cluster is the owner's one command, which the contract prints with your values:
+
+```bash
+ml-container-creator bootstrap update --module training
+aws eks create-pod-identity-association --cluster-name <eks-cluster> --namespace <namespace> \
+    --service-account mlcc-train-sa --role-arn <MLCC_HP_TRAIN_ROLE_ARN> --region <region>
+```
+
+MLCC creates only the `mlcc-train-sa` ServiceAccount itself.
+
+### What runs
+
+- **Node.** `--instance-group` > `TRAIN_HP_INSTANCE_GROUP` > the first (name-sorted) Ready GPU
+  group with a whole free node, filtered by `--instance-type`. GPUs = `--gpus` or the node's
+  allocatable `nvidia.com/gpu`. Single node, so no EFA request.
+- **Image.** `TRAIN_IMAGE` from `do/training/config.yaml`. It **must ship `hyperpodrun`**
+  (`pip install hyperpod-elastic-agent`); the project's serving image does not. A missing
+  `hyperpodrun` fails within seconds with `MLCC_PRECONDITION hyperpodrun-missing`.
+- **Plugin.** `do/training/<technique>/` ships in a per-job ConfigMap (refused above 1 MiB) and
+  launches with `accelerate launch` exactly as on SMTJ, under `hyperpodrun`.
+- **Scratch.** The `fsx-claim` subpath `mlcc/<project>/<job>/`, else a generic ephemeral volume
+  sized `max(50Gi, 2.5 × the staged model)` or `--scratch-size`. Output never lands on the
+  container's root disk.
+- **Data in and out.** An init container copies the dataset (and the staged model) in; after
+  training an egress container uploads `logs/` always and `output/` on success to
+  `s3://<artifacts>/<project>/train/<job>/`, then writes `_MLCC_RESULT.json`.
+  `--dataset fsx://<subpath>` mounts an existing `fsx-claim` subpath read-only instead.
+- **Completion.** Success is `_MLCC_RESULT.json` with exit 0, never a status condition. The
+  output is promoted and the `TRAIN_*` variables are written exactly as for SMTJ.
+
+### Watcher
+
+The watcher fails the job on a `Failed` condition, a non-zero main container, two container
+restarts, no `Running` within `--startup-timeout` (1200 s), no new log line within
+`--stall-timeout` (1800 s; `0` disables) or the deadline (`max_runtime_seconds`). On **every**
+terminal state it prints the last 200 log lines and deletes the HyperPodPyTorchJob, so its GPUs
+are released. Ctrl+C only detaches: run `./do/train --status` later to collect the result and
+release the GPUs.
+
+---
+
 ## Flags Reference
 
 | Flag | Description |
@@ -382,6 +467,13 @@ project home. When MLflow is not configured, `do/train` submits exactly as befor
 | `--batch-size <n>` | Same as `--set batch_size=<n>` |
 | `--lora-r <n>` | Same as `--set lora_r=<n>` |
 | `--beta <val>` | Same as `--set beta=<val>` (DPO / GRPO) |
+| `--backend <b>` | `smtj` (default) or `hp-eks` (hyperpod-eks projects only); see [HyperPod EKS backend](#hyperpod-eks-backend-backend-hp-eks) |
+| `--stop` | Stop the tracked job (`hp-eks`: delete the HyperPodPyTorchJob) |
+| `--instance-group <g>` | `hp-eks`: pin the instance group |
+| `--instance-type <t>` | `hp-eks`: only consider nodes of this type |
+| `--gpus <n>` | `hp-eks`: GPUs to request (default: the node's allocatable) |
+| `--startup-timeout <s>` / `--stall-timeout <s>` | `hp-eks` watcher limits (defaults 1200 / 1800; `0` disables the stall check) |
+| `--scratch-size <N>Gi` / `--storage-class <sc>` | `hp-eks` scratch volume when there is no `fsx-claim` |
 
 ---
 
