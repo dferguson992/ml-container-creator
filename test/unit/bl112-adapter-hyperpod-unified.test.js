@@ -237,7 +237,7 @@ describe('do/adapter — plain eks target support (Wave 6 follow-up, ADR-007)', 
             'do/adapter must gate with the contract-derived _additive_verb_supported_on'
         );
         assert.ok(/eks\)\s+echo "vllm-hotload"/.test(CONTRACT), 'eks must expose the vllm-hotload mechanism');
-        assert.ok(/hyperpod-eks\)\s+echo "vllm-hotload"/.test(CONTRACT), 'hyperpod-eks must expose vllm-hotload');
+        assert.ok(/hyperpod-eks\)\s+echo "vllm-hotload[ a-z-]*"/.test(CONTRACT), 'hyperpod-eks must expose vllm-hotload');
     });
 
     it('routes eks through the same vLLM k8s path as hyperpod-eks (by mechanism)', () => {

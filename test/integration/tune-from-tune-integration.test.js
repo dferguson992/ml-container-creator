@@ -141,9 +141,12 @@ describe('Feature: managed-model-customization — --from-tune integration (Req 
                 assert.match(r.stdout, /Contract violation: artifact-kind/);
             });
         });
-        it('the refusal guidance suggests do/add-ic --from-tune', () => {
+        it('the refusal guidance is derived from the ADR-013 contract (names the full-model verb per target)', () => {
+            // Wave 11 R8.2: the literal ("use do/add-ic ...") became the derived
+            // _additive_kind_guidance, which names do/add-ic on realtime and
+            // do/add-pod on hyperpod-eks (asserted per target in additive-deploy-contract).
             const addSection = getAdapterAddSection();
-            assert.ok(/_kind_guidance="[^"]*do\/add-ic <name> --from-tune/.test(addSection));
+            assert.ok(/_kind_guidance="[^"]*\$\(_additive_kind_guidance full_model/.test(addSection));
         });
         it('gates before any staging (kind check precedes the canonical promotion)', () => {
             // Bucket consolidation R3.4: the legacy Processing-Job staging was replaced
