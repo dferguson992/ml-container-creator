@@ -515,6 +515,35 @@ stz_teardown_if_owned() {
     stz_teardown "$@"
 }
 
+# stz_status_line <current-copies> — R5.3: `scale-to-zero: on (min 0, max N)`
+# plus the current copy count. Min/max are read from the first deployed IC's
+# scalable target (read-only describe), falling back to do/config.
+stz_status_line() {
+    local _cur="${1:-}" _ic="" _mm="" _min="0" _max="${SCALE_MAX_CAPACITY:-1}" _note=""
+    _ic=$(_stz_deployed_ics | head -1)
+    case "${STZ_MECHANISM}" in
+        sagemaker-ic-step)
+            if [ -n "${_ic}" ]; then
+                _mm=$(aws application-autoscaling describe-scalable-targets \
+                    --service-namespace "${_STZ_IC_NAMESPACE}" \
+                    --resource-ids "inference-component/${_ic}" \
+                    --scalable-dimension "${_STZ_IC_DIMENSION}" \
+                    --region "${AWS_REGION}" \
+                    --query 'ScalableTargets[0].[MinCapacity,MaxCapacity]' \
+                    --output text 2>/dev/null || true)
+            fi
+            ;;
+    esac
+    if [ -n "${_mm}" ] && [ "${_mm}" != "None" ]; then
+        _min=$(echo "${_mm}" | awk '{print $1}')
+        _max=$(echo "${_mm}" | awk '{print $2}')
+    else
+        _note=" [scalable target not found: ./do/deploy --reconfigure --scale-to-zero on]"
+    fi
+    [ "${SCALE_TO_ZERO_STATUS:-}" = "failed" ] && _note=" [setup failed: ./do/deploy --reconfigure --scale-to-zero on]"
+    echo "scale-to-zero: on (min ${_min}, max ${_max}); current copies: ${_cur:--}${_note}"
+}
+
 # stz_plan <target> — --dry-run: the warning and the exact calls a deploy would
 # make, printed by the same functions that make them (no AWS call).
 stz_plan() {

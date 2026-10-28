@@ -387,3 +387,146 @@ def test_clean_makes_no_scaling_call_when_never_enabled(stz_sandbox):
     rc, out, err = _run_clean(sb, script)
     assert rc == 0, out + err
     assert not [c for c in sb.calls() if c[0] in ("application-autoscaling", "cloudwatch")]
+
+
+# ── R5 / R6: the warning, its single data file, do/status, the cost caveat ────
+
+import os  # noqa: E402
+
+import scale_to_zero  # noqa: E402
+import target_manifest  # noqa: E402
+
+_REPO = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def test_warning_wording_is_driven_by_requests_at_zero():
+    for target in target_manifest.list_targets():
+        text = "\n".join(scale_to_zero.warning_lines(target))
+        assert "not for interactive SLAs" in text
+        assert "Your model and instance were not measured." in text
+        at_zero = scale_to_zero.capability(target)["requests_at_zero"]
+        if at_zero == "fail":
+            assert "requests FAIL until a copy is ready" in text, target
+        elif at_zero == "queued":
+            assert "QUEUED" in text and "FAIL" not in text, target
+
+
+def test_warning_numbers_come_only_from_the_reference_file(tmp_path):
+    ref = scale_to_zero.reference()
+    for key in ("source", "date", "model", "instance", "engine", "region",
+                "recovery_mean_minutes", "breakdown_minutes"):
+        assert ref.get(key) not in (None, "", []), f"reference.{key} (provenance) is required"
+    fake = dict(ref, recovery_mean_minutes=42.4, runs_minutes=[40.0, 44.8],
+                breakdown_minutes=[{"phase": "p1", "minutes": 40.0}, {"phase": "p2", "minutes": 2.4}],
+                date="1999-01")
+    path = tmp_path / "ref.json"
+    path.write_text(json.dumps(fake))
+    text = "\n".join(scale_to_zero.warning_lines("realtime-inference", scale_to_zero.reference(str(path))))
+    assert "42.4 min mean" in text and "40.0 p1" in text and "1999-01" in text
+    assert str(ref["recovery_mean_minutes"]) not in text, "no figure is hardcoded in the helper"
+
+
+def test_no_script_repeats_the_reference_figures():
+    """R5.2 grep guard: the mean recovery appears only in the data file."""
+    mean = str(scale_to_zero.reference()["recovery_mean_minutes"])
+    offenders = []
+    for root in (os.path.join(_REPO, "templates"), os.path.join(_REPO, "src")):
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                if name == "scale_to_zero_reference.json":
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    text = open(path, encoding="utf-8").read()
+                except (UnicodeDecodeError, OSError):
+                    continue
+                if re.search(r"(?<![\d.])" + re.escape(mean) + r"(?![\d])", text):
+                    offenders.append(os.path.relpath(path, _REPO))
+    assert not offenders, f"{mean} repeated outside the data file: {offenders}"
+
+
+def test_cost_caveat_extension_only_when_on_for_an_enabled_target():
+    import pricing
+    targets = target_manifest.list_targets()
+    enabled = [t for t in targets if scale_to_zero.capability(t)["enabled"]]
+    disabled = [t for t in targets if not scale_to_zero.capability(t)["enabled"]]
+    assert enabled and disabled
+    for t in enabled:
+        line = pricing.scale_to_zero_caveat(t, "true")
+        assert "idle stretches longer than the scale-in delay" in line
+        assert "No idle-adjusted cost is computed." in line
+        assert str(scale_to_zero.reference()["recovery_mean_minutes"]) in line
+        assert pricing.scale_to_zero_caveat(t, "false") == ""
+    for t in disabled:
+        assert pricing.scale_to_zero_caveat(t, "true") == ""
+
+
+def test_cost_summary_lines_appends_the_caveat_after_cost_caveat(monkeypatch):
+    import pricing
+    target = next(t for t in target_manifest.list_targets() if scale_to_zero.capability(t)["enabled"])
+    monkeypatch.setenv("DEPLOYMENT_TARGET", target)
+    monkeypatch.setenv("SCALE_TO_ZERO", "false")
+    off = pricing.cost_summary_lines([])
+    assert off[-1] == pricing.COST_CAVEAT
+    monkeypatch.setenv("SCALE_TO_ZERO", "true")
+    on = pricing.cost_summary_lines([])
+    assert on[:-1] == off and "Scale-to-zero is on" in on[-1]
+
+
+def _status_sandbox(sb, current_copies):
+    import shutil
+    shutil.copy(os.path.join(_REPO, "templates", "do", "lib", "script-contract.sh"),
+                os.path.join(sb.do, "lib", "script-contract.sh"))
+    sb.write("do/config", "\n".join([
+        'export PROJECT_NAME="stz"',
+        'export DEPLOYMENT_TARGET="realtime-inference"',
+        'export DEPLOYMENT_TARGET_SMAI_STATUS="InService"',
+        'export ENDPOINT_NAME="stz-endpoint-1"',
+        f'export INFERENCE_COMPONENT_NAME="{IC}"',
+        'export SCALE_TO_ZERO="true"',
+        'export SCALE_MAX_CAPACITY="2"',
+        'export SCALE_TO_ZERO_STATUS="ok"',
+        '']))
+    sb.rules([
+        {"match": ["sts", "Account"], "stdout": "111122223333\n"},
+        {"match": ["describe-endpoint"], "stdout": json.dumps({
+            "EndpointStatus": "InService",
+            "ProductionVariants": [{"CurrentInstanceCount": current_copies, "InstanceType": "ml.g5.xlarge"}]}, indent=2)},
+        {"match": ["describe-inference-component"], "stdout": json.dumps({
+            "InferenceComponentStatus": "InService",
+            "Specification": {"ComputeResourceRequirements": {"NumberOfAcceleratorDevicesRequired": 1}},
+            "RuntimeConfig": {"CurrentCopyCount": current_copies, "DesiredCopyCount": current_copies}}, indent=2)},
+        {"match": ["describe-scalable-targets"], "stdout": "0\t2\n"},
+    ])
+    return _render(sb, "status", "do/status")
+
+
+def _run_status(sb, script):
+    import subprocess
+    env = dict(os.environ, PATH=os.path.join(sb.root, "bin") + os.pathsep + os.environ["PATH"],
+               STZ_SANDBOX=sb.root, AWS_REGION="us-east-1", TMPDIR=sb.root)
+    env.pop("AWS_PROFILE", None)
+    env.pop("VIRTUAL_ENV", None)
+    os.makedirs(os.path.join(sb.root, ".mlcc", "hey-venv", "bin"), exist_ok=True)
+    sb.write(".mlcc/hey-venv/bin/activate", "# stub venv\n")
+    r = subprocess.run(["/bin/bash", script], cwd=sb.root, env=env, capture_output=True, text=True, timeout=60)
+    return r.returncode, r.stdout, r.stderr
+
+
+def test_status_at_zero_shows_the_state_line_and_the_warning(stz_sandbox):
+    sb = stz_sandbox
+    script = _status_sandbox(sb, 0)
+    rc, out, err = _run_status(sb, script)
+    assert rc == 0, out + err
+    assert "scale-to-zero: on (min 0, max 2); current copies: 0" in out
+    assert "requests FAIL until a copy is ready" in out
+    assert "0/0" in out, "the Current/Desired copy fields are reused"
+
+
+def test_status_with_a_copy_shows_the_line_without_the_warning(stz_sandbox):
+    sb = stz_sandbox
+    script = _status_sandbox(sb, 1)
+    rc, out, err = _run_status(sb, script)
+    assert rc == 0, out + err
+    assert "scale-to-zero: on (min 0, max 2); current copies: 1" in out
+    assert "requests FAIL" not in out
