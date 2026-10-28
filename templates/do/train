@@ -276,6 +276,18 @@ _list_techniques() {
     echo "${techniques:-none found}"
 }
 
+# ── _have_pyyaml() ───────────────────────────────────────────────────────────
+# YAML parser selection. python3 + PyYAML is preferred everywhere; yq is only a
+# fallback when PyYAML is missing. The two disagree on scalars: mikefarah yq is
+# YAML 1.2 and turns `learning_rate: 2e-4` into the float 0.0002, while PyYAML
+# (YAML 1.1) keeps the string "2e-4". Preferring yq made the same project send
+# different hyperparameter strings depending on whether yq happened to be
+# installed (GitHub runners ship it), breaking the helper's "stringified,
+# nothing coerced" contract.
+_have_pyyaml() {
+    command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1
+}
+
 # ── _resolve_technique() ─────────────────────────────────────────────────────
 # Determine technique from CLI flag or config.yaml, validate directory exists.
 # Sets TECHNIQUE and TRAIN_SCRIPT_PATH.
@@ -285,7 +297,7 @@ _resolve_technique() {
     # Priority: CLI flag > config.yaml > default (custom)
     if [ -n "${ARG_TECHNIQUE}" ]; then
         TECHNIQUE="${ARG_TECHNIQUE}"
-    elif command -v yq &>/dev/null; then
+    elif ! _have_pyyaml && command -v yq &>/dev/null; then
         TECHNIQUE=$(yq -r '.technique // "custom"' "${CONFIG_FILE}")
     elif command -v python3 &>/dev/null; then
         TECHNIQUE=$(python3 -c "
@@ -329,7 +341,7 @@ _load_technique_defaults() {
         return 0
     fi
 
-    if command -v yq &>/dev/null; then
+    if ! _have_pyyaml && command -v yq &>/dev/null; then
         TECHNIQUE_DEFAULTS_JSON=$(yq -o=json '.' "${defaults_file}" 2>/dev/null) || TECHNIQUE_DEFAULTS_JSON="{}"
     elif command -v python3 &>/dev/null; then
         TECHNIQUE_DEFAULTS_JSON=$(python3 -c "
@@ -679,7 +691,9 @@ _parse_config() {
         exit 1
     fi
 
-    if command -v yq &>/dev/null; then
+    if _have_pyyaml; then
+        _parse_config_python
+    elif command -v yq &>/dev/null; then
         _parse_config_yq
     elif command -v python3 &>/dev/null; then
         _parse_config_python
