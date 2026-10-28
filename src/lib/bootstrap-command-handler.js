@@ -78,6 +78,7 @@ const DENORMALIZED_FLAT_KEYS = [
     'modelPackageGroupName',
     // training
     'mlflowAppArn', 'artifactsS3Bucket', 'trainingS3Bucket', 'adapterS3Bucket', 'rewardLambdaRoleArn',
+    'hpTrainRoleArn',
     // ci
     'ciInfraProvisioned', 'ciTableName', 'codebuildSourceS3Bucket',
     // eks (BL143)
@@ -1239,6 +1240,12 @@ export default class BootstrapCommandHandler {
             // role on the CLI.
             if (outputs.training.RewardLambdaRoleArn) {
                 profileData.rewardLambdaRoleArn = outputs.training.RewardLambdaRoleArn;
+            }
+            // Wave 11 R3.2: the HyperPod training (Pod Identity) role. Threaded to
+            // the runtime as MLCC_HP_TRAIN_ROLE_ARN; the hp-eks cluster contract
+            // compares the owner's association against it.
+            if (outputs.training.HpTrainRoleArn) {
+                profileData.hpTrainRoleArn = outputs.training.HpTrainRoleArn;
             }
         }
 
