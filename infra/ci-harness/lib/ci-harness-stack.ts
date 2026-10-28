@@ -1182,7 +1182,11 @@ export class MlccCiHarnessStack extends cdk.Stack {
             ],
         });
 
-        // Glue permissions for partition management
+        // Glue permissions for partition management. GetPartition + UpdatePartition
+        // (Wave 9, R11.4): the benchmark writer reconciles an existing partition's
+        // column list with the table's after a schema change (BL216). Kept in
+        // conformance with bootstrap-modules/ci BenchmarkPartitionRegister by
+        // test/benchmark-writer-iam.test.ts.
         const benchmarkGluePolicy = new iam.PolicyStatement({
             sid: 'GlueCatalogAccess',
             effect: iam.Effect.ALLOW,
@@ -1192,6 +1196,8 @@ export class MlccCiHarnessStack extends cdk.Stack {
                 'glue:GetPartitions',
                 'glue:BatchCreatePartition',
                 'glue:CreatePartition',
+                'glue:GetPartition',
+                'glue:UpdatePartition',
             ],
             resources: [
                 'arn:aws:glue:*:*:catalog',
@@ -1211,10 +1217,20 @@ export class MlccCiHarnessStack extends cdk.Stack {
             resources: ['*'],
         });
 
+        // Price List API lookup (Wave 9, R7): the benchmark writer resolves
+        // on-demand instance and Bedrock prices via pricing:GetProducts. The
+        // Pricing API has no resource-level permissions, so Resource must be '*'.
+        const benchmarkPricingPolicy = new iam.PolicyStatement({
+            sid: 'BenchmarkPriceLookup',
+            effect: iam.Effect.ALLOW,
+            actions: ['pricing:GetProducts'],
+            resources: ['*'],
+        });
+
         // Create a managed policy for benchmark permissions so we can condition it
         const benchmarkPolicy = new iam.Policy(this, 'BenchmarkWritePolicy', {
             policyName: 'mlcc-ci-benchmark-write-policy',
-            statements: [benchmarkS3Policy, benchmarkGluePolicy, benchmarkAthenaPolicy],
+            statements: [benchmarkS3Policy, benchmarkGluePolicy, benchmarkAthenaPolicy, benchmarkPricingPolicy],
         });
         benchmarkPolicy.attachToRole(codebuildRole);
 
