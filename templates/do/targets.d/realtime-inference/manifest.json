@@ -13,10 +13,11 @@
     "IC_GPU_COUNT": "auto",
     "INSTANCE_TYPES": ""
   },
-  "runtime_owned_vars": ["DEPLOYMENT_TARGET_SMAI_STATUS"],
+  "runtime_owned_vars": ["DEPLOYMENT_TARGET_SMAI_STATUS", "SCALE_TO_ZERO", "SCALE_MAX_CAPACITY", "SCALE_TO_ZERO_STATUS"],
   "serving_config_source": "sagemaker-ic",
   "service_quota_usage": "endpoint usage",
   "pricing": { "service": "AmazonSageMaker", "component": "Hosting", "instance_count": { "basis": "endpoint-current" } },
+  "scale_to_zero": { "support": "native", "mechanism": "sagemaker-ic-step", "wake_signal": "NoCapacityInvocationFailures", "requests_at_zero": "fail", "idle_billing": "none-at-zero", "enabled": true },
   "verbs": {
     "optimize": true,
     "add-ic": true,

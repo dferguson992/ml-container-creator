@@ -41,7 +41,8 @@ import {
     statusVarToAnswerKey,
     adapterDelivery,
     pricing,
-    observability
+    observability,
+    scaleToZero
 } from '../../src/lib/target-manifest-reader.js';
 import { listServeEngines, metricSignals } from '../../src/lib/serve-manifest-reader.js';
 
@@ -411,5 +412,46 @@ describe('Wave 9 (R1/R6/R12, OQ-9.9) — observability + verbs.metrics are decla
             assert.ok(!fn.includes(`'${d.target}'`), `_collect_gpu_signals must not branch on '${d.target}'`);
         }
         assert.match(read('templates/do/metrics'), /target_manifest\.py" verbs/);
+    });
+});
+describe('Wave 10 (ADR-014 R1, R8.1) — scale_to_zero is declared on every target and read by both readers', () => {
+    const py = process.env.MLCC_PYTHON || 'python3';
+    const schema = JSON.parse(read('templates/do/targets.d/manifest.schema.json'));
+    const validate = new Ajv({ allErrors: true, strict: false }).compile(schema);
+    it('the schema requires the block', () => {
+        assert.ok(schema.required.includes('scale_to_zero'));
+    });
+    for (const d of descriptors) {
+        it(`${d.target} declares a valid scale_to_zero block`, () => {
+            assert.ok(d.scale_to_zero, `${d.target} must declare scale_to_zero`);
+            assert.ok(validate(d), JSON.stringify(validate.errors));
+        });
+        it(`${d.target}: enabled implies native + mechanism + wake signal; disabled carries a reason`, () => {
+            const s = d.scale_to_zero;
+            if (s.enabled) {
+                assert.strictEqual(s.support, 'native');
+                assert.ok(s.mechanism && s.wake_signal);
+            } else {
+                assert.ok(s.reason && s.reason.length > 10, 'reason is shown verbatim on refusal');
+            }
+        });
+    }
+    it('the schema rejects enabled on a non-native target and a disabled block without a reason', () => {
+        const base = descriptors.find((d) => d.scale_to_zero.enabled);
+        assert.ok(base, 'at least one enabled target');
+        const notNative = { ...base, scale_to_zero: { ...base.scale_to_zero, support: 'pod-only' } };
+        assert.ok(!validate(notNative), 'enabled + pod-only must be invalid');
+        const noMech = { ...base, scale_to_zero: { ...base.scale_to_zero, mechanism: null } };
+        assert.ok(!validate(noMech), 'enabled + null mechanism must be invalid');
+        const noReason = { ...base, scale_to_zero: { ...base.scale_to_zero, enabled: false } };
+        assert.ok(!validate(noReason), 'disabled without a reason must be invalid');
+    });
+    it('the Python reader (target_manifest.py scale_to_zero) agrees with the Node reader', () => {
+        for (const d of descriptors) {
+            const r = spawnSync(py, [join(ROOT, 'templates/do/lib/python/target_manifest.py'), 'scale_to_zero', d.target],
+                { encoding: 'utf8' });
+            assert.strictEqual(r.status, 0, r.stderr);
+            assert.deepStrictEqual(JSON.parse(r.stdout), scaleToZero(d.target), d.target);
+        }
     });
 });

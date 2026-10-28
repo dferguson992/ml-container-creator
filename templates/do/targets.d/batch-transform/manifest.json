@@ -17,6 +17,7 @@
   "serving_config_source": "sagemaker-ic",
   "service_quota_usage": "transform job usage",
   "pricing": { "service": "AmazonSageMaker", "component": "BatchTransform", "instance_count": { "basis": "not-benchmarked" } },
+  "scale_to_zero": { "support": "not-applicable", "mechanism": null, "wake_signal": null, "requests_at_zero": "n/a", "idle_billing": "n/a", "enabled": false, "reason": "batch transform jobs do not idle: a job releases its instances when it completes (ADR-014)" },
   "verbs": {
     "optimize": false,
     "add-ic": false,
