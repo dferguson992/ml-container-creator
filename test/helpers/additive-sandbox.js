@@ -42,6 +42,8 @@ export function makeSandbox({ scripts = [], config = '', pyHelpers = false, real
     writeFileSync(join(libDir, 'profile.sh'), '# stub profile.sh\n');
     // Bucket consolidation R3: the thin shell wrapper over s3_layout.py.
     writeFileSync(join(libDir, 's3-layout.sh'), readFileSync(join(DO_SRC, 'lib/s3-layout.sh')));
+    // Wave 11 R7.4: the shared IEC render sourced by deploy.d/hyperpod-eks and do/add-pod.
+    writeFileSync(join(libDir, 'hp-iec-render.sh'), readFileSync(join(DO_SRC, 'lib/hp-iec-render.sh')));
     // _require_python_env resolves <root>/.mlcc/hey-venv/bin/activate.
     mkdirSync(join(root, '.mlcc/hey-venv/bin'), { recursive: true });
     writeFileSync(join(root, '.mlcc/hey-venv/bin/activate'), '# stub venv\n');
