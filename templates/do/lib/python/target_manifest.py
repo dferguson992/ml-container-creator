@@ -32,6 +32,7 @@ CLI (one-shot, for bash callers):
     pricing           — prints the JSON pricing object (Wave 9 price resolver)
     observability     — prints the JSON object (Wave 9: store, selector, dashboard ...)
     service_quota_usage — prints the Service Quotas usage suffix (or "")
+    scale_to_zero     — prints the JSON object (Wave 10: support, mechanism, enabled ...)
     resolve           — resolves an alias to its canonical target name
 
   <target> accepts a canonical name OR an alias (resolved via `aliases`).
@@ -223,6 +224,25 @@ def observability(target: str, targets_dir: str | None = None) -> dict:
     return obs
 
 
+def scale_to_zero(target: str, targets_dir: str | None = None) -> dict:
+    """Return the target's scale_to_zero declaration (Wave 10, ADR-014 R1):
+    {support, mechanism, wake_signal, requests_at_zero, idle_billing, enabled,
+    reason}. A target without the block reads as not-applicable and disabled,
+    so callers refuse instead of erroring (the schema requires the block)."""
+    block = dict(read_manifest(target, targets_dir).get("scale_to_zero") or {})
+    if not block:
+        block = {
+            "support": "not-applicable",
+            "mechanism": None,
+            "wake_signal": None,
+            "requests_at_zero": "n/a",
+            "idle_billing": "n/a",
+            "enabled": False,
+            "reason": "this target declares no scale_to_zero capability",
+        }
+    return block
+
+
 def service_quota_usage(target: str, targets_dir: str | None = None) -> str:
     """Return the SageMaker Service Quotas usage suffix for the target's
     instances (e.g. 'endpoint usage'), or '' when capacity is cluster-provided."""
@@ -231,6 +251,8 @@ def service_quota_usage(target: str, targets_dir: str | None = None) -> str:
 
 _ARRAY_FIELDS = {"aliases", "required_vars", "runtime_owned_vars"}
 _OBJECT_FIELDS = {"optional_vars", "verbs", "adapter_delivery", "cluster_contract", "pricing", "observability"}
+# Fields whose accessor applies a default, so the CLI prints the accessor value.
+_ACCESSOR_FIELDS = {"scale_to_zero": scale_to_zero}
 _STRING_FIELDS = {
     "target",
     "status_var",
@@ -272,6 +294,9 @@ def _cli(argv: list[str]) -> int:
         return 0
     if field in _OBJECT_FIELDS:
         print(json.dumps(manifest.get(field, {})))
+        return 0
+    if field in _ACCESSOR_FIELDS:
+        print(json.dumps(_ACCESSOR_FIELDS[field](target)))
         return 0
 
     print(f"Error: unknown field '{field}'", file=sys.stderr)

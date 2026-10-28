@@ -60,6 +60,8 @@ FLAG_BATCH_OUTPUT_PATH=""
 FLAG_BATCH_SPLIT_TYPE=""
 FLAG_BATCH_STRATEGY=""
 FLAG_BATCH_MAX_CONCURRENT=""
+FLAG_SCALE_TO_ZERO=""
+FLAG_SCALE_MAX=""
 DEPLOY_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -189,6 +191,18 @@ while [ $# -gt 0 ]; do
             FLAG_INSTANCE_TYPES="$1"
             shift
             ;;
+        --scale-to-zero)
+            shift
+            if [ $# -eq 0 ]; then echo "❌ --scale-to-zero requires a value"; exit 1; fi
+            FLAG_SCALE_TO_ZERO="$1"
+            shift
+            ;;
+        --scale-max)
+            shift
+            if [ $# -eq 0 ]; then echo "❌ --scale-max requires a value"; exit 1; fi
+            FLAG_SCALE_MAX="$1"
+            shift
+            ;;
         # <<< END GENERATED deploy-flag arg-parse
         --status)
             FLAG_STATUS=1
@@ -257,6 +271,12 @@ while [ $# -gt 0 ]; do
             echo "  --async-output-path <p>     S3 output path"
             echo "  --async-sns-topic <arn>     SNS topic ARN for completion notifications"
             echo "  --async-max-concurrent <n>  Max concurrent async invocations"
+            echo "  --scale-to-zero <on|off>    Real-time IC endpoints only: scale to zero instances when"
+            echo "                              idle (opt-in). Not for interactive SLAs: while at zero,"
+            echo "                              requests FAIL for minutes until a copy is ready."
+            echo "                              With --reconfigure, applies to the live endpoint."
+            echo "                              See docs/scale-to-zero.md"
+            echo "  --scale-max <n>             Max IC copies and instances with scale-to-zero (1-20, default 1)"
             echo ""
             echo "Batch Transform flags:"
             echo "  --batch-input-path <p>      S3 input path (required)"
@@ -303,6 +323,30 @@ if [ -n "$FLAG_TARGET" ]; then
         async)                      FLAG_TARGET="async-inference" ;;
     esac
     DEPLOYMENT_TARGET="$FLAG_TARGET"
+fi
+
+# ── Scale-to-zero flags (Wave 10, ADR-014; do/lib/scale-to-zero.sh) ───────────
+# A bad --scale-to-zero / --scale-max value exits 1 here, before any AWS call.
+# A target whose descriptor has scale_to_zero.enabled=false refuses either flag
+# with the descriptor reason (exit 3). --dry-run writes nothing to do/config.
+source "${SCRIPT_DIR}/lib/scale-to-zero.sh"
+stz_parse_flags "${FLAG_SCALE_TO_ZERO:-}" "${FLAG_SCALE_MAX:-}"
+_STZ_PERSIST=1
+[ "${FLAG_DRY_RUN:-0}" -eq 1 ] && _STZ_PERSIST=0
+if [ -n "${STZ_FLAGS_GIVEN}" ] && [ -n "${DEPLOYMENT_TARGET:-}" ]; then
+    stz_apply_flags "${DEPLOYMENT_TARGET}" "${_STZ_PERSIST}"
+    if stz_target_live "${DEPLOYMENT_TARGET}"; then
+        if [ "${FLAG_RECONFIGURE:-0}" -eq 1 ]; then
+            # R2.5: --reconfigure + a scale-to-zero flag changes the LIVE endpoint
+            # in place (no clean, no re-prompt), then exits 0 / 4 / 5.
+            _STZ_RC=0
+            stz_reconfigure_live "${DEPLOYMENT_TARGET}" || _STZ_RC=$?
+            exit "${_STZ_RC}"
+        elif [ "${FLAG_DRY_RUN:-0}" -ne 1 ]; then
+            echo "ℹ️  Saved SCALE_TO_ZERO=${SCALE_TO_ZERO} (max ${SCALE_MAX_CAPACITY}) for ${DEPLOYMENT_TARGET}; the live deployment is unchanged."
+            echo "   Apply it in place: ./do/deploy --reconfigure --scale-to-zero $([ "${SCALE_TO_ZERO}" = "true" ] && echo on || echo off)"
+        fi
+    fi
 fi
 
 # ── Status var back-fill for v1.4 migration (FR-9.1) ─────────────────────
@@ -684,6 +728,8 @@ _HELPER_INVOKED=0
     FLAG_QUEUE="${FLAG_QUEUE:-}"; [ -n "$FLAG_QUEUE" ] && _DEPLOY_FLAG_ARGS+=("--queue" "$FLAG_QUEUE")
     FLAG_GPU_COUNT="${FLAG_GPU_COUNT:-}"; [ -n "$FLAG_GPU_COUNT" ] && _DEPLOY_FLAG_ARGS+=("--gpu-count" "$FLAG_GPU_COUNT")
     FLAG_INSTANCE_TYPES="${FLAG_INSTANCE_TYPES:-}"; [ -n "$FLAG_INSTANCE_TYPES" ] && _DEPLOY_FLAG_ARGS+=("--instance-types" "$FLAG_INSTANCE_TYPES")
+    FLAG_SCALE_TO_ZERO="${FLAG_SCALE_TO_ZERO:-}"; [ -n "$FLAG_SCALE_TO_ZERO" ] && _DEPLOY_FLAG_ARGS+=("--scale-to-zero" "$FLAG_SCALE_TO_ZERO")
+    FLAG_SCALE_MAX="${FLAG_SCALE_MAX:-}"; [ -n "$FLAG_SCALE_MAX" ] && _DEPLOY_FLAG_ARGS+=("--scale-max" "$FLAG_SCALE_MAX")
     # <<< END GENERATED deploy-flag args-array
 if [ -z "${DEPLOYMENT_TARGET:-}" ] || [ "$_NEEDS_HELPER" -eq 1 ]; then
     # Invoke the deploy helper prompt to collect deployment parameters
@@ -789,6 +835,12 @@ if [ -n "${MLCC_DEPLOY_ERR_FILE:-}" ] && [ -f "${MLCC_DEPLOY_ERR_FILE}" ]; then
     _err=$(cat "${MLCC_DEPLOY_ERR_FILE}"); rm -f "${MLCC_DEPLOY_ERR_FILE}"
     echo "" >&2; echo "❌ ${_err}" >&2; echo "" >&2
     exit 1
+fi
+
+# Scale-to-zero (Wave 10): re-check now that the target and endpoint strategy
+# may only have come from the interactive builder.
+if [ -n "${STZ_FLAGS_GIVEN}" ] && [ -n "${DEPLOYMENT_TARGET:-}" ]; then
+    stz_apply_flags "${DEPLOYMENT_TARGET}" "${_STZ_PERSIST}"
 fi
 
 # ── Persist answers before dispatch (FR-2.5, CP-7) ────────
@@ -942,7 +994,8 @@ if [ "${FLAG_DRY_RUN:-0}" -eq 1 ]; then
                IC_GPU_COUNT INSTANCE_TYPES HP_CLUSTER_NAME HP_GPU_COUNT \
                HP_NAMESPACE HP_REPLICAS HP_QUEUE ASYNC_S3_OUTPUT_PATH \
                ASYNC_SNS_TOPIC ASYNC_MAX_CONCURRENT_INVOCATIONS BATCH_INPUT_PATH \
-               BATCH_OUTPUT_PATH BATCH_SPLIT_TYPE BATCH_STRATEGY BATCH_MAX_CONCURRENT; do
+               BATCH_OUTPUT_PATH BATCH_SPLIT_TYPE BATCH_STRATEGY BATCH_MAX_CONCURRENT \
+               SCALE_TO_ZERO SCALE_MAX_CAPACITY; do
         val="${!var:-}"
         if [ -n "$val" ]; then
             echo "  $var=$val"
@@ -951,6 +1004,11 @@ if [ "${FLAG_DRY_RUN:-0}" -eq 1 ]; then
     echo ""
     _run_sizing_preflight
     echo ""
+    # Wave 10: the planned scaling calls and the cold-start warning (nothing runs).
+    if stz_active "${DEPLOYMENT_TARGET}"; then
+        stz_plan "${DEPLOYMENT_TARGET}"
+        echo ""
+    fi
     echo "Would execute:"
     echo "  source ${SCRIPT_DIR}/deploy.d/${DEPLOYMENT_TARGET} ${DEPLOY_ARGS[*]:-}"
     echo ""

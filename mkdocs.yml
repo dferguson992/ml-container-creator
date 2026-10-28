@@ -61,6 +61,7 @@ nav:
       - Configuration: configuration.md
       - Secrets Management: secrets.md
       - Deployment & Inference: deployments.md
+      - Scale-to-Zero: scale-to-zero.md
       - Fine-Tuning: fine-tuning.md
       - Custom Training: custom-training.md
       - Authoring do/train Techniques: train-plugin-authoring.md

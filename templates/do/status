@@ -19,6 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/script-contract.sh"
 source "${SCRIPT_DIR}/config"
 source "${SCRIPT_DIR}/lib/aws-preflight.sh"
+source "${SCRIPT_DIR}/lib/scale-to-zero.sh"
 
 # ============================================================
 # SageMaker Real-Time Inference Status
@@ -178,6 +179,15 @@ echo ""
 # ============================================================
 TOTAL_GPU_USED=0
 IC_ROWS=""
+# Wave 10 (R5.3): lowest current copy count across the ICs ("" = none read).
+_STZ_MIN_COPIES=""
+_stz_track_copies() {
+    local _cur="${1%%/*}"
+    case "${_cur}" in ''|*[!0-9]*) return 0 ;; esac
+    if [ -z "${_STZ_MIN_COPIES}" ] || [ "${_cur}" -lt "${_STZ_MIN_COPIES}" ]; then
+        _STZ_MIN_COPIES="${_cur}"
+    fi
+}
 
 # "<current>/<desired>" copy counts from a DescribeInferenceComponent JSON
 # (RuntimeConfig.CurrentCopyCount / DesiredCopyCount); "-" when absent. Uses the
@@ -230,6 +240,7 @@ if [ -d "${SCRIPT_DIR}/ic" ]; then
 
         # Wave 9 R12.3: show Current AND Desired copies (Desired alone hid scale lag).
         ic_copy_count=$(_ic_copies "${IC_JSON}")
+        _stz_track_copies "${ic_copy_count}"
 
         TOTAL_GPU_USED=$(( TOTAL_GPU_USED + ic_gpu_count ))
 
@@ -277,6 +288,7 @@ else
 
         # Wave 9 R12.3: show Current AND Desired copies (Desired alone hid scale lag).
         ic_copy_count=$(_ic_copies "${IC_JSON}")
+        _stz_track_copies "${ic_copy_count}"
 
         TOTAL_GPU_USED=$(( TOTAL_GPU_USED + ic_gpu_count ))
 
@@ -293,6 +305,20 @@ else
 fi
 
 echo ""
+
+# ============================================================
+# Scale-to-zero (Wave 10, ADR-014 R5.3)
+# ============================================================
+# Derived from the descriptor (scale_to_zero.enabled) + do/config SCALE_TO_ZERO;
+# min/max read live from the scalable target (read-only). At 0 copies the plain
+# warning prints: requests to this endpoint fail until a copy is ready.
+if stz_active "${DEPLOYMENT_TARGET:-}"; then
+    stz_status_line "${_STZ_MIN_COPIES}"
+    if [ "${_STZ_MIN_COPIES}" = "0" ]; then
+        stz_warning "${DEPLOYMENT_TARGET}"
+    fi
+    echo ""
+fi
 
 # ============================================================
 # Native dashboard pointer (Wave 9 R12.2, one line)

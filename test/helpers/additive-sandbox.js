@@ -42,6 +42,13 @@ export function makeSandbox({ scripts = [], config = '', pyHelpers = false, real
     writeFileSync(join(libDir, 'profile.sh'), '# stub profile.sh\n');
     // Bucket consolidation R3: the thin shell wrapper over s3_layout.py.
     writeFileSync(join(libDir, 's3-layout.sh'), readFileSync(join(DO_SRC, 'lib/s3-layout.sh')));
+    // Wave 10 (ADR-014): do/deploy, do/status and do/add-ic source the scale-to-zero
+    // helper; it reads the descriptors through scale_to_zero.py (and degrades to
+    // "off" when they are absent, i.e. without pyHelpers).
+    writeFileSync(join(libDir, 'scale-to-zero.sh'), readFileSync(join(DO_SRC, 'lib/scale-to-zero.sh')));
+    for (const py of ['scale_to_zero.py', 'scale_to_zero_reference.json']) {
+        writeFileSync(join(pyDir, py), readFileSync(join(DO_SRC, 'lib/python', py)));
+    }
     // _require_python_env resolves <root>/.mlcc/hey-venv/bin/activate.
     mkdirSync(join(root, '.mlcc/hey-venv/bin'), { recursive: true });
     writeFileSync(join(root, '.mlcc/hey-venv/bin/activate'), '# stub venv\n');
