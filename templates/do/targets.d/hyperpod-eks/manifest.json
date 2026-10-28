@@ -24,7 +24,9 @@
     "HP_CPU_REQUEST",
     "HP_MEM_REQUEST",
     "KUBECONFIG",
-    "HP_BENCHMARK_METRICS_ENABLED"
+    "HP_BENCHMARK_METRICS_ENABLED",
+    "TRAIN_HP_INSTANCE_GROUP",
+    "TRAIN_HP_NAMESPACE"
   ],
   "serving_config_source": "kubernetes",
   "cluster_contract": { "script": "lib/python/hyperpod_ops.py", "entry": "preflight-env" },
