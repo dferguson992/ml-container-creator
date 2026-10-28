@@ -211,10 +211,20 @@ _stz_set_status() {
     [ "${_STZ_PLAN:-0}" = "1" ] && return 0
     SCALE_TO_ZERO_STATUS="$1"
     export SCALE_TO_ZERO_STATUS
-    if type _update_config >/dev/null 2>&1; then
-        _update_config "SCALE_TO_ZERO_STATUS" "$1"
-    elif type _update_config_var >/dev/null 2>&1; then
-        _update_config_var "SCALE_TO_ZERO_STATUS" "$1"
+    _stz_write_config "SCALE_TO_ZERO_STATUS" "$1"
+}
+
+# _stz_write_config <key> <value> — replace or append `export KEY="value"` in
+# do/config (the same edit as do/deploy's _update_config; no dependency on it,
+# so clean.d and the in-place reconfigure can call it too).
+_stz_write_config() {
+    local _config="${_STZ_DO_DIR}/config"
+    [ -f "${_config}" ] || return 0
+    if grep -q "^export $1=" "${_config}" 2>/dev/null; then
+        sed -i.bak "s|^export $1=.*|export $1=\"$2\"|" "${_config}"
+        rm -f "${_config}.bak"
+    else
+        echo "export $1=\"$2\"" >> "${_config}"
     fi
 }
 
@@ -569,9 +579,7 @@ _stz_ic_step_swap_config() {
         return 1
     fi
     ENDPOINT_CONFIG_NAME="${_new_epc}"
-    if type _update_config >/dev/null 2>&1; then
-        _update_config "ENDPOINT_CONFIG_NAME" "${_new_epc}"
-    fi
+    _stz_write_config "ENDPOINT_CONFIG_NAME" "${_new_epc}"
     _stz_record sagemaker-endpoint-config \
         "arn:aws:sagemaker:${AWS_REGION}:${AWS_ACCOUNT_ID:-}:endpoint-config/${_new_epc}" \
         "{\"endpointConfigName\":\"${_new_epc}\",\"instanceType\":\"${INSTANCE_TYPE:-}\",\"region\":\"${AWS_REGION}\"}"

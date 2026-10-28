@@ -303,3 +303,87 @@ def test_reconfigure_on_update_failure_is_exit_5_and_endpoint_unchanged(stz_sand
     assert rc == 5, out + err
     assert "NOT enabled" in err
     assert not [c for c in sb.calls() if c[0] == "application-autoscaling"], "no scaling resource without the variant"
+
+
+# ── R4.2: do/clean (clean.d/realtime-inference, rendered) ─────────────────────
+
+def _render(sb, rel, dest):
+    """Render an EJS do/ template into the sandbox (as generation does)."""
+    import os
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available to render the EJS template")
+    repo = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    js = ("const ejs=require('ejs'),fs=require('fs');"
+          "process.stdout.write(ejs.render(fs.readFileSync(process.argv[1],'utf8'),"
+          "{deploy_mode:'build',enableLora:false,includeBenchmark:false,serverEnvVars:{},existingEndpointName:''}));")
+    out = subprocess.run([node, "-e", js, os.path.join(repo, "templates", "do", rel)],
+                         cwd=repo, capture_output=True, text=True, check=True).stdout
+    return sb.write(dest, out, 0o755)
+
+
+def _clean_sandbox(sb, scale_to_zero):
+    sb.write("do/lib/profile.sh", "# stub profile.sh\n")
+    sb.write("bin/sleep", "#!/bin/bash\nexit 0\n", 0o755)  # skip the 15 s IC-deletion pause
+    sb.write("do/config", "\n".join([
+        'export PROJECT_NAME="stz"',
+        'export ENDPOINT_NAME="stz-endpoint-1"',
+        'export ENDPOINT_CONFIG_NAME="stz-epc-1"',
+        f'export INFERENCE_COMPONENT_NAME="{IC}"',
+        f'export SCALE_TO_ZERO="{scale_to_zero}"',
+        'export SCALE_TO_ZERO_STATUS="ok"' if scale_to_zero == "true" else 'export SCALE_TO_ZERO_STATUS=""',
+        '']))
+    return _render(sb, "clean.d/realtime-inference", "do/clean.d/realtime-inference")
+
+
+def _run_clean(sb, script):
+    import os
+    import subprocess
+    env = dict(os.environ, PATH=os.path.join(sb.root, "bin") + os.pathsep + os.environ["PATH"],
+               STZ_SANDBOX=sb.root, AWS_REGION="us-east-1", TMPDIR=sb.root)
+    env.pop("AWS_PROFILE", None)
+    r = subprocess.run(["/bin/bash", script, "endpoint", "--force"], cwd=sb.root, env=env,
+                       capture_output=True, text=True, timeout=60)
+    return r.returncode, r.stdout, r.stderr
+
+
+def test_clean_removes_scaling_resources_before_the_ic_and_endpoint(stz_sandbox):
+    sb = stz_sandbox
+    script = _clean_sandbox(sb, "true")
+    sb.rules([{"match": ["sts", "Account"], "stdout": "111122223333\n"}])
+    rc, out, err = _run_clean(sb, script)
+    assert rc == 0, out + err
+    ops = [c[1] for c in sb.calls() if c[0] != "sts"]
+    order = ["delete-alarms", "delete-scaling-policy", "deregister-scalable-target",
+             "delete-inference-component", "delete-endpoint"]
+    idx = [ops.index(o) for o in order]
+    assert idx == sorted(idx), f"clean order: {ops}"
+    assert ops.count("delete-scaling-policy") == 2
+    assert 'SCALE_TO_ZERO_STATUS=""' in sb.config()
+    assert any(m.startswith("delete --id cloudwatch:us-east-1:alarm/") for m in sb.manifest_calls())
+
+
+def test_clean_is_idempotent_when_scaling_resources_are_already_gone(stz_sandbox):
+    sb = stz_sandbox
+    script = _clean_sandbox(sb, "true")
+    sb.rules([
+        {"match": ["sts", "Account"], "stdout": "111122223333\n"},
+        {"match": ["delete-alarms"], "rc": 254, "stderr": "An error occurred (ResourceNotFound)\n"},
+        {"match": ["delete-scaling-policy"], "rc": 254, "stderr": "An error occurred (ObjectNotFoundException)\n"},
+        {"match": ["deregister-scalable-target"], "rc": 254, "stderr": "An error occurred (ObjectNotFoundException)\n"},
+    ])
+    rc, out, err = _run_clean(sb, script)
+    assert rc == 0, out + err
+    assert "could not be removed" not in out + err
+    assert "delete-endpoint" in [c[1] for c in sb.calls()]
+
+
+def test_clean_makes_no_scaling_call_when_never_enabled(stz_sandbox):
+    sb = stz_sandbox
+    script = _clean_sandbox(sb, "false")
+    sb.rules([{"match": ["sts", "Account"], "stdout": "111122223333\n"}])
+    rc, out, err = _run_clean(sb, script)
+    assert rc == 0, out + err
+    assert not [c for c in sb.calls() if c[0] in ("application-autoscaling", "cloudwatch")]
