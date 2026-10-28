@@ -24,8 +24,6 @@ describe('Wave 10 — do/deploy scale-to-zero flags (behavioral, bash 3.2)', fun
 
     function setup(target, extra = []) {
         sb = makeSandbox({ scripts: ['deploy'], pyHelpers: true });
-        sb.write('do/lib/scale-to-zero.sh', readFileSync(join(DO_SRC, 'lib/scale-to-zero.sh')), 0o644);
-        sb.write('do/lib/python/scale_to_zero.py', readFileSync(join(DO_SRC, 'lib/python/scale_to_zero.py')), 0o644);
         sb.write('do/config', [
             'export PROJECT_NAME="stz-test"',
             `export DEPLOYMENT_TARGET="${target}"`,
