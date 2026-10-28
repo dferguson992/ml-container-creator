@@ -446,6 +446,15 @@ describe('Wave 10 (ADR-014 R1, R8.1) — scale_to_zero is declared on every targ
         const noReason = { ...base, scale_to_zero: { ...base.scale_to_zero, enabled: false } };
         assert.ok(!validate(noReason), 'disabled without a reason must be invalid');
     });
+    it('flag acceptance matches enabled: --scale-to-zero / --scale-max are declared exactly on enabled targets', () => {
+        for (const d of descriptors) {
+            const flags = (d.answer_params || []).map((p) => p.flag).filter(Boolean);
+            for (const f of ['--scale-to-zero', '--scale-max']) {
+                assert.strictEqual(flags.includes(f), d.scale_to_zero.enabled,
+                    `${d.target}: ${f} declared iff scale_to_zero.enabled`);
+            }
+        }
+    });
     it('the Python reader (target_manifest.py scale_to_zero) agrees with the Node reader', () => {
         for (const d of descriptors) {
             const r = spawnSync(py, [join(ROOT, 'templates/do/lib/python/target_manifest.py'), 'scale_to_zero', d.target],
