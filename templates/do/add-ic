@@ -36,8 +36,9 @@ source "${SCRIPT_DIR}/config"
 # mechanism, which only realtime-inference exposes. The refusal on every other
 # target (hyperpod-eks / eks / async / batch) is derived from the contract
 # table's empty mechanism intersection and names the right verb — e.g. on
-# hyperpod-eks a LoRA goes through `do/adapter add <name> --from-tune`, and a
-# full model on a cluster is honestly "not supported yet" (do/add-pod, BL149).
+# hyperpod-eks a LoRA goes through `do/adapter add <name> --from-tune` and a
+# full model through `do/add-pod <name> --from-tune` (BL149); plain eks has no
+# full-model verb yet (do/add-pod on eks is post-2.0).
 _additive_verb_supported_on add-ic "${DEPLOYMENT_TARGET:-}"
 
 # ============================================================

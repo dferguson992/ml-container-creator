@@ -21,6 +21,7 @@
 #   HP_IEC_NAME             rewrites metadata.name, spec.endpointName and the `app:` label
 #   HP_MODEL_LOCATION       rewrites modelLocation (the S3 key prefix of the weights)
 #   HP_IEC_ROLE             adds labels mlcc.aws/project-name=<PROJECT_NAME>, mlcc.aws/role=<role>
+#   HP_IEC_REPLICAS         rewrites spec.replicas (do/add-pod serves one replica)
 #   HP_IEC_NODE_GROUP       replaces spec.instanceType with a nodeAffinity pinning the
 #                           instance group (the CRD makes the two mutually exclusive)
 #
@@ -71,6 +72,7 @@ _hp_render_iec() {
             HP_MODEL_LOCATION="${HP_MODEL_LOCATION:-}" \
             HP_IEC_ROLE="${HP_IEC_ROLE:-}" \
             HP_IEC_NODE_GROUP="${HP_IEC_NODE_GROUP:-}" \
+            HP_IEC_REPLICAS="${HP_IEC_REPLICAS:-}" \
             HP_IEC_PROJECT="${PROJECT_NAME:-}" \
             python3 -c '
 import os, re, sys
@@ -141,6 +143,10 @@ if iec_name and any(l.startswith("kind: InferenceEndpointConfig") for l in out):
         i = _one(r"^  labels:\s*$", "metadata.labels")
         out[i + 1:i + 1] = ["    mlcc.aws/project-name: \"%s\"" % os.environ.get("HP_IEC_PROJECT", ""),
                             "    mlcc.aws/role: \"%s\"" % role]
+    replicas = os.environ.get("HP_IEC_REPLICAS", "")
+    if replicas:
+        i = _one(r"^  replicas:\s*", "spec.replicas")
+        out[i] = "  replicas: %s" % replicas
     group = os.environ.get("HP_IEC_NODE_GROUP", "")
     if group:
         i = _one(r"^  instanceType:\s*", "spec.instanceType")

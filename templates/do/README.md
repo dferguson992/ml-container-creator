@@ -24,6 +24,7 @@ All settings centralized in `do/config`. Override via environment variables.
 | `./do/stage` | Download and stage model artifacts (HuggingFace → S3) |
 | `./do/deploy` | Deploy endpoint to SageMaker |
 | `./do/add-ic` | Add an inference component to an existing endpoint |
+| `./do/add-pod` | hyperpod-eks: serve a full fine-tuned model as its own InferenceEndpointConfig |
 | `./do/test` | Test local container or live endpoint |
 | `./do/benchmark` | Run SageMaker AI Benchmarking job |
 | `./do/optimize` | Apply model optimizations (quantization, compilation) |

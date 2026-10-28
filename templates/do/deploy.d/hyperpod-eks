@@ -209,25 +209,30 @@ echo "📁 Ensuring namespace exists: ${HP_NAMESPACE}"
 # during the operator's model download and is not exposed to the container.
 # ─────────────────────────────────────────────────────────────────────────────
 
-if [ -n "${RESOLVED_HF_TOKEN:-}" ]; then
-    echo "🔑 Creating K8s Secret 'hf-token-secret' in namespace '${HP_NAMESPACE}'..."
-    kubectl create secret generic hf-token-secret \
-        --from-literal=token="${RESOLVED_HF_TOKEN}" \
-        --namespace "${HP_NAMESPACE}" \
-        --dry-run=client -o yaml | kubectl apply -f - 2>&1 || {
-        echo "⚠️  Warning: Could not create hf-token-secret (will continue)"
-        echo "   The pod may fail to pull gated models — set HF_TOKEN_ARN in do/config"
-    }
-    echo "✅ HuggingFace token secret ready"
-else
-    echo "   ⚠️  No HuggingFace token configured"
-    echo "   Set HF_TOKEN_ARN in do/config or run: mcc bootstrap add-secret hfToken <arn>"
-    echo "   (Continuing — token only required for gated HuggingFace models)"
-fi
+# Wave 11 (do/add-pod): MLCC_HP_RENDER_ONLY=<dir> runs this driver only up to the
+# IEC render (same derivation as a real deploy) and copies the manifests to <dir>;
+# it makes no cluster write (the base deployment already created both objects).
+if [ -z "${MLCC_HP_RENDER_ONLY:-}" ]; then
+    if [ -n "${RESOLVED_HF_TOKEN:-}" ]; then
+        echo "🔑 Creating K8s Secret 'hf-token-secret' in namespace '${HP_NAMESPACE}'..."
+        kubectl create secret generic hf-token-secret \
+            --from-literal=token="${RESOLVED_HF_TOKEN}" \
+            --namespace "${HP_NAMESPACE}" \
+            --dry-run=client -o yaml | kubectl apply -f - 2>&1 || {
+            echo "⚠️  Warning: Could not create hf-token-secret (will continue)"
+            echo "   The pod may fail to pull gated models — set HF_TOKEN_ARN in do/config"
+        }
+        echo "✅ HuggingFace token secret ready"
+    else
+        echo "   ⚠️  No HuggingFace token configured"
+        echo "   Set HF_TOKEN_ARN in do/config or run: mcc bootstrap add-secret hfToken <arn>"
+        echo "   (Continuing — token only required for gated HuggingFace models)"
+    fi
 
-echo "📁 Ensuring namespace exists: ${HP_NAMESPACE}"
-if ! kubectl create namespace "${HP_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - 2>&1; then
-    echo "⚠️  Warning: Could not create/verify namespace"
+    echo "📁 Ensuring namespace exists: ${HP_NAMESPACE}"
+    if ! kubectl create namespace "${HP_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - 2>&1; then
+        echo "⚠️  Warning: Could not create/verify namespace"
+    fi
 fi
 
 # ── Preflight: cluster inference capability (WARN, do not block) ──────────────
@@ -815,6 +820,11 @@ _hp_render_iec "${_HP_RENDER_DIR}" hyperpod || {
     rm -rf "${_HP_RENDER_DIR}"
     exit 3
 }
+if [ -n "${MLCC_HP_RENDER_ONLY:-}" ]; then
+    cp "${_HP_RENDER_DIR}"/* "${MLCC_HP_RENDER_ONLY}/"
+    rm -rf "${_HP_RENDER_DIR}"
+    return 0 2>/dev/null || exit 0
+fi
 
 # ── Contract preflight (Wave 6.1 R6; read-only, report only) ──────────────────
 # Mirrors the eks BL156 contract for hyperpod-eks: S3 CSI driver present, the
