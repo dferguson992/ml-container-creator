@@ -22,7 +22,7 @@
 import assert from 'node:assert';
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import {
-    mkdtempSync, cpSync, readFileSync, rmSync, existsSync
+    mkdtempSync, cpSync, readFileSync, rmSync, existsSync, writeFileSync
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -307,6 +307,13 @@ describe('Wave 11 R9.3 — hp-eks workload_kind, namespace exclusion, catalog hp
     });
 
     it('backfills workload_kind on an unchanged (version-skipped) descriptor', async () => {
+        // Start from a pre-Wave-11 descriptor (the shipped one may already carry a kind).
+        const mp = path.join(tmp, 'sft', 'manifest.json');
+        const pre = JSON.parse(readFileSync(mp, 'utf8'));
+        for (const v of Object.values(pre.variants)) {
+            if (v._synced && v._synced['hp-eks']) delete v._synced['hp-eks'].workload_kind;
+        }
+        writeFileSync(mp, JSON.stringify(pre, null, 2));
         await syncTuneDescriptors(HP_RECIPES, { fetchOverrideParams: async () => knobs, tuneDir: tmp, fetchPayloadTemplate: async () => null });
         assert.ok(!read('sft')._synced['hp-eks'].workload_kind);
         const res = await syncTuneDescriptors(HP_RECIPES, { fetchOverrideParams: async () => knobs, tuneDir: tmp, fetchPayloadTemplate: async (u) => templates(u) });
