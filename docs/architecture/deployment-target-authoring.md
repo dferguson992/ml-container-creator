@@ -204,6 +204,18 @@ derived from the descriptor.
    `dashboard` for a real store) and `verbs.metrics` (must equal `store != none`).
    `do/benchmark`'s GPU/engine columns, `do/metrics` and the `do/status` dashboard
    line derive from it; a target with `store: none` gets the `do/metrics` skip notice.
+9. **Declare scale-to-zero** (Wave 10, [ADR-014](../adr/ADR-014-scale-from-zero.md)) —
+   the descriptor's required `scale_to_zero` block: `support` (`native` |
+   `pod-only` | `requires-cluster-addon` | `not-applicable`), `mechanism`,
+   `wake_signal`, `requests_at_zero` (`fail` | `queued` | `unknown` | `n/a`),
+   `idle_billing`, `enabled`, and a `reason` whenever `enabled` is false. The schema
+   allows `enabled: true` only with `support: native` plus a mechanism and wake
+   signal. `do/deploy --scale-to-zero` acceptance (declare `--scale-to-zero` /
+   `--scale-max` in `answer_params` only when enabled), the refusal reason, the
+   cold-start warning wording, `do/status` and `do/clean` all derive from it, and
+   the matrix in [scale-to-zero.md](../scale-to-zero.md) is rendered from it. A new
+   target that cannot scale to zero declares `enabled: false` with its reason;
+   enabling one means adding its `mechanism` arm to `do/lib/scale-to-zero.sh`.
 
 Everything else — the guard's status-var case, `do-config.js` `SHELL_VAR_TO_ANSWER`,
 `regenerate`'s `RUNTIME_OWNED_VARS`, `deploy_schema.py`'s `SCHEMAS` / `STATUS_VARS`
