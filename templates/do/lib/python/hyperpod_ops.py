@@ -39,7 +39,16 @@ Subcommands (all print one JSON object on stdout; human notes on stderr):
       pod down — R4.2). If the surge instance never joined, UpdateCluster sets the
       target back to N instead. Never goes below N; never scales to zero.
 
-  preflight-env   (same preflight; inputs from do/config env — do/validate)
+  contract --verb train|tune|add-pod [--group G] [--instance-type T] [--gpus N]
+           [--dataset s3://...] [--job J] [--storage-class SC] [--model-bucket B]
+           [--template-gpus N --template-efa N] [--adapt-shape] [--allow-surge] [--json]
+      Wave 11 R2, read-only: the verb-scoped cluster contract (training-operator,
+      pod-identity, scratch-volume, free-gpus, gpu-shape-fit, local-queue,
+      s3-csi-role). Prints {"findings": [...], "resolved": {...}, "blocked": b};
+      exit 4 on any block finding (the verb stops before any cluster write).
+
+  preflight-env   (same preflight; inputs from do/config env — do/validate; also
+                   reports the hp-eks training elements capped at warn)
   preflight --cluster C --namespace NS --project P --model-source S
             [--model-bucket B] [--lora-delivery true|false] [--eks-cluster E]
       R6, read-only: S3 CSI driver present; the model source is S3 when LoRA
@@ -472,6 +481,382 @@ def preflight(cluster: str, namespace: str, project: str, model_source: str,
     return {"findings": findings}
 
 
+# ── Wave 11 R2: verb-scoped cluster contract ──────────────────────────────────
+#
+# One read-only entry (`contract --verb train|tune|add-pod`) evaluates exactly the
+# elements the verb needs and returns the preflight findings shape plus a
+# `resolved` block (EKS cluster, chosen group / node / GPUs, scratch mode) that the
+# submit path consumes so nothing is looked up twice. A `block` finding means the
+# verb must stop (exit 4) BEFORE any cluster write. MLCC never performs a fix
+# (ADR-012): each finding names the owner's command. A transport / permission
+# error on a hard element fails CLOSED (block), never open.
+
+HPPJ_CRD = "hyperpodpytorchjobs.sagemaker.amazonaws.com"
+TRAINING_OPERATOR_NAMESPACE = "aws-hyperpod"
+TRAINING_OPERATOR_ADDON = "amazon-sagemaker-hyperpod-training-operator"
+TRAIN_SERVICE_ACCOUNT = "mlcc-train-sa"
+FSX_CLAIM = "fsx-claim"
+EFA_RESOURCE = "vpc.amazonaws.com/efa"
+DEFAULT_SC_ANNOTATION = "storageclass.kubernetes.io/is-default-class"
+CONTRACT_ELEMENTS = {
+    "train": ("training-operator", "pod-identity", "scratch-volume", "free-gpus", "local-queue"),
+    "tune": ("training-operator", "pod-identity", "scratch-volume", "free-gpus", "gpu-shape-fit", "local-queue"),
+    "add-pod": ("free-gpus", "local-queue", "s3-csi-role"),
+}
+
+
+def _not_found(err: str) -> bool:
+    return "NotFound" in err or "not found" in err
+
+
+def association_command(eks_cluster: str, namespace: str, role_arn: str, region: str) -> str:
+    """The ONE command the owner runs to bind mlcc-train-sa to the training role
+    (OQ-11.4). MLCC prints it; it never runs it."""
+    return (f"aws eks create-pod-identity-association --cluster-name {eks_cluster or '<eks-cluster>'} "
+            f"--namespace {namespace} --service-account {TRAIN_SERVICE_ACCOUNT} "
+            f"--role-arn {role_arn or '<MLCC_HP_TRAIN_ROLE_ARN>'} --region {region or '<region>'}")
+
+
+def eks_cluster_name(cluster: str, env: dict) -> tuple[str, str]:
+    """The EKS cluster behind a HyperPod cluster: EKS_CLUSTER_NAME when set, else
+    DescribeCluster Orchestrator.Eks.ClusterArn. Returns (name, error)."""
+    explicit = (env.get("EKS_CLUSTER_NAME") or "").strip()
+    if explicit:
+        return explicit, ""
+    if not cluster:
+        return "", "HP_CLUSTER_NAME is not set"
+    rc, out, err = _aws(["sagemaker", "describe-cluster", "--cluster-name", cluster,
+                         "--query", "Orchestrator.Eks.ClusterArn", "--output", "text"])
+    arn = out.strip()
+    if rc != 0 or not arn or arn == "None":
+        return "", (err.strip() or f"cluster '{cluster}' has no EKS orchestrator")
+    return arn.rsplit("/", 1)[-1], ""
+
+
+def _node_rows(nodes: list[dict], pods: list[dict]) -> list[dict]:
+    """free_gpus() rows plus the instance type and EFA allocatable per node."""
+    by_name = {(n.get("metadata") or {}).get("name", ""): n for n in nodes}
+    rows = free_gpus(nodes, pods)
+    for r in rows:
+        n = by_name.get(r["name"]) or {}
+        labels = (n.get("metadata") or {}).get("labels") or {}
+        r["instance_type"] = labels.get(INSTANCE_TYPE_LABEL, "")
+        try:
+            r["efa"] = int(str(((n.get("status") or {}).get("allocatable") or {}).get(EFA_RESOURCE, "0")))
+        except ValueError:
+            r["efa"] = 0
+    return rows
+
+
+def _gpu_pods_on(pods: list[dict], node_names: set) -> list[str]:
+    out = []
+    for p in pods:
+        if (p.get("spec") or {}).get("nodeName") not in node_names:
+            continue
+        if (p.get("status") or {}).get("phase") in ("Succeeded", "Failed") or _pod_gpus(p) <= 0:
+            continue
+        md = p.get("metadata") or {}
+        out.append(f"{md.get('namespace', '')}/{md.get('name', '')}")
+    return sorted(out)
+
+
+def pick_group(rows: list[dict], group: str = "", instance_type: str = "", gpus: int = 0) -> tuple[dict | None, str]:
+    """R4.2 group pick over live nodes: the named group (--instance-group /
+    TRAIN_HP_INSTANCE_GROUP) else the first name-sorted Ready GPU group with a
+    node that has the requested GPUs free (a WHOLE free node when --gpus is not
+    given), filtered by instance type. Never a hardcoded group or SKU."""
+    cands = [r for r in rows if r["ready"] and r["allocatable"] > 0 and r["group"]]
+    if group:
+        cands = [r for r in cands if r["group"] == group]
+        if not cands:
+            return None, f"instance group '{group}' has no Ready GPU node"
+    if instance_type:
+        cands = [r for r in cands if r["instance_type"] == instance_type]
+        if not cands:
+            return None, f"no Ready GPU node of instance type {instance_type}" + (f" in group '{group}'" if group else "")
+    for r in sorted(cands, key=lambda x: (x["group"], x["name"])):
+        if gpus and gpus > r["allocatable"]:
+            continue
+        need = gpus or r["allocatable"]
+        if r["free"] >= need:
+            return dict(r, gpus=need), ""
+    if gpus and all(gpus > r["allocatable"] for r in cands):
+        return None, f"--gpus {gpus} exceeds every candidate node's allocatable nvidia.com/gpu"
+    return None, "no candidate node has " + (f"{gpus} free GPU(s)" if gpus else "a whole free GPU node")
+
+
+def _check_training_operator(findings: list) -> None:
+    rc, out, err = _run(["kubectl", "get", "crd", HPPJ_CRD, "-o", "name"])
+    fix = (f"Install the {TRAINING_OPERATOR_ADDON} EKS add-on on the cluster "
+           f"(cluster owner; MLCC never installs operators, ADR-012).")
+    if rc != 0:
+        if _not_found(err):
+            findings.append(_finding("block", "training-operator", f"CRD {HPPJ_CRD} is not installed", fix))
+        else:
+            findings.append(_finding("block", "training-operator",
+                                     f"could not read CRD {HPPJ_CRD}: {err.strip()[:200]}",
+                                     "Check kubectl access to the cluster (KUBECONFIG / EKS access entry)."))
+        return
+    deps = _kubectl_json(["get", "deployments", "-n", TRAINING_OPERATOR_NAMESPACE])
+    if deps is None:
+        findings.append(_finding("block", "training-operator",
+                                 f"could not list Deployments in {TRAINING_OPERATOR_NAMESPACE}", fix))
+        return
+    ops = [d for d in deps.get("items") or [] if "training" in ((d.get("metadata") or {}).get("name") or "")]
+    available = [d for d in ops if any(c.get("type") == "Available" and c.get("status") == "True"
+                                       for c in (d.get("status") or {}).get("conditions") or [])]
+    if available:
+        findings.append(_finding("info", "training-operator",
+                                 f"HyperPod training operator is Available ({available[0]['metadata']['name']})"))
+    else:
+        findings.append(_finding("block", "training-operator",
+                                 f"no Available HyperPod training-operator Deployment in {TRAINING_OPERATOR_NAMESPACE}", fix))
+
+
+def _simulate(role: str, action: str, resource: str) -> tuple[str, str]:
+    rc, out, err = _aws(["iam", "simulate-principal-policy", "--policy-source-arn", role,
+                         "--action-names", action, "--resource-arns", resource, "--output", "json"])
+    data = _json(out) if rc == 0 else None
+    if not data:
+        return "error", err.strip()[:200]
+    results = data.get("EvaluationResults") or []
+    return (results[0].get("EvalDecision") if results else "error"), ""
+
+
+def _check_pod_identity(findings: list, resolved: dict, a: dict, env: dict) -> None:
+    role = (env.get("MLCC_HP_TRAIN_ROLE_ARN") or "").strip()
+    ns, region = a["namespace"], env.get("AWS_REGION", "")
+    eks, err = eks_cluster_name(a["cluster"], env)
+    resolved["eks_cluster"] = eks
+    if not role:
+        findings.append(_finding(
+            "block", "pod-identity",
+            "MLCC_HP_TRAIN_ROLE_ARN is empty: the bootstrap profile has no HyperPod training role",
+            "Create it with the training module: ml-container-creator bootstrap update --module training"))
+        return
+    cmd = association_command(eks, ns, role, region)
+    if not eks:
+        findings.append(_finding("block", "pod-identity", f"could not resolve the EKS cluster: {err}", cmd))
+        return
+    rc, out, err = _aws(["eks", "list-pod-identity-associations", "--cluster-name", eks, "--namespace", ns,
+                         "--service-account", TRAIN_SERVICE_ACCOUNT, "--output", "json"])
+    data = _json(out) if rc == 0 else None
+    if data is None:
+        findings.append(_finding("block", "pod-identity",
+                                 f"could not list pod identity associations: {err.strip()[:200]}", cmd))
+        return
+    assocs = data.get("associations") or []
+    if not assocs:
+        findings.append(_finding(
+            "block", "pod-identity",
+            f"no EKS Pod Identity association for {ns}/{TRAIN_SERVICE_ACCOUNT}: HyperPod training pods "
+            f"have no AWS credentials without it (cluster owner runs the command below; ADR-012)", cmd))
+        return
+    rc, out, err = _aws(["eks", "describe-pod-identity-association", "--cluster-name", eks,
+                         "--association-id", str(assocs[0].get("associationId", "")), "--output", "json"])
+    got = (((_json(out) or {}).get("association") or {}).get("roleArn") or "") if rc == 0 else ""
+    if rc != 0:
+        findings.append(_finding("block", "pod-identity",
+                                 f"could not describe the pod identity association: {err.strip()[:200]}", cmd))
+        return
+    if got != role:
+        findings.append(_finding(
+            "block", "pod-identity",
+            f"{ns}/{TRAIN_SERVICE_ACCOUNT} is associated with {got or '<none>'}, not MLCC_HP_TRAIN_ROLE_ARN {role}",
+            "Delete the mismatched association (aws eks delete-pod-identity-association --cluster-name "
+            f"{eks} --association-id {assocs[0].get('associationId', '')} --region {region or '<region>'}), "
+            f"then: {cmd}"))
+        return
+    probes = []
+    dataset = a.get("dataset") or ""
+    if dataset.startswith("s3://"):
+        key = dataset[len("s3://"):]
+        probes.append(("s3:GetObject", f"arn:aws:s3:::{key}{'probe' if key.endswith('/') else ''}", f"read {dataset}"))
+    artifacts = (env.get("ARTIFACTS_S3_BUCKET") or "").strip()
+    if artifacts and a.get("project"):
+        out_key = f"{artifacts}/{a['project']}/{a['kind']}/{a.get('job') or 'mlcc-probe'}/probe"
+        probes.append(("s3:PutObject", f"arn:aws:s3:::{out_key}", f"write s3://{out_key.rsplit('/', 1)[0]}/"))
+    denied = []
+    for action, res, what in probes:
+        decision, serr = _simulate(role, action, res)
+        if decision != "allowed":
+            denied.append(f"{action} ({what}): {decision}{' ' + serr if serr else ''}")
+    if denied:
+        findings.append(_finding(
+            "block", "pod-identity",
+            f"the training role {role} is not allowed: {'; '.join(denied)}",
+            "Re-run the training module (ml-container-creator bootstrap update --module training); "
+            "datasets must live under the core bucket's datasets/ prefix."))
+        return
+    findings.append(_finding("info", "pod-identity",
+                             f"{ns}/{TRAIN_SERVICE_ACCOUNT} → {role}" + (" (dataset read + artifacts write simulated)" if probes else "")))
+
+
+def _check_scratch(findings: list, resolved: dict, a: dict) -> None:
+    ns = a["namespace"]
+    rc, out, err = _run(["kubectl", "get", "pvc", FSX_CLAIM, "-n", ns, "-o", "json"])
+    pvc = _json(out) if rc == 0 else None
+    if rc != 0 and not _not_found(err):
+        findings.append(_finding("block", "scratch-volume", f"could not read PVC {ns}/{FSX_CLAIM}: {err.strip()[:200]}",
+                                 "Check kubectl access to the cluster."))
+        return
+    if isinstance(pvc, dict) and ((pvc.get("status") or {}).get("phase") == "Bound"):
+        resolved["scratch"] = "fsx"
+        findings.append(_finding("info", "scratch-volume",
+                                 f"PVC {ns}/{FSX_CLAIM} is Bound: job scratch is its mlcc/<project>/<job>/ subpath"))
+        return
+    if a["verb"] != "train":
+        findings.append(_finding(
+            "block", "scratch-volume", f"PVC {ns}/{FSX_CLAIM} is not Bound (the AWS HP-EKS recipes need it)",
+            f"Create the FSx for Lustre PV/PVC '{FSX_CLAIM}' in {ns} (cluster owner; AWS recipe prerequisite)."))
+        return
+    scs = _kubectl_json(["get", "storageclass"])
+    if scs is None:
+        findings.append(_finding("block", "scratch-volume", "could not list StorageClasses", "Check kubectl access."))
+        return
+    items = scs.get("items") or []
+    want = a.get("storage_class") or ""
+    chosen = ""
+    if want:
+        chosen = want if any((i.get("metadata") or {}).get("name") == want for i in items) else ""
+    else:
+        for i in items:
+            if ((i.get("metadata") or {}).get("annotations") or {}).get(DEFAULT_SC_ANNOTATION) == "true":
+                chosen = i["metadata"]["name"]
+                break
+    if chosen:
+        resolved["scratch"] = "ephemeral"
+        resolved["storage_class"] = chosen
+        findings.append(_finding("info", "scratch-volume",
+                                 f"no Bound {FSX_CLAIM}; job scratch is a generic ephemeral volume on StorageClass {chosen}"))
+        return
+    findings.append(_finding(
+        "block", "scratch-volume",
+        f"no Bound PVC {ns}/{FSX_CLAIM} and " + (f"StorageClass '{want}' not found" if want else "no default StorageClass"),
+        f"Create the '{FSX_CLAIM}' FSx PVC, or a StorageClass (pass it with --storage-class); "
+        "MLCC never writes training output to the container overlay."))
+
+
+def _check_free_gpus(findings: list, resolved: dict, a: dict) -> None:
+    view = cluster_view(instance_type=None if a.get("group") else (a.get("instance_type") or None),
+                        group=a.get("group") or None)
+    if view is None:
+        findings.append(_finding("block", "free-gpus", "could not read nodes/pods with kubectl", "Check kubectl access."))
+        return
+    nodes, pods = view
+    rows = _node_rows(nodes, pods)
+    if a["verb"] == "add-pod":
+        need = int(a.get("gpus") or 1)
+        ok = [r for r in rows if r["ready"] and r["free"] >= need
+              and (not a.get("instance_type") or r["instance_type"] == a["instance_type"])]
+        if ok:
+            resolved["node"], resolved["group"] = ok[0]["name"], ok[0]["group"]
+            findings.append(_finding("info", "free-gpus", f"{ok[0]['name']} ({ok[0]['group']}) has {ok[0]['free']} free GPU(s)"))
+            return
+        busy = _gpu_pods_on(pods, {r["name"] for r in rows})
+        findings.append(_finding(
+            "warn" if a.get("allow_surge") else "block", "free-gpus",
+            f"no Ready node has {need} free GPU(s)" + (f"; GPU pods: {', '.join(busy)}" if busy else ""),
+            "Free a node, pick another --instance-group, or pass --surge-node to add one."))
+        return
+    choice, reason = pick_group(rows, a.get("group") or "", a.get("instance_type") or "", int(a.get("gpus") or 0))
+    if choice:
+        resolved.update({"group": choice["group"], "node": choice["name"], "gpus": choice["gpus"],
+                         "allocatable": choice["allocatable"], "efa": choice["efa"],
+                         "instance_type": choice["instance_type"]})
+        findings.append(_finding("info", "free-gpus",
+                                 f"group {choice['group']} node {choice['name']}: {choice['gpus']} of "
+                                 f"{choice['allocatable']} GPU(s) free"))
+        return
+    busy = _gpu_pods_on(pods, {r["name"] for r in rows if r["allocatable"] > 0})
+    findings.append(_finding(
+        "block", "free-gpus", reason + (f"; GPU pods holding them: {', '.join(busy)}" if busy else ""),
+        "Free a GPU node, or name another group with --instance-group (never a serving group you need)."))
+
+
+def _check_shape_fit(findings: list, resolved: dict, a: dict) -> None:
+    t_gpu, t_efa = a.get("template_gpus"), a.get("template_efa") or 0
+    if t_gpu is None or "allocatable" not in resolved:
+        findings.append(_finding("info", "gpu-shape-fit", "no template shape to compare (render not reached)"))
+        return
+    g_gpu, g_efa = resolved["allocatable"], resolved.get("efa", 0)
+    if t_gpu <= g_gpu and t_efa <= g_efa:
+        findings.append(_finding("info", "gpu-shape-fit",
+                                 f"template shape ({t_gpu} GPU, {t_efa} EFA) fits group {resolved['group']}"))
+        return
+    msg = (f"the AWS recipe requests {t_gpu} GPU / {t_efa} EFA per node; group {resolved['group']} "
+           f"has {g_gpu} GPU / {g_efa} EFA")
+    if a.get("adapt_shape"):
+        findings.append(_finding("warn", "gpu-shape-fit",
+                                 msg + ": --adapt-shape rewrites it (EXPERIMENTAL, AWS-unsupported)"))
+        return
+    findings.append(_finding(
+        "block", "gpu-shape-fit", msg,
+        "Use a p4d/p5 instance group (the recipe's supported shape), or opt in to the EXPERIMENTAL "
+        "--adapt-shape rewrite to the group's allocatable."))
+
+
+def _check_local_queue(findings: list, a: dict, env: dict) -> None:
+    q = (env.get("HP_QUEUE") or "").strip()
+    if not q:
+        return
+    rc, out, err = _run(["kubectl", "get", "localqueues.kueue.x-k8s.io", q, "-n", a["namespace"], "-o", "name"])
+    if rc == 0 and out.strip():
+        findings.append(_finding("info", "local-queue", f"Kueue LocalQueue {a['namespace']}/{q} exists"))
+        return
+    findings.append(_finding(
+        "block", "local-queue",
+        f"Kueue LocalQueue {a['namespace']}/{q} " + ("does not exist" if (rc == 0 or _not_found(err)) else f"could not be read: {err.strip()[:200]}")
+        + " (a workload naming it would stay Pending forever)",
+        f"Create the LocalQueue '{q}' in {a['namespace']} (cluster owner), or unset HP_QUEUE."))
+
+
+def _check_s3_csi_role(findings: list, a: dict, env: dict) -> None:
+    bucket = a.get("model_bucket") or ""
+    report = preflight(a["cluster"], a["namespace"], a.get("project", ""), "s3", bucket, False,
+                       env.get("EKS_CLUSTER_NAME", ""))
+    for f in report["findings"]:
+        if f["check"] != "s3-csi-role":
+            continue
+        if f["severity"] == "warn" and "not allowed" in f["message"]:
+            f = dict(f, severity="block")
+        findings.append(f)
+
+
+def contract(verb: str, args: dict, env: dict | None = None) -> dict:
+    """Run the verb's contract elements (R2.2). Returns {findings, resolved}."""
+    env = dict(os.environ) if env is None else env
+    a = dict(args)
+    a["verb"] = verb
+    a.setdefault("cluster", env.get("HP_CLUSTER_NAME", ""))
+    a["namespace"] = a.get("namespace") or env.get("HP_NAMESPACE") or "default"
+    a.setdefault("project", env.get("PROJECT_NAME", ""))
+    a["kind"] = "tune" if verb == "tune" else "train"
+    findings: list[dict] = []
+    resolved: dict = {"namespace": a["namespace"], "service_account": TRAIN_SERVICE_ACCOUNT}
+    for element in CONTRACT_ELEMENTS[verb]:
+        if element == "training-operator":
+            _check_training_operator(findings)
+        elif element == "pod-identity":
+            _check_pod_identity(findings, resolved, a, env)
+        elif element == "scratch-volume":
+            _check_scratch(findings, resolved, a)
+        elif element == "free-gpus":
+            _check_free_gpus(findings, resolved, a)
+        elif element == "gpu-shape-fit":
+            _check_shape_fit(findings, resolved, a)
+        elif element == "local-queue":
+            _check_local_queue(findings, a, env)
+        elif element == "s3-csi-role":
+            _check_s3_csi_role(findings, a, env)
+    return {"findings": findings, "resolved": resolved,
+            "blocked": any(f["severity"] == "block" for f in findings)}
+
+
+def _cap_warn(findings: list[dict]) -> list[dict]:
+    return [dict(f, severity="warn") if f["severity"] == "block" else f for f in findings]
+
+
 def preflight_from_env(env: dict | None = None) -> dict:
     """The same read-only R6 preflight, with its inputs read from do/config-style
     env (Wave 8 R5.3: do/validate calls it through the hyperpod-eks descriptor's
@@ -481,9 +866,20 @@ def preflight_from_env(env: dict | None = None) -> dict:
     staged = (env.get("STAGED_MODEL_PATH") or "").strip()
     source = (env.get("HP_MODEL_SOURCE") or "").strip() or ("s3" if staged.startswith("s3://") else "huggingface")
     bucket = staged[len("s3://"):].split("/", 1)[0] if source == "s3" and staged.startswith("s3://") else ""
-    return preflight(env.get("HP_CLUSTER_NAME", ""), env.get("HP_NAMESPACE") or "default",
-                     env.get("PROJECT_NAME", ""), source, bucket,
-                     (env.get("HP_LORA_ENABLED") or "").lower() == "true", env.get("EKS_CLUSTER_NAME", ""))
+    report = preflight(env.get("HP_CLUSTER_NAME", ""), env.get("HP_NAMESPACE") or "default",
+                       env.get("PROJECT_NAME", ""), source, bucket,
+                       (env.get("HP_LORA_ENABLED") or "").lower() == "true", env.get("EKS_CLUSTER_NAME", ""))
+    # Wave 11 R2.3: plain do/validate also reports the hp-eks training elements,
+    # but never above `warn` (a serving-only project must not fail validate on a
+    # training prerequisite; `do/train|tune --backend hp-eks` enforces them).
+    findings: list[dict] = []
+    a = {"verb": "train", "kind": "train", "cluster": env.get("HP_CLUSTER_NAME", ""),
+         "namespace": env.get("HP_NAMESPACE") or "default", "project": env.get("PROJECT_NAME", "")}
+    _check_training_operator(findings)
+    _check_pod_identity(findings, {}, a, env)
+    _check_local_queue(findings, a, env)
+    report["findings"].extend(_cap_warn(findings))
+    return report
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -528,7 +924,42 @@ def _cli(argv: list[str]) -> int:
     f.add_argument("--lora-delivery", default="false")
     f.add_argument("--eks-cluster", default="")
     sub.add_parser("preflight-env")
+    k = sub.add_parser("contract")
+    k.add_argument("--verb", required=True, choices=sorted(CONTRACT_ELEMENTS))
+    k.add_argument("--cluster", default=None)
+    k.add_argument("--namespace", default=None)
+    k.add_argument("--project", default=None)
+    k.add_argument("--group", default="")
+    k.add_argument("--instance-type", default="")
+    k.add_argument("--gpus", type=int, default=0)
+    k.add_argument("--dataset", default="")
+    k.add_argument("--job", default="")
+    k.add_argument("--storage-class", default="")
+    k.add_argument("--model-bucket", default="")
+    k.add_argument("--template-gpus", type=int, default=None)
+    k.add_argument("--template-efa", type=int, default=0)
+    k.add_argument("--adapt-shape", action="store_true")
+    k.add_argument("--allow-surge", action="store_true")
+    k.add_argument("--json", action="store_true", help="JSON only (default prints JSON plus a human summary on stderr)")
     args = p.parse_args(argv)
+
+    if args.cmd == "contract":
+        cargs = {key: val for key, val in {
+            "cluster": args.cluster, "namespace": args.namespace, "project": args.project,
+            "group": args.group, "instance_type": args.instance_type, "gpus": args.gpus,
+            "dataset": args.dataset, "job": args.job, "storage_class": args.storage_class,
+            "model_bucket": args.model_bucket, "template_gpus": args.template_gpus,
+            "template_efa": args.template_efa, "adapt_shape": args.adapt_shape,
+            "allow_surge": args.allow_surge}.items() if val is not None}
+        out = contract(args.verb, cargs)
+        if not args.json:
+            for f in out["findings"]:
+                mark = {"block": "❌", "warn": "⚠️ ", "info": "✅"}.get(f["severity"], "•")
+                _note(f"   {mark} {f['check']}: {f['message']}")
+                if f["severity"] != "info" and f["fix"]:
+                    _note(f"      → {f['fix']}")
+        _emit(out)
+        return 4 if out["blocked"] else 0
 
     if args.cmd == "rollout-capacity":
         rc, out = rollout_capacity(args.cluster, args.namespace, args.project, args.instance_type, args.gpus)

@@ -639,3 +639,33 @@ def test_every_sagemaker_cli_flag_exists_in_service_model(clis, repo_invocations
     assert not problems, (
         "AWS CLI would reject these SageMaker options (botocore {}):\n  ".format(
             botocore.__version__) + "\n  ".join(sorted(set(problems))))
+
+
+# ── Wave 11: the cluster contract's eks / iam / sagemaker calls ──────────────
+
+def test_hyperpod_contract_aws_argv_exists_in_service_models():
+    """hyperpod_ops.contract builds its `aws` argv as Python lists that the static
+    extractor above does not see (``_aws(["eks", ...])``), so check the RECORDED
+    argv from a stubbed run through every element, plus the printed
+    create-pod-identity-association command, against botocore's eks / iam /
+    sagemaker models (Wave 11 R13.2)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "test_hyperpod_contract", str(REPO / "test" / "unit" / "test_hyperpod_contract.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    checkers = {}
+    problems, seen = [], set()
+    for argv in mod.recorded_contract_argv():
+        if argv[0] != "aws":
+            continue
+        service, op = argv[1], argv[2]
+        seen.add((service, op))
+        checker = checkers.setdefault(service, ServiceCli(service))
+        flags = [a for a in argv[3:] if FLAG_RE.match(a)]
+        inv = {"op": op, "flags": flags, "file": "hyperpod_ops.contract", "line": 0, "kind": "recorded"}
+        problems.extend(checker.problems(inv))
+    assert {("eks", "list-pod-identity-associations"), ("eks", "describe-pod-identity-association"),
+            ("eks", "create-pod-identity-association"), ("iam", "simulate-principal-policy"),
+            ("sagemaker", "describe-cluster")} <= seen
+    assert not problems, "\n".join(problems)
