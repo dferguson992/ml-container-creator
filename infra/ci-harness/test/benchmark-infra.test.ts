@@ -219,6 +219,8 @@ describe('Benchmark Infrastructure (Glue/S3/IAM Provisioning)', () => {
                                 'glue:GetPartitions',
                                 'glue:BatchCreatePartition',
                                 'glue:CreatePartition',
+                                'glue:GetPartition',
+                                'glue:UpdatePartition',
                             ],
                             Resource: [
                                 'arn:aws:glue:*:*:catalog',
