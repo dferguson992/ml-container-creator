@@ -2399,7 +2399,7 @@
             "CONTAINER_IMAGE_URI": "DLC image resolved at generation time for dlc-direct mode",
             "ENDPOINT_EXTERNAL": "computed from an imported existing endpoint (mcc import), no generator parameter",
             "INSTANCE_POOLS": "heterogeneous pools resolved by the instance recommender, no generator parameter",
-            "INFERENCE_AMI_VERSION": "auto-resolved from the CUDA version / registry at generation time, no generator parameter",
+            "INFERENCE_AMI_VERSION": "resolved at deploy time from the instance family (fleet-drivers.json AWS AMI table, BL209) and the image default; no generator parameter",
             "IC_ENV_VLLM_MAX_MODEL_LEN": "computed by the instance sizer (sizerMaxModelLen), default 4096",
             "IC_ENV_VLLM_GPU_MEMORY_UTILIZATION": "commented example of a deploy-time IC env var (set via --ic-env)",
             "HF_MODEL_ID": "copy of modelName preserved for tokenizer / catalog lookups after staging",

@@ -266,6 +266,8 @@ Add an entry mapping the instance family (without `ml.` prefix) to its driver in
 
 This is used by `image-filter.js` to determine which container images are CUDA-driver-compatible with the instance.
 
+Also add the family to the `default_families` or `override_families` list of every `ami_versions` entry that the [AWS GPU driver table](https://docs.aws.amazon.com/sagemaker/latest/dg/inference-gpu-drivers.html) lists it under (copy the table; do not guess). If AWS names a default AMI for the family, also set `inference_ami_version` on the family entry. `resolveInferenceAmi()` in `image-filter.js` reads these lists to pick the `InferenceAmiVersion` sent at deploy time (BL209), and `do/lib/endpoint-config.sh` uses them to validate pools. `test/unit/catalog-driver-conformance.test.js` fails if a GPU family resolves to an AMI AWS does not list for it.
+
 ### Step 2: `servers/lib/catalogs/instances.json`
 
 Add one entry per instance size under the `catalog` key:
