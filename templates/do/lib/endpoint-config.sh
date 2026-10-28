@@ -5,7 +5,8 @@
 # Sourced by do/deploy — expects PROJECT_NAME, AWS_REGION to be set by the caller.
 # One of INSTANCE_TYPE or INSTANCE_POOLS must be set (mutually exclusive).
 # Optional: ROLE_ARN, INFERENCE_AMI_VERSION, CAPACITY_RESERVATION_ARN, ASYNC_INFERENCE_CONFIG,
-#           POOL_TIMEOUT (default: 1200), POOL_INSTANCE_COUNT (default: 1), MODEL_NAME_SM.
+#           POOL_TIMEOUT (default: 1200), POOL_INSTANCE_COUNT (default: 1), MODEL_NAME_SM,
+#           STZ_ACTIVE + SCALE_MAX_CAPACITY (scale-to-zero, set by do/lib/scale-to-zero.sh).
 
 # Directory of this file (do/lib in a project, templates/do/lib in the source
 # tree) — locates the python/inference_ami.py helper next to it.
@@ -152,6 +153,15 @@ create_endpoint_config() {
         if [ -n "${CAPACITY_RESERVATION_ARN:-}" ]; then
             variant_json="${variant_json},\"CapacityReservationConfig\":{\"CapacityReservationPreference\":\"capacity-reservations-only\",\"MlReservationArn\":\"${CAPACITY_RESERVATION_ARN}\"}"
             echo "   ✓ Capacity reservation: ${CAPACITY_RESERVATION_ARN}"
+        fi
+
+        # Wave 10 (ADR-014 R3.1): scale-to-zero needs ManagedInstanceScaling with
+        # MinInstanceCount 0 on the variant. Only when do/lib/scale-to-zero.sh set
+        # STZ_ACTIVE=true (opted in, target enabled); otherwise the variant is
+        # byte-identical to before.
+        if [ "${STZ_ACTIVE:-false}" = "true" ] && type stz_variant_scaling_json >/dev/null 2>&1; then
+            variant_json="${variant_json}$(stz_variant_scaling_json)"
+            echo "   ✓ Scale-to-zero: ManagedInstanceScaling min 0, max ${SCALE_MAX_CAPACITY:-1}"
         fi
 
         variant_json="${variant_json}}]"
