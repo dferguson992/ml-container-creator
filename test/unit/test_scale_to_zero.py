@@ -530,3 +530,17 @@ def test_status_with_a_copy_shows_the_line_without_the_warning(stz_sandbox):
     assert rc == 0, out + err
     assert "scale-to-zero: on (min 0, max 2); current copies: 1" in out
     assert "requests FAIL" not in out
+
+
+def test_plan_lines_are_copy_pasteable_shell(stz_sandbox):
+    """R9.1: each planned call round-trips through the shell to the real argv."""
+    import shlex
+    sb = stz_sandbox
+    rc, out, err = sb.run('SCALE_MAX_CAPACITY=2\nstz_plan realtime-inference\n'
+                          'exec 9>&1; _STZ_PLAN=1; _stz_aws cloudwatch put-metric-alarm --alarm-description "it\'s {x}"')
+    assert rc == 0, out + err
+    planned = [shlex.split(line.strip()) for line in out.splitlines() if line.strip().startswith("aws ")]
+    assert len(planned) == 5
+    step = next(p for p in planned if "StepScaling" in p)
+    assert json.loads(step[step.index("--step-scaling-policy-configuration") + 1])["AdjustmentType"] == "ExactCapacity"
+    assert planned[-1][-1] == "it's {x}"

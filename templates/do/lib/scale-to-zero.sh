@@ -183,9 +183,15 @@ _STZ_DO_DIR="$(cd "${_STZ_LIB_DIR}/.." && pwd)"
 # dry-run plan and the real deploy run the SAME code path.
 _stz_aws() {
     if [ "${_STZ_PLAN:-0}" = "1" ]; then
-        printf '     aws' >&9
-        printf ' %q' "$@" >&9
-        printf '\n' >&9
+        # Copy-pasteable: plain words as-is, anything else single-quoted.
+        local _a _line="     aws" _sq="'" _esc="'\\''"
+        for _a in "$@"; do
+            case "${_a}" in
+                *[!A-Za-z0-9_./:=,@+-]*) _line="${_line} '${_a//${_sq}/${_esc}}'" ;;
+                *) _line="${_line} ${_a}" ;;
+            esac
+        done
+        printf '%s\n' "${_line}" >&9
         case " $* " in
             *" --query PolicyARN "*) echo "<planned-policy-arn>" ;;
         esac
