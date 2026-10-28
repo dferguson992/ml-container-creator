@@ -846,6 +846,8 @@ describe('MlccCiHarnessStack', () => {
                                 'glue:GetPartitions',
                                 'glue:BatchCreatePartition',
                                 'glue:CreatePartition',
+                                'glue:GetPartition',
+                                'glue:UpdatePartition',
                             ]),
                             Resource: Match.arrayWith([
                                 'arn:aws:glue:*:*:catalog',

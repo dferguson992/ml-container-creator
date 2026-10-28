@@ -42,6 +42,7 @@ The generated `do/config` file stores the `INSTANCE_TYPE` and optionally `INFERE
 
 After deployment, `./do/test` validates the endpoint by invoking inference through the inference component, `./do/logs` tails CloudWatch logs, and `./do/clean endpoint` tears down the inference component, endpoint, and endpoint configuration.
 
+Real-time endpoints can opt in to scaling to zero instances when idle (`./do/deploy --scale-to-zero on`); requests fail while it wakes. See [Scale-to-Zero](scale-to-zero.md).
 For real-time inference, async inference, and batch transform deployment patterns, see the target-specific sections below.
 
 ### SageMaker AI HyperPod EKS (`hyperpod-eks`)
@@ -419,6 +420,7 @@ tell *why* a command stopped:
 | `1` | General error (including missing AWS credentials) |
 | `2` | Usage / argument error |
 | `3` | **Not supported for this deployment target** — the command doesn't apply to your current `DEPLOYMENT_TARGET`, or a required deployment/precondition isn't in place. The message names the supported targets. |
+| `5` | `do/deploy` only: deployed, but the opt-in [scale-to-zero](scale-to-zero.md) setup failed and was rolled back. The endpoint is up at a fixed floor. |
 
 Exit `3` is not a failure of the operation — it means the command couldn't start
 because a precondition (a live deployment, or a compatible target) wasn't met.

@@ -160,6 +160,28 @@ export function observability(target, targetsDir = TARGETS_D) {
     return obs;
 }
 /**
+ * The target's scale_to_zero declaration (Wave 10, ADR-014 R1): whether the
+ * platform can scale it to zero ({support, mechanism, wake_signal,
+ * requests_at_zero, idle_billing}) and whether MLCC wires it ({enabled, reason}).
+ * Node twin of target_manifest.scale_to_zero(); a target without the block reads
+ * as not-applicable and disabled.
+ * @returns {{support: string, mechanism: ?string, wake_signal: ?string, requests_at_zero: string, idle_billing: string, enabled: boolean, reason?: string}}
+ */
+export function scaleToZero(target, targetsDir = TARGETS_D) {
+    const d = getDescriptor(target, targetsDir);
+    if (d && d.scale_to_zero) return { ...d.scale_to_zero };
+    return {
+        support: 'not-applicable',
+        mechanism: null,
+        wake_signal: null,
+        requests_at_zero: 'n/a',
+        idle_billing: 'n/a',
+        enabled: false,
+        reason: 'this target declares no scale_to_zero capability'
+    };
+}
+
+/**
  * The status_var -> answer_key map across all targets, for building
  * SHELL_VAR_TO_ANSWER's per-target status entries.
  * @returns {Object<string,string>}

@@ -547,6 +547,13 @@ echo ""
 # ============================================================
 # Deploy the new IC immediately
 # ============================================================
+# Wave 10 (ADR-014 R3.3): an IC added later is not registered for scale-to-zero.
+source "${SCRIPT_DIR}/lib/scale-to-zero.sh"
+if stz_active "${DEPLOYMENT_TARGET:-}"; then
+    stz_add_ic_notice
+    echo ""
+    export MLCC_STZ_ADD_IC_NOTICE=1
+fi
 echo "🚀 Deploying IC '${IC_NAME}'..."
 echo ""
 exec "${SCRIPT_DIR}/deploy" --ic "${IC_NAME}"

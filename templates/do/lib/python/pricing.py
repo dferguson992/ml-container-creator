@@ -697,7 +697,25 @@ def cost_summary_lines(records: list) -> list:
     if best is not None:
         lines.append(_line(best, peak=True))
     lines.append(COST_CAVEAT)
+    stz = scale_to_zero_caveat()
+    if stz:
+        lines.append(stz)
     return lines
+
+
+def scale_to_zero_caveat(target: str | None = None, scale_to_zero: str | None = None) -> str:
+    """Wave 10 (ADR-014 R6.1): when SCALE_TO_ZERO=true for an enabled target,
+    the trade-off line that follows COST_CAVEAT (savings only on idle stretches
+    longer than the scale-in delay; each wake costs the reference cold start).
+    Target and opt-in default to the do/config environment. '' otherwise, and
+    on any error (the cost lines never fail a benchmark write)."""
+    try:
+        import scale_to_zero as _stz
+        return _stz.cost_caveat(
+            target if target is not None else os.environ.get('DEPLOYMENT_TARGET'),
+            scale_to_zero if scale_to_zero is not None else os.environ.get('SCALE_TO_ZERO'))
+    except Exception:  # noqa: BLE001 - advisory line only
+        return ''
 
 
 # ── Snapshot + verify-bedrock (live, read-only) ───────────────────────────────

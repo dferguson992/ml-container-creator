@@ -10,6 +10,9 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${SCRIPT_DIR}/config"
 source "${SCRIPT_DIR}/lib/profile.sh"
+source "${SCRIPT_DIR}/lib/scale-to-zero.sh"
+# Wave 10 (ADR-014 R4.2): this target's own name, for the scale_to_zero descriptor.
+_STZ_CLEAN_TARGET="$(basename "${BASH_SOURCE[0]}")"
 
 # ── Profile-resolved variables (env var > profile > default) ──────────────────
 ECR_REPOSITORY_NAME="${ECR_REPOSITORY_NAME:-${_PROFILE_ecrRepositoryName:-ml-container-creator}}"
@@ -389,6 +392,24 @@ clean_endpoint() {
         return 1
     fi
 
+    # Wave 10 (ADR-014 R4.2): scale-to-zero resources (alarm, policies, then the
+    # scalable target) go first, before the ICs and the endpoint. "Not found"
+    # counts as removed; no AWS call when scale-to-zero was never enabled.
+    local _stz_ics=""
+    if [ ${#IC_NAMES_TO_DELETE[@]} -gt 0 ]; then
+        _stz_ics="${IC_NAMES_TO_DELETE[*]}"
+    elif [ "${IC_EXISTS}" = true ]; then
+        _stz_ics="${IC_NAME}"
+    fi
+    if [ -n "${_stz_ics}" ]; then
+        # ${_stz_ics}: space-separated IC names, unquoted on purpose.
+        stz_teardown_if_owned "${_STZ_CLEAN_TARGET}" ${_stz_ics} \
+            || echo "⚠️  Some scale-to-zero resources could not be removed (see above); continuing."
+        if [ -n "${SCALE_TO_ZERO_STATUS:-}" ]; then
+            _stz_set_status ""
+        fi
+    fi
+
 <% if (typeof enableLora !== 'undefined' && enableLora) { %>
     # Delete adapter ICs first (adapters depend on base ICs)
     if [ -d "${SCRIPT_DIR}/adapters" ]; then
@@ -571,6 +592,10 @@ clean_ic() {
     if ! confirm_action "This will delete inference component '${ic_deployed_name}'"; then
         return 1
     fi
+
+    # Wave 10 (ADR-014 R4.2): its scale-to-zero resources first (if any).
+    stz_teardown_if_owned "${_STZ_CLEAN_TARGET}" "${ic_deployed_name}" \
+        || echo "⚠️  Some scale-to-zero resources could not be removed (see above); continuing."
 
     # Delete the inference component
     echo "🗑️  Deleting inference component: ${ic_deployed_name}"

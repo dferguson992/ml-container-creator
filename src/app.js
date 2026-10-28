@@ -828,6 +828,16 @@ export async function postGenerate(destDir, answers, tritonBackends = {}) {
         (architecture === 'triton' && !tritonBackends[answers.backend]?.supportsSampleModel);
 
     if (answers.includeSampleModel && !skipSampleTraining) {
+        // MLCC_SKIP_SAMPLE_TRAINING=1 generates the sample_model/ files but skips
+        // the pip install + dataset download + training run. The test suites set
+        // it (test/setup-env.js) so generation stays hermetic: on CI runners pip
+        // really installs the stack and fetches the UCI dataset, which under
+        // parallel load exceeds the generator timeout.
+        if (process.env.MLCC_SKIP_SAMPLE_TRAINING === '1') {
+            console.log('\n⏭️  Skipping sample model training (MLCC_SKIP_SAMPLE_TRAINING=1)');
+            console.log('   Train it later with: python sample_model/train_abalone.py');
+            return;
+        }
         await _runSampleModelTraining(destDir);
     }
 }

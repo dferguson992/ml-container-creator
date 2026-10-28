@@ -22,7 +22,8 @@
     "verbs",
     "observability",
     "answer_params",
-    "pricing"
+    "pricing",
+    "scale_to_zero"
   ],
   "properties": {
     "target": {
@@ -141,6 +142,37 @@
       "uniqueItems": true,
       "items": { "type": "string", "enum": ["smtj", "hp-eks"] },
       "description": "Wave 11 (R1.1, OQ-11.5): the training compute backends do/train and do/tune may submit to from a project on this target, in preference order; the FIRST entry is the default when --backend is not given. smtj = a SageMaker training job (every target). hp-eks = a single-node HyperPodPyTorchJob on the project's HyperPod EKS cluster (hyperpod-eks only; opt-in, never the default). Verbs read this at run time through target_manifest.py compute_backends; no consumer branches on the target name."
+    },
+    "scale_to_zero": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["support", "mechanism", "wake_signal", "requests_at_zero", "idle_billing", "enabled"],
+      "description": "Wave 10 (ADR-014 §1/§2, R1): whether and how this target can scale to zero, and whether MLCC wires it in this release. do/deploy flag acceptance (--scale-to-zero), the cold-start warning wording, do/status and do/clean derive from this block instead of branching on the target name. support: what the platform offers (native = the AWS service scales the billed capacity to zero; pod-only = pods scale but nodes stay billed; requires-cluster-addon = needs an add-on the cluster owner installs; not-applicable = the target never idles). The enums are an open set: extend them here when a new target needs a new value. mechanism: the plug-point do/lib/scale-to-zero.sh dispatches on (ADR-013 style), null when there is none. wake_signal: the metric that wakes the target from zero, null when unknown. requests_at_zero: what a request sees while at zero (fail / queued / unknown / n/a); it drives the warning text. idle_billing: what is still billed at zero. enabled: MLCC v2 wires it (only with support native plus a mechanism and wake signal); reason: why not, shown verbatim when --scale-to-zero is refused.",
+      "properties": {
+        "support": { "type": "string", "enum": ["native", "pod-only", "requires-cluster-addon", "not-applicable"] },
+        "mechanism": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9-]*$" },
+        "wake_signal": { "type": ["string", "null"], "pattern": "^[A-Za-z][A-Za-z0-9]*$" },
+        "requests_at_zero": { "type": "string", "enum": ["fail", "queued", "unknown", "n/a"] },
+        "idle_billing": { "type": "string", "enum": ["none-at-zero", "nodes-still-billed", "n/a"] },
+        "enabled": { "type": "boolean" },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+          "then": {
+            "properties": {
+              "support": { "const": "native" },
+              "mechanism": { "type": "string" },
+              "wake_signal": { "type": "string" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "enabled": { "const": false } }, "required": ["enabled"] },
+          "then": { "required": ["reason"] }
+        }
+      ]
     },
     "verbs": {
       "type": "object",

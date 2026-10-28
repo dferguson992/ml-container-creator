@@ -213,3 +213,60 @@ not have.
 - `.kiro/specs/v2-w9-01-observability-tokenomics/requirements.md` (OQ-9.5, R8.5).
 - ADR-008 (descriptor), ADR-012 (consume, don't provision), ADR-013 (mechanism plug-points).
 - Wave 10 spec: `.kiro/specs/v2-w10-01-scale-from-zero/` (incl. the owner-run validation runbook).
+
+## Addendum A: Wave 10 Task 1 facts (2026-10-27, build agent)
+
+Checked against AWS docs, the MLCC code at `f9985928` and the botocore service models
+(local botocore 1.43.33; CI pins 1.43.118 in `.github/workflows/ci.yml`). No AWS API call was
+made. V = verified in the cited source; U = not verified (left to the owner-run runbook).
+
+1. **`ExactCapacity` is valid for the IC dimension (V at the API level, U at runtime).**
+   `StepScalingPolicyConfiguration.AdjustmentType` accepts `ChangeInCapacity`,
+   `ExactCapacity` and `PercentChangeInCapacity`, with no per-dimension restriction, and
+   `ScalableDimension` includes `sagemaker:inference-component:DesiredCopyCount` (botocore
+   `application-autoscaling` model;
+   [StepScalingPolicyConfiguration](https://docs.aws.amazon.com/autoscaling/application/APIReference/API_StepScalingPolicyConfiguration.html)).
+   Whether it stops the observed overshoot is unmeasured (runbook S5).
+2. **Cleanup must be explicit.** Deleting an endpoint makes Application Auto Scaling deregister
+   the endpoint's *models* as scalable targets when the caller may call
+   `DeregisterScalableTarget` (V,
+   [Delete endpoints configured for auto scaling](https://docs.aws.amazon.com/sagemaker/latest/dg/endpoint-delete-with-scaling.html)).
+   The page does not say the same for IC-level targets when an IC is deleted (U). Deleting a
+   step scaling policy removes the alarm *action* but never the CloudWatch alarm (V, botocore
+   `DeleteScalingPolicy` documentation). So `clean.d/realtime-inference` deletes the alarm, the
+   two policies and the scalable target itself, before the IC and the endpoint, and treats
+   `ObjectNotFoundException` / `ResourceNotFound` as already removed.
+3. **`update-endpoint` and `ManagedInstanceScaling` (U).** `ManagedInstanceScaling` is a member
+   of the endpoint-config production variant (`MinInstanceCount` minimum 0, V botocore and
+   [ProductionVariantManagedInstanceScaling](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_ProductionVariantManagedInstanceScaling.html)).
+   `UpdateEndpoint` swaps in a new endpoint config; its `ExcludeRetainedVariantProperties` enum
+   (`DesiredInstanceCount`, `DesiredWeight`, `DataCaptureConfig`) does not cover it. AWS's
+   update guidance requires deregistering scaling first only when the update changes the
+   instance type or removes a variant
+   ([Update endpoints that use auto scaling](https://docs.aws.amazon.com/sagemaker/latest/dg/endpoint-scaling-update.html)),
+   which MLCC's in-place reconfigure never does. No AWS page states that an IC-backed endpoint
+   accepts an update that adds or removes `ManagedInstanceScaling`. MLCC implements the R2.5
+   in-place path as `create-endpoint-config` (same variant plus or minus the block) then
+   `update-endpoint`, and the owner's runbook S1 / S6 is the first live check.
+4. **Every MLCC realtime deploy uses inference components (V, code).**
+   `deploy.d/realtime-inference` always creates an IC (`create_inference_component` for
+   `do/ic/*.conf`, `create_inference_component_legacy` otherwise) and never calls
+   `create-model`; `create_endpoint_config` passes the execution role and no model (the IC
+   flow). The R2.3 "no IC" refusal therefore only fires on the in-place reconfigure, which
+   checks `list-inference-components --endpoint-name-equals` on the live endpoint. Attaching to
+   an external endpoint (`ENDPOINT_STRATEGY=existing`) is refused separately (config not owned).
+5. **One request must be able to wake the endpoint.** The AWS procedure says the endpoint
+   provisions an instance after "an inference request that it can't respond to", but its CLI
+   example uses `GreaterThanThreshold` with threshold 1, which needs two failures in one 60 s
+   period ([Scale an endpoint to zero instances](https://docs.aws.amazon.com/sagemaker/latest/dg/endpoint-auto-scaling-zero-instances.html)).
+   AWS's launch post uses `GreaterThanOrEqualToThreshold` with threshold 1
+   ([blog](https://aws.amazon.com/blogs/machine-learning/unlock-cost-savings-with-the-new-scale-down-to-zero-feature-in-amazon-sagemaker-inference/)).
+   MLCC uses `GreaterThanOrEqualToThreshold` / 1 with the doc's 60 s period, `Sum`, one
+   evaluation period and one datapoint, so a single failed request wakes it.
+6. **First registration creates a service-linked role.** `RegisterScalableTarget` creates
+   `AWSServiceRoleForApplicationAutoScaling_SageMakerEndpoint` if it does not exist (V,
+   [Application Auto Scaling service-linked roles](https://docs.aws.amazon.com/autoscaling/application/userguide/application-auto-scaling-service-linked-roles.html)),
+   so the deploying principal needs `iam:CreateServiceLinkedRole` for that role once per account.
+
+The live results of the owner-run runbook (recovery breakdown, copy count after the first
+success, the in-place update) go into Addendum B.

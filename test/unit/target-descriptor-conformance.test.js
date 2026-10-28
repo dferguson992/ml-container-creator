@@ -42,7 +42,8 @@ import {
     adapterDelivery,
     pricing,
     observability,
-    computeBackends
+    computeBackends,
+    scaleToZero
 } from '../../src/lib/target-manifest-reader.js';
 import { listServeEngines, metricSignals } from '../../src/lib/serve-manifest-reader.js';
 
@@ -446,6 +447,68 @@ describe('Wave 11 R1.1 — compute_backends is declared per target and read the 
     it('every target declares verbs.add-pod explicitly (BL149; agreement with ADR-013 is in additive-deploy-contract)', () => {
         for (const d of descriptors) {
             assert.strictEqual(typeof (d.verbs || {})['add-pod'], 'boolean', `${d.target} verbs.add-pod`);
+        }
+    });
+    it('the schema requires compute_backends next to scale_to_zero and rejects an unknown backend (W10 + W11 merge)', () => {
+        const schema = JSON.parse(read('templates/do/targets.d/manifest.schema.json'));
+        assert.ok(schema.required.includes('compute_backends') && schema.required.includes('scale_to_zero'));
+        const validate = new Ajv({ allErrors: true, strict: false }).compile(schema);
+        const base = descriptors.find((d) => d.compute_backends.includes('hp-eks'));
+        assert.ok(validate(base), JSON.stringify(validate.errors));
+        assert.ok(!validate({ ...base, compute_backends: ['smtj', 'no-such-backend'] }), 'unknown backend must be invalid');
+        const without = { ...base };
+        delete without.compute_backends;
+        assert.ok(!validate(without), 'a descriptor without compute_backends must be invalid');
+    });
+});
+
+describe('Wave 10 (ADR-014 R1, R8.1) — scale_to_zero is declared on every target and read by both readers', () => {
+    const py = process.env.MLCC_PYTHON || 'python3';
+    const schema = JSON.parse(read('templates/do/targets.d/manifest.schema.json'));
+    const validate = new Ajv({ allErrors: true, strict: false }).compile(schema);
+    it('the schema requires the block', () => {
+        assert.ok(schema.required.includes('scale_to_zero'));
+    });
+    for (const d of descriptors) {
+        it(`${d.target} declares a valid scale_to_zero block`, () => {
+            assert.ok(d.scale_to_zero, `${d.target} must declare scale_to_zero`);
+            assert.ok(validate(d), JSON.stringify(validate.errors));
+        });
+        it(`${d.target}: enabled implies native + mechanism + wake signal; disabled carries a reason`, () => {
+            const s = d.scale_to_zero;
+            if (s.enabled) {
+                assert.strictEqual(s.support, 'native');
+                assert.ok(s.mechanism && s.wake_signal);
+            } else {
+                assert.ok(s.reason && s.reason.length > 10, 'reason is shown verbatim on refusal');
+            }
+        });
+    }
+    it('the schema rejects enabled on a non-native target and a disabled block without a reason', () => {
+        const base = descriptors.find((d) => d.scale_to_zero.enabled);
+        assert.ok(base, 'at least one enabled target');
+        const notNative = { ...base, scale_to_zero: { ...base.scale_to_zero, support: 'pod-only' } };
+        assert.ok(!validate(notNative), 'enabled + pod-only must be invalid');
+        const noMech = { ...base, scale_to_zero: { ...base.scale_to_zero, mechanism: null } };
+        assert.ok(!validate(noMech), 'enabled + null mechanism must be invalid');
+        const noReason = { ...base, scale_to_zero: { ...base.scale_to_zero, enabled: false } };
+        assert.ok(!validate(noReason), 'disabled without a reason must be invalid');
+    });
+    it('flag acceptance matches enabled: --scale-to-zero / --scale-max are declared exactly on enabled targets', () => {
+        for (const d of descriptors) {
+            const flags = (d.answer_params || []).map((p) => p.flag).filter(Boolean);
+            for (const f of ['--scale-to-zero', '--scale-max']) {
+                assert.strictEqual(flags.includes(f), d.scale_to_zero.enabled,
+                    `${d.target}: ${f} declared iff scale_to_zero.enabled`);
+            }
+        }
+    });
+    it('the Python reader (target_manifest.py scale_to_zero) agrees with the Node reader', () => {
+        for (const d of descriptors) {
+            const r = spawnSync(py, [join(ROOT, 'templates/do/lib/python/target_manifest.py'), 'scale_to_zero', d.target],
+                { encoding: 'utf8' });
+            assert.strictEqual(r.status, 0, r.stderr);
+            assert.deepStrictEqual(JSON.parse(r.stdout), scaleToZero(d.target), d.target);
         }
     });
 });
