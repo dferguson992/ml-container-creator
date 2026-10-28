@@ -28,6 +28,10 @@ describe('Wave 10 — do/deploy scale-to-zero flags (behavioral, bash 3.2)', fun
             'export PROJECT_NAME="stz-test"',
             `export DEPLOYMENT_TARGET="${target}"`,
             'export INSTANCE_TYPE="ml.g5.xlarge"',
+            // A generated do/config always exports AWS_REGION. Pin it here so the
+            // dry-run plan does not depend on the ambient env (another test in
+            // the same mocha worker may delete process.env.AWS_REGION).
+            'export AWS_REGION="us-east-1"',
             ...extra,
             ''
         ].join('\n'), 0o644);
