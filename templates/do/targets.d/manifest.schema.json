@@ -18,6 +18,7 @@
     "optional_vars",
     "runtime_owned_vars",
     "serving_config_source",
+    "compute_backends",
     "verbs",
     "observability",
     "answer_params",
@@ -134,6 +135,13 @@
         }
       }
     },
+    "compute_backends": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "enum": ["smtj", "hp-eks"] },
+      "description": "Wave 11 (R1.1, OQ-11.5): the training compute backends do/train and do/tune may submit to from a project on this target, in preference order; the FIRST entry is the default when --backend is not given. smtj = a SageMaker training job (every target). hp-eks = a single-node HyperPodPyTorchJob on the project's HyperPod EKS cluster (hyperpod-eks only; opt-in, never the default). Verbs read this at run time through target_manifest.py compute_backends; no consumer branches on the target name."
+    },
     "verbs": {
       "type": "object",
       "additionalProperties": { "type": "boolean" },
@@ -141,6 +149,7 @@
       "properties": {
         "optimize": { "type": "boolean" },
         "add-ic": { "type": "boolean" },
+        "add-pod": { "type": "boolean", "description": "Wave 11 (R8.1, BL149): do/add-pod applies (the ADR-013 contract derives a pod-apply mechanism for full_model on this target). Must agree with _additive_verb_supported_on add-pod (additive-deploy-contract.test.js)." },
         "ci": { "type": "boolean" },
         "adapter": { "type": "boolean" },
         "draft": { "type": "boolean" },

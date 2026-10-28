@@ -16,9 +16,11 @@
   "serving_config_source": "sagemaker-ic",
   "service_quota_usage": "endpoint usage",
   "pricing": { "service": "AmazonSageMaker", "component": "AsyncInf", "instance_count": { "basis": "endpoint-current" } },
+  "compute_backends": ["smtj"],
   "verbs": {
     "optimize": false,
     "add-ic": false,
+    "add-pod": false,
     "ci": false,
     "adapter": false,
     "draft": false,

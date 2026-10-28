@@ -106,6 +106,19 @@ export function answerKey(target, targetsDir = TARGETS_D) {
     return d ? d.answer_key : '';
 }
 
+/**
+ * The target's training compute backends (Wave 11 R1.1), in preference order;
+ * the first entry is the default. Node twin of target_manifest.compute_backends().
+ * A descriptor that predates the field reads as ['smtj'].
+ * @returns {string[]}
+ */
+export function computeBackends(target, targetsDir = TARGETS_D) {
+    const d = getDescriptor(target, targetsDir);
+    return d && Array.isArray(d.compute_backends) && d.compute_backends.length > 0
+        ? d.compute_backends.slice()
+        : ['smtj'];
+}
+
 /** The target's verb-applicability map (verb -> boolean). */
 export function verbs(target, targetsDir = TARGETS_D) {
     const d = getDescriptor(target, targetsDir);
