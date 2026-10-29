@@ -303,11 +303,13 @@ if [ -z "${ARG_GROUP}" ]; then
     _cap_rc=0
     _cap=$(python3 "${SCRIPT_DIR}/lib/python/hyperpod_ops.py" rollout-capacity --cluster "${HP_CLUSTER_NAME}" \
         --namespace "${HP_NAMESPACE}" --project "${IEC_NAME}" --instance-type "${HP_INSTANCE_TYPE:-${INSTANCE_TYPE:-}}" \
-        --gpus "${POD_GPUS}") || _cap_rc=$?
+        --gpus "${POD_GPUS}" --model-source s3 --purpose new) || _cap_rc=$?
     if [ "${_cap_rc}" -eq 3 ]; then
         if [ "${ARG_SURGE}" != true ]; then
             rm -rf "${_render_dir}"
-            echo "❌ No node has room for ${IEC_NAME}. Free a node, use --instance-group, or pass --surge-node."
+            echo "❌ No node has room for ${IEC_NAME} (GPUs and pod slots, incl. its Mountpoint-S3 pod)."
+            printf '%s' "${_cap}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("   " + d.get("reason", "")); print("   Fix: " + d["fix"]) if d.get("fix") else None' 2>/dev/null || true
+            echo "   Free a node, use --instance-group, or pass --surge-node."
             exit 4
         fi
         _grp=$(printf '%s' "${_cap}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('group',''))")

@@ -28,6 +28,16 @@ source "${SCRIPT_DIR}/lib/scale-to-zero.sh"
 # Validate AWS credentials (general runtime error — exit 1, not a contract violation)
 _aws_preflight
 
+# BL236: on a Kubernetes-family target (derived from targets.d), a serving pod
+# stuck in ContainerCreating with a FailedMount from the S3 CSI driver gets its
+# Mountpoint pod's FailedScheduling reason printed (e.g. "Too many pods").
+# Read-only, optional: never fails do/status.
+if [ "$(python3 "${SCRIPT_DIR}/lib/python/target_manifest.py" family "${DEPLOYMENT_TARGET:-}" 2>/dev/null || true)" = "kubernetes" ] \
+    && command -v kubectl >/dev/null 2>&1; then
+    python3 "${SCRIPT_DIR}/lib/python/hyperpod_ops.py" mount-diagnose \
+        --namespace "${HP_NAMESPACE:-default}" --selector "app=${PROJECT_NAME}" >/dev/null || true
+fi
+
 # Check that we have an endpoint to query
 if [ -z "${ENDPOINT_NAME:-}" ]; then
     echo "❌ No endpoint configured"

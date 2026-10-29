@@ -18,6 +18,16 @@ Subcommands (all print one JSON object on stdout; human notes on stderr):
       group (node label sagemaker.amazonaws.com/instance-group-name) and its
       Current/Target count from DescribeCluster.  exit 0 = schedulable,
       3 = not schedulable, 1 = could not determine.
+      BL236 [--model-source S] [--purpose rollout|new]: a node must ALSO have
+      free pod slots (allocatable pods minus non-terminal pods): 1 for the pod,
+      +1 for its Mountpoint-S3 pod when S=s3 and no Mountpoint pod for the
+      serving volume runs on the node yet. Per-node pod slots are in the JSON
+      ("nodes") and on stderr; "limit" is "pod-slots" or "gpus" when refused.
+
+  mount-diagnose --namespace N --selector app=P
+      BL236, read-only (do/status, do/logs): for a pod stuck in ContainerCreating
+      with a FailedMount from s3.csi.aws.com, the Mountpoint pod pinned to its
+      node and that pod's FailedScheduling message.
 
   surge-up --cluster C --group G
       R4.3 opt-in. UpdateCluster with the group's TargetCount + 1, copying every
@@ -203,21 +213,39 @@ def cluster_view(instance_type: str | None = None, group: str | None = None) -> 
     return nodes.get("items") or [], pods.get("items") or []
 
 
+def _alloc_int(node: dict, resource: str) -> int | None:
+    """A node's status.allocatable[resource] as an int; None when absent/unparsable."""
+    val = ((node.get("status") or {}).get("allocatable") or {}).get(resource)
+    if val is None:
+        return None
+    try:
+        return int(str(val))
+    except ValueError:
+        return None
+
+
 def free_gpus(nodes: list[dict], pods: list[dict]) -> list[dict]:
+    """Per node: free nvidia.com/gpu AND free pod slots (BL236).
+
+    Both are allocatable minus what non-terminal pods (phase not Succeeded /
+    Failed) bound to the node hold — the kube-scheduler's own accounting. Pod
+    slots come from the node's allocatable `pods` (the kubelet's max-pods, e.g.
+    the VPC CNI ENI-based limit); never from a per-instance table. When a node
+    does not report allocatable pods, `pod_slots_free` is None (not enforced)."""
     used: dict[str, int] = {}
+    count: dict[str, int] = {}
     for p in pods:
         phase = (p.get("status") or {}).get("phase")
         node = (p.get("spec") or {}).get("nodeName")
         if not node or phase in ("Succeeded", "Failed"):
             continue
         used[node] = used.get(node, 0) + _pod_gpus(p)
+        count[node] = count.get(node, 0) + 1
     out = []
     for n in nodes:
         name = (n.get("metadata") or {}).get("name", "")
-        try:
-            alloc = int(str(((n.get("status") or {}).get("allocatable") or {}).get(GPU_RESOURCE, "0")))
-        except ValueError:
-            alloc = 0
+        alloc = _alloc_int(n, GPU_RESOURCE) or 0
+        pods_alloc = _alloc_int(n, "pods")
         out.append({
             "name": name,
             "group": ((n.get("metadata") or {}).get("labels") or {}).get(GROUP_LABEL, ""),
@@ -225,8 +253,204 @@ def free_gpus(nodes: list[dict], pods: list[dict]) -> list[dict]:
             "allocatable": alloc,
             "free": alloc - used.get(name, 0),
             "instance_id": _node_instance_id(n),
+            "pods_allocatable": pods_alloc,
+            "pods_used": count.get(name, 0),
+            "pod_slots_free": None if pods_alloc is None else pods_alloc - count.get(name, 0),
         })
     return out
+
+
+# ── BL236: pod-slot headroom (model pod + Mountpoint-S3 pod) ───────────────────
+#
+# Mountpoint for S3 CSI v2 runs one Mountpoint pod per (node, PersistentVolume),
+# pinned to the node (matchFields nodeAffinity, preemptionPolicy Never). It is a
+# separate pod that needs its own slot on the SAME node as the workload: when the
+# node's max-pods is used up, the workload pod schedules (a GPU was free) but its
+# Mountpoint pod stays Pending "Too many pods" and the workload hangs in
+# ContainerCreating (FailedMount). A pod mounting a volume that already has a
+# Running Mountpoint pod on the node reuses it and needs no extra slot.
+
+S3_CSI_VOLUME_ANNOTATION = "s3.csi.aws.com/volume-name"
+PICK_SLOT_FULL = "GPUs are free but no pod slot is"
+POD_SLOT_FIX = (
+    "Choose another instance group / instance type with free pod slots, free a pod slot on the node "
+    "(remove a non-essential pod), or raise the node's max-pods with VPC CNI prefix delegation "
+    "(ENABLE_PREFIX_DELEGATION=true on the aws-node DaemonSet, then replace the nodes; cluster owner)."
+)
+
+
+def _is_mount_pod(pod: dict) -> bool:
+    return S3_CSI_VOLUME_ANNOTATION in (((pod.get("metadata") or {}).get("annotations")) or {})
+
+
+def mount_pods_by_node(pods: list[dict]) -> dict[str, set]:
+    """node name → PV names with a Running, non-terminating Mountpoint pod there."""
+    out: dict[str, set] = {}
+    for p in pods:
+        if not _is_mount_pod(p) or (p.get("metadata") or {}).get("deletionTimestamp"):
+            continue
+        if (p.get("status") or {}).get("phase") != "Running":
+            continue
+        node = (p.get("spec") or {}).get("nodeName")
+        if node:
+            out.setdefault(node, set()).add(p["metadata"]["annotations"][S3_CSI_VOLUME_ANNOTATION])
+    return out
+
+
+def _pod_claims(pods: list[dict]) -> set:
+    claims = set()
+    for p in pods:
+        ns = (p.get("metadata") or {}).get("namespace", "")
+        for v in (p.get("spec") or {}).get("volumes") or []:
+            claim = (v.get("persistentVolumeClaim") or {}).get("claimName")
+            if claim:
+                claims.add((ns, claim))
+    return claims
+
+
+def s3_volumes(pods: list[dict]) -> set:
+    """The S3-CSI PersistentVolume names the given (serving) pods mount, read
+    live: pod → PVC → spec.volumeName → PV whose csi.driver is s3.csi.aws.com.
+    Unreadable objects are skipped (the caller then assumes a NEW Mountpoint pod
+    is needed — the conservative answer)."""
+    vols = set()
+    for ns, claim in sorted(_pod_claims(pods)):
+        pvc = _kubectl_json(["get", "pvc", claim, "-n", ns])
+        pv_name = ((pvc or {}).get("spec") or {}).get("volumeName")
+        if not pv_name:
+            continue
+        pv = _kubectl_json(["get", "pv", pv_name])
+        if (((pv or {}).get("spec") or {}).get("csi") or {}).get("driver") == S3_CSI_DRIVER:
+            vols.add(pv_name)
+    return vols
+
+
+def pod_slots_needed(node: str, s3_mount: bool, volumes: set, mounts: dict[str, set]) -> int:
+    """Slots one new workload pod needs on `node`: itself, plus its Mountpoint
+    pod when it mounts S3 via the CSI driver and no Mountpoint pod for one of its
+    volumes is already Running there."""
+    if not s3_mount:
+        return 1
+    if volumes and volumes & mounts.get(node, set()):
+        return 1
+    return 2
+
+
+def annotate_fit(rows: list[dict], gpus: int, pods: list[dict], s3_mount: bool, volumes: set) -> list[dict]:
+    """Add pod_slots_needed / gpu_fit / slot_fit / fits to free_gpus() rows."""
+    mounts = mount_pods_by_node(pods)
+    for r in rows:
+        need = pod_slots_needed(r["name"], s3_mount, volumes, mounts)
+        r["pod_slots_needed"] = need
+        r["gpu_fit"] = r["free"] >= gpus
+        r["slot_fit"] = r["pod_slots_free"] is None or r["pod_slots_free"] >= need
+        r["fits"] = bool(r["ready"] and r["gpu_fit"] and r["slot_fit"])
+    return rows
+
+
+def _slot_detail(r: dict) -> str:
+    why = "model pod + Mountpoint-S3 pod" if r.get("pod_slots_needed", 1) > 1 else "model pod"
+    alloc = r.get("pods_allocatable")
+    return (f"{r['name']}: {r['pods_used']}/{alloc if alloc is not None else '?'} pods, "
+            f"{r['pod_slots_free'] if r['pod_slots_free'] is not None else '?'} slot(s) free, "
+            f"needs {r.get('pod_slots_needed', 1)} ({why})")
+
+
+def _mount_pod_node(pod: dict) -> str:
+    """The node a Mountpoint pod is bound or pinned to: spec.nodeName, else its
+    required nodeAffinity matchFields metadata.name (a Pending pod has no nodeName)."""
+    node = (pod.get("spec") or {}).get("nodeName")
+    if node:
+        return node
+    terms = (((((pod.get("spec") or {}).get("affinity") or {}).get("nodeAffinity") or {})
+              .get("requiredDuringSchedulingIgnoredDuringExecution") or {}).get("nodeSelectorTerms") or [])
+    for t in terms:
+        for f in t.get("matchFields") or []:
+            if f.get("key") == "metadata.name" and f.get("values"):
+                return f["values"][0]
+    return ""
+
+
+def _pod_events(namespace: str, name: str, reason: str) -> list[str]:
+    data = _kubectl_json(["get", "events", "-n", namespace, "--field-selector", f"involvedObject.name={name}"])
+    return [e.get("message", "") for e in (data or {}).get("items") or [] if e.get("reason") == reason]
+
+
+def _container_creating(pod: dict) -> bool:
+    st = pod.get("status") or {}
+    if st.get("phase") != "Pending" or not (pod.get("spec") or {}).get("nodeName"):
+        return False
+    waits = [((c.get("state") or {}).get("waiting") or {}).get("reason")
+             for c in (st.get("containerStatuses") or []) + (st.get("initContainerStatuses") or [])]
+    return not waits or "ContainerCreating" in waits or "PodInitializing" in waits
+
+
+def mount_diagnose(namespace: str, selector: str) -> dict:
+    """BL236 (do/status, do/logs), read-only: a serving pod stuck in
+    ContainerCreating with a FailedMount from the S3 CSI driver usually means its
+    Mountpoint pod could not schedule. Name that pod and its FailedScheduling
+    message (e.g. '0/N nodes are available: 1 Too many pods')."""
+    data = _kubectl_json(["get", "pods", "-n", namespace, "-l", selector])
+    if data is None:
+        return {"stuck": [], "error": "could not read pods with kubectl"}
+    stuck = []
+    all_pods = None
+    for p in data.get("items") or []:
+        if not _container_creating(p):
+            continue
+        name = p["metadata"]["name"]
+        mounts = [m for m in _pod_events(namespace, name, "FailedMount")
+                  if S3_CSI_DRIVER in m or "Mountpoint" in m]
+        if not mounts:
+            continue
+        node = p["spec"]["nodeName"]
+        vols = s3_volumes([p])
+        if all_pods is None:
+            all_pods = (_kubectl_json(["get", "pods", "--all-namespaces"]) or {}).get("items") or []
+        mps = []
+        for mp in all_pods:
+            if not _is_mount_pod(mp) or _mount_pod_node(mp) != node:
+                continue
+            vol = mp["metadata"]["annotations"][S3_CSI_VOLUME_ANNOTATION]
+            if vols and vol not in vols:
+                continue
+            phase = (mp.get("status") or {}).get("phase", "")
+            if phase == "Running":
+                continue
+            md = mp["metadata"]
+            mps.append({"name": md.get("name", ""), "namespace": md.get("namespace", ""), "volume": vol,
+                        "phase": phase,
+                        "failed_scheduling": _pod_events(md.get("namespace", ""), md.get("name", ""),
+                                                         "FailedScheduling")[-1:]})
+        stuck.append({"pod": name, "node": node, "failed_mount": mounts[-1], "mountpoint_pods": mps})
+    return {"stuck": stuck}
+
+
+def mount_diagnose_notes(report: dict) -> list[str]:
+    """Human lines for mount_diagnose() (stderr)."""
+    lines = []
+    for s in report.get("stuck") or []:
+        lines.append(f"⚠️  {s['pod']} is stuck in ContainerCreating on {s['node']}: FailedMount from {S3_CSI_DRIVER}")
+        lines.append(f"   {s['failed_mount'][:300]}")
+        too_many = False
+        for mp in s["mountpoint_pods"]:
+            msg = (mp["failed_scheduling"] or ["(no FailedScheduling event)"])[0]
+            too_many = too_many or "Too many pods" in msg
+            lines.append(f"   Mountpoint pod {mp['namespace']}/{mp['name']} ({mp['phase'] or '?'}): {msg[:300]}")
+        if not s["mountpoint_pods"]:
+            lines.append("   No pending Mountpoint pod found for this node; check: kubectl get pods -A -o wide | grep mp-")
+        if too_many:
+            lines.append(f"   The node has no free pod slot for the Mountpoint pod. Fix: {POD_SLOT_FIX}")
+    return lines
+
+
+def capacity_note(r: dict) -> str:
+    """One human line per node: GPUs and pod slots (stderr)."""
+    pods = ("pod slots n/a" if r.get("pod_slots_free") is None else
+            f"pod slots {r['pod_slots_free']}/{r['pods_allocatable']} free (needs {r.get('pod_slots_needed', 1)})")
+    mark = "✅" if r.get("fits") else "❌"
+    return (f"   {mark} {r['name']} ({r.get('group') or '?'}): GPUs {r['free']}/{r['allocatable']} free, {pods}"
+            + ("" if r["ready"] else ", not Ready"))
 
 
 def _serving_pods(pods: list[dict], namespace: str, project: str) -> list[dict]:
@@ -238,15 +462,26 @@ def _serving_pods(pods: list[dict], namespace: str, project: str) -> list[dict]:
 # ── R4.1 rollout capacity ──────────────────────────────────────────────────────
 
 
-def rollout_capacity(cluster: str, namespace: str, project: str, instance_type: str, gpus: int) -> tuple[int, dict]:
+def rollout_capacity(cluster: str, namespace: str, project: str, instance_type: str, gpus: int,
+                     model_source: str = "", purpose: str = "rollout") -> tuple[int, dict]:
+    """Can ONE new serving pod schedule AND start? (R4.1 + BL236.)
+
+    A node fits when it is Ready, has `gpus` free GPUs and has the pod slots the
+    pod needs (itself, plus a Mountpoint-S3 pod when `model_source` is s3 and no
+    Mountpoint pod for the serving volume already runs there). `purpose` only
+    words the reason: "rollout" (the operator's surge pod) or "new" (first
+    deploy / add-pod)."""
     view = cluster_view(instance_type=instance_type)
     if view is None:
         return 1, {"schedulable": None, "reason": "could not read nodes/pods with kubectl"}
     nodes, pods = view
-    report = free_gpus(nodes, pods)
+    s3_mount = model_source == "s3"
+    serving = _serving_pods(pods, namespace, project)
+    volumes = s3_volumes(serving) if (s3_mount and serving) else set()
+    report = annotate_fit(free_gpus(nodes, pods), gpus, pods, s3_mount, volumes)
     eligible = [n for n in report if n["ready"]]
-    schedulable = any(n["free"] >= gpus for n in eligible)
-    serving_nodes = {(p.get("spec") or {}).get("nodeName") for p in _serving_pods(pods, namespace, project)}
+    schedulable = any(n["fits"] for n in eligible)
+    serving_nodes = {(p.get("spec") or {}).get("nodeName") for p in serving}
     groups = [n["group"] for n in report if n["name"] in serving_nodes and n["group"]] or \
              [n["group"] for n in report if n["group"]]
     group = groups[0] if groups else ""
@@ -267,12 +502,38 @@ def rollout_capacity(cluster: str, namespace: str, project: str, instance_type: 
         else:
             result["describe_error"] = err
     result["single_node"] = result["current_count"] == 1
+    result["model_source"] = model_source
+    result["s3_volumes"] = sorted(volumes)
+    what = "the rollout's surge pod" if purpose == "rollout" else "the new serving pod"
     if schedulable:
-        result["reason"] = "a node of this instance type has enough free GPUs for the surge pod"
+        result["limit"] = ""
+        result["reason"] = f"a node of this instance type has enough free GPUs and pod slots for {what}"
+        # The scheduler picks among GPU-fit nodes by its own scoring; a GPU-fit
+        # node without the Mountpoint slot could still be chosen.
+        at_risk = [n["name"] for n in eligible if n["gpu_fit"] and not n["slot_fit"]]
+        if at_risk:
+            result["at_risk_nodes"] = at_risk
+            result["reason"] += (f"; note: {', '.join(at_risk)} also has free GPUs but no pod slot for it — "
+                                 f"if the scheduler picks that node the pod hangs in ContainerCreating")
         return 0, result
+    gpu_ok = [n for n in eligible if n["gpu_fit"]]
+    if gpu_ok:
+        # BL236: GPUs are free, pod slots are not.
+        result["limit"] = "pod-slots"
+        result["reason"] = (
+            f"no Ready {instance_type} node has a free pod slot for {what}: GPUs are free but the "
+            f"node's max-pods is used up ({'; '.join(_slot_detail(n) for n in gpu_ok)}). "
+            + ("The pod would schedule, but its Mountpoint-S3 pod could not (FailedScheduling 'Too many "
+               "pods'), so it would hang in ContainerCreating with FailedMount"
+               if any(n["pod_slots_needed"] > 1 for n in gpu_ok) else "The pod would stay Pending")
+        )
+        result["fix"] = POD_SLOT_FIX
+        return 3, result
+    result["limit"] = "gpus"
     result["reason"] = (
-        f"no Ready {instance_type} node has {gpus} free GPU(s) for the rollout's surge pod "
-        f"(the operator keeps the old pod until the new one is Ready, so it would stay Pending)"
+        f"no Ready {instance_type} node has {gpus} free GPU(s) for {what}"
+        + (" (the operator keeps the old pod until the new one is Ready, so it would stay Pending)"
+           if purpose == "rollout" else " (it would stay Pending)")
     )
     return 3, result
 
@@ -574,14 +835,22 @@ def pick_group(rows: list[dict], group: str = "", instance_type: str = "", gpus:
         cands = [r for r in cands if r["instance_type"] == instance_type]
         if not cands:
             return None, f"no Ready GPU node of instance type {instance_type}" + (f" in group '{group}'" if group else "")
+    slot_full = []
     for r in sorted(cands, key=lambda x: (x["group"], x["name"])):
         if gpus and gpus > r["allocatable"]:
             continue
         need = gpus or r["allocatable"]
         if r["free"] >= need:
+            # BL236: the job pod also needs a pod slot on the node.
+            if r.get("pod_slots_free") is not None and r["pod_slots_free"] < 1:
+                slot_full.append(r)
+                continue
             return dict(r, gpus=need), ""
     if gpus and all(gpus > r["allocatable"] for r in cands):
         return None, f"--gpus {gpus} exceeds every candidate node's allocatable nvidia.com/gpu"
+    if slot_full:
+        return None, (PICK_SLOT_FULL + ": "
+                      + "; ".join(_slot_detail(dict(r, pod_slots_needed=1)) for r in slot_full))
     return None, "no candidate node has " + (f"{gpus} free GPU(s)" if gpus else "a whole free GPU node")
 
 
@@ -747,15 +1016,34 @@ def _check_free_gpus(findings: list, resolved: dict, a: dict) -> None:
     rows = _node_rows(nodes, pods)
     if a["verb"] == "add-pod":
         need = int(a.get("gpus") or 1)
-        ok = [r for r in rows if r["ready"] and r["free"] >= need
-              and (not a.get("instance_type") or r["instance_type"] == a["instance_type"])]
+        # add-pod always serves its full model from S3 (a NEW IEC, so a new
+        # S3 volume): the pod needs its own slot plus one for its Mountpoint pod.
+        annotate_fit(rows, need, pods, True, set())
+        typed = [r for r in rows if r["ready"]
+                 and (not a.get("instance_type") or r["instance_type"] == a["instance_type"])]
+        ok = [r for r in typed if r["fits"]]
+        resolved["nodes"] = [{k: r.get(k) for k in ("name", "group", "free", "allocatable", "pods_allocatable",
+                                                    "pods_used", "pod_slots_free", "pod_slots_needed", "fits")}
+                             for r in typed]
         if ok:
             resolved["node"], resolved["group"] = ok[0]["name"], ok[0]["group"]
-            findings.append(_finding("info", "free-gpus", f"{ok[0]['name']} ({ok[0]['group']}) has {ok[0]['free']} free GPU(s)"))
+            slots = ("" if ok[0]["pod_slots_free"] is None else
+                     f", {ok[0]['pod_slots_free']} free pod slot(s) (needs {ok[0]['pod_slots_needed']})")
+            findings.append(_finding("info", "free-gpus",
+                                     f"{ok[0]['name']} ({ok[0]['group']}) has {ok[0]['free']} free GPU(s){slots}"))
+            return
+        gpu_ok = [r for r in typed if r["gpu_fit"]]
+        sev = "warn" if a.get("allow_surge") else "block"
+        if gpu_ok:
+            findings.append(_finding(
+                sev, "pod-slots",
+                "GPUs are free but no node has the pod slots for the add-pod pod and its Mountpoint-S3 pod "
+                f"({'; '.join(_slot_detail(r) for r in gpu_ok)}); it would hang in ContainerCreating (FailedMount)",
+                POD_SLOT_FIX + " Or pass --surge-node to add a node."))
             return
         busy = _gpu_pods_on(pods, {r["name"] for r in rows})
         findings.append(_finding(
-            "warn" if a.get("allow_surge") else "block", "free-gpus",
+            sev, "free-gpus",
             f"no Ready node has {need} free GPU(s)" + (f"; GPU pods: {', '.join(busy)}" if busy else ""),
             "Free a node, pick another --instance-group, or pass --surge-node to add one."))
         return
@@ -767,6 +1055,9 @@ def _check_free_gpus(findings: list, resolved: dict, a: dict) -> None:
         findings.append(_finding("info", "free-gpus",
                                  f"group {choice['group']} node {choice['name']}: {choice['gpus']} of "
                                  f"{choice['allocatable']} GPU(s) free"))
+        return
+    if reason.startswith(PICK_SLOT_FULL):
+        findings.append(_finding("block", "pod-slots", reason, POD_SLOT_FIX))
         return
     busy = _gpu_pods_on(pods, {r["name"] for r in rows if r["allocatable"] > 0})
     findings.append(_finding(
@@ -876,11 +1167,33 @@ def preflight_from_env(env: dict | None = None) -> dict:
     a = {"verb": "train", "kind": "train", "cluster": env.get("HP_CLUSTER_NAME", ""),
          "namespace": env.get("HP_NAMESPACE") or "default", "project": env.get("PROJECT_NAME", "")}
     _check_training_operator(findings)
+    _check_training_operator(findings)
     _check_pod_identity(findings, {}, a, env)
     _check_local_queue(findings, a, env)
+    _check_serving_capacity(findings, a, env, source)
     report["findings"].extend(_cap_warn(findings))
     return report
 
+
+def _check_serving_capacity(findings: list, a: dict, env: dict, source: str) -> None:
+    """BL236 (do/validate): can one serving pod of this project schedule AND
+    start — free GPUs plus pod slots (incl. the Mountpoint-S3 pod)? Reported,
+    never above `warn`. Skipped when the instance type is not known yet."""
+    itype = (env.get("HP_INSTANCE_TYPE") or env.get("INSTANCE_TYPE") or "").strip()
+    if not itype:
+        return
+    try:
+        gpus = int(str(env.get("HP_GPU_COUNT") or "1"))
+    except ValueError:
+        gpus = 1
+    rc, out = rollout_capacity(a["cluster"], a["namespace"], a["project"], itype, gpus, source, "new")
+    if rc == 0:
+        findings.append(_finding("info", "serving-capacity", out.get("reason", "")))
+    elif rc == 3:
+        check = "pod-slots" if out.get("limit") == "pod-slots" else "free-gpus"
+        findings.append(_finding("warn", check, out.get("reason", ""), out.get("fix", "")))
+    else:
+        findings.append(_finding("info", "serving-capacity", out.get("reason", "could not determine capacity")))
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
@@ -894,6 +1207,11 @@ def _cli(argv: list[str]) -> int:
     a.add_argument("--project", required=True)
     a.add_argument("--instance-type", required=True)
     a.add_argument("--gpus", type=int, required=True)
+    a.add_argument("--model-source", default="", help="s3 when the model is mounted by the S3 CSI driver")
+    a.add_argument("--purpose", default="rollout", choices=["rollout", "new"])
+    md = sub.add_parser("mount-diagnose")
+    md.add_argument("--namespace", required=True)
+    md.add_argument("--selector", required=True)
     b = sub.add_parser("surge-up")
     b.add_argument("--cluster", required=True)
     b.add_argument("--group", required=True)
@@ -962,7 +1280,14 @@ def _cli(argv: list[str]) -> int:
         return 4 if out["blocked"] else 0
 
     if args.cmd == "rollout-capacity":
-        rc, out = rollout_capacity(args.cluster, args.namespace, args.project, args.instance_type, args.gpus)
+        rc, out = rollout_capacity(args.cluster, args.namespace, args.project, args.instance_type, args.gpus,
+                                   args.model_source, args.purpose)
+        for r in out.get("nodes") or []:
+            _note(capacity_note(r))
+    elif args.cmd == "mount-diagnose":
+        rc, out = 0, mount_diagnose(args.namespace, args.selector)
+        for line in mount_diagnose_notes(out):
+            _note(line)
     elif args.cmd == "surge-up":
         rc, out = surge_up(args.cluster, args.group)
     elif args.cmd == "surge-wait":
