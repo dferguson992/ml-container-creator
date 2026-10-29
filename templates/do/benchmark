@@ -537,6 +537,7 @@ _run_eks_aiperf_benchmark() {
         if python3 "${_sd}/.benchmark_writer.py" write \
             --results-file "${_EKS_OUTPUT_JSONL}" \
             --config-file "${_sd}/config" \
+            ${DEPLOYMENT_TARGET:+--deployment-target "${DEPLOYMENT_TARGET}"} \
             --project-name "${PROJECT_NAME}" \
             --workload "${BENCHMARK_WORKLOAD:-manual}" \
             --concurrency "${BENCHMARK_CONCURRENCY}" \
@@ -865,6 +866,16 @@ if [ "${ARG_STATUS}" = true ]; then
                 if [ -n "${_WRITER_INPUT}" ]; then
                     echo ""
                     echo "   📊 Writing to Athena..."
+                    # BL213: the inference component THIS job benchmarked (its
+                    # BenchmarkTarget), so the row's target follows the job, not a
+                    # DEPLOYMENT_TARGET that may have changed since. Optional
+                    # read-only probe: no IC / any error → "" (safe swallow).
+                    _STATUS_IC_NAME=$(aws sagemaker describe-ai-benchmark-job \
+                        --ai-benchmark-job-name "${JOB_NAME}" \
+                        --region "${AWS_REGION}" \
+                        --query 'BenchmarkTarget.Endpoint.InferenceComponents[0].Identifier' \
+                        --output text 2>/dev/null) || _STATUS_IC_NAME=""
+                    [ "${_STATUS_IC_NAME}" != "None" ] || _STATUS_IC_NAME=""
                     # Wave 9 R1.2 / R6.3: the resume path gets a run window too —
                     # the writer reads the downloaded AIPerf start/end (else
                     # DescribeAIBenchmarkJob times via --benchmark-job-name, which
@@ -873,6 +884,8 @@ if [ "${ARG_STATUS}" = true ]; then
                     if python3 "$(dirname "${BASH_SOURCE[0]}")/.benchmark_writer.py" write \
                         --results-file "${_WRITER_INPUT}" \
                         --config-file "$(dirname "${BASH_SOURCE[0]}")/config" \
+                        ${DEPLOYMENT_TARGET:+--deployment-target "${DEPLOYMENT_TARGET}"} \
+                        ${_STATUS_IC_NAME:+--ic-name "${_STATUS_IC_NAME}"} \
                         --project-name "${PROJECT_NAME}" \
                         --workload "${BENCHMARK_WORKLOAD:-manual}" \
                         --concurrency "${BENCHMARK_CONCURRENCY:-2}" \
@@ -2083,6 +2096,7 @@ print(f'Combined {n_metrics} concurrency level results')
             if python3 "$(dirname "${BASH_SOURCE[0]}")/.benchmark_writer.py" write \
                 --results-file "${_COMBINED_FILE}" \
                 --config-file "$(dirname "${BASH_SOURCE[0]}")/config" \
+                ${DEPLOYMENT_TARGET:+--deployment-target "${DEPLOYMENT_TARGET}"} \
                 --project-name "${PROJECT_NAME}" \
                 --workload "${BENCHMARK_WORKLOAD:-manual}" \
                 --bucket "${CI_BENCHMARK_RESULTS_BUCKET}" \
@@ -3187,6 +3201,7 @@ except Exception as e:
         if python3 "$(dirname "${BASH_SOURCE[0]}")/.benchmark_writer.py" write \
             --results-file "${_WRITER_INPUT}" \
             --config-file "$(dirname "${BASH_SOURCE[0]}")/config" \
+            ${DEPLOYMENT_TARGET:+--deployment-target "${DEPLOYMENT_TARGET}"} \
             --project-name "${PROJECT_NAME}" \
             --workload "${BENCHMARK_WORKLOAD:-manual}" \
             --concurrency "${BENCHMARK_CONCURRENCY}" \

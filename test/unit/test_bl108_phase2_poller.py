@@ -344,7 +344,12 @@ class TestBenchmarkWriterUnchanged:
     # descriptor store, real error_rate, the .mlcc/instances.json catalog path,
     # benchmark_job_name on the write path, and per-job/per-level scrape sidecars
     # (--gpu-metrics-dir). Re-pinned again after merging 9B into 9A (both halves applied).
-    _EXPECTED_SHA256 = "bcf4cfca89e15393461af75991870911c2fd07f6d081b3b79d13085d24a75afe"
+    #
+    # Re-pinned (BL213, v2.0 bug fix): rows are labelled with the target actually
+    # benchmarked — new --deployment-target arg + resolve_benchmarked_target()
+    # (alias resolution via targets.d; an IC run is labelled with the descriptor's
+    # IC-hosting target). Deliberate writer change; pin updated.
+    _EXPECTED_SHA256 = "21a90789e7a138bdd6b3f21786be9898a8f59eda1d6fc807e5da0776bc4d5a01"
 
     def test_writer_hash_unchanged(self):
         with open(_WRITER_PATH, "rb") as f:
