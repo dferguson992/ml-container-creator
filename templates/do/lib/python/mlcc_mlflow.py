@@ -310,8 +310,11 @@ def log_first_class_dataset(source, name, meta=None, context="training"):
         # A minimal descriptor frame — carries the provenance, downloads nothing.
         frame = pd.DataFrame([{k: v for k, v in provenance.items()}] or [{}])
         ds = mlflow.data.from_pandas(frame, source=source, name=safe_name)
-    except Exception:  # noqa: BLE001 — pandas/from_pandas unavailable → fall back to meta dataset
-        return log_dataset(source=source, name=name, context=context, meta=meta)
+    except Exception:  # noqa: BLE001 — pandas/from_pandas unavailable → no first-class Dataset
+        # Do NOT log the meta dataset here: every caller follows up with
+        # log_dataset (the run-input lineage edge), so a fallback here logged the
+        # same input twice whenever pandas was absent (BL234).
+        return None
     mlflow.log_input(ds, context=context)
     return (safe_name, _derive_digest(source, safe_name, meta))
 
