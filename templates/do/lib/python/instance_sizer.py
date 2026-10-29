@@ -152,12 +152,12 @@ def recommend_for_model(model_name: str, precision: str = "float16") -> str | No
 def resolve_model_params(model_name: str) -> float | None:
     """Attempt to resolve parameter count from Hugging Face Hub.
 
-    Downloads config.json for *model_name* and extracts the parameter
-    count. Falls back to estimating from architecture dimensions if
-    ``num_parameters`` is not present.
-
-    Estimation formula (matches MCP server's model-resolver.js):
-        params ≈ hidden_size * num_hidden_layers * 12
+    Precedence (same as the MCP server's model-resolver.js and
+    catalog_registration._extract_from_hf_config):
+      1. HF Hub API safetensors.total (authoritative; public even for gated repos)
+      2. config.json ``num_parameters``
+      3. dense-transformer estimate from config dimensions, reading the nested
+         ``text_config`` of multimodal models (never for MoE)
 
     Args:
         model_name: HF Hub model identifier (e.g. "meta-llama/Llama-2-7b-hf").
@@ -165,6 +165,11 @@ def resolve_model_params(model_name: str) -> float | None:
     Returns:
         Parameter count in billions (e.g. 7.0), or None if lookup fails.
     """
+    import catalog_registration  # noqa: WPS433 — sibling module in lib/python
+
+    hub_info = catalog_registration._fetch_hub_info(model_name)
+
+    config: dict[str, Any] = {}
     try:
         from huggingface_hub import hf_hub_download  # noqa: WPS433
         import json
@@ -177,20 +182,12 @@ def resolve_model_params(model_name: str) -> float | None:
         )
 
         with open(config_path) as f:
-            config: dict[str, Any] = json.load(f)
-
-        # Direct parameter count field
-        if "num_parameters" in config:
-            return config["num_parameters"] / 1e9
-
-        # Estimate from architecture dimensions
-        hidden_size = config.get("hidden_size")
-        num_layers = config.get("num_hidden_layers")
-        if hidden_size and num_layers:
-            estimated = hidden_size * num_layers * 12
-            return estimated / 1e9
-
-        return None  # noqa: TRY300
-
+            config = json.load(f)
     except Exception:  # noqa: BLE001
+        config = {}
+
+    if not config and not hub_info:
         return None
+    entry = catalog_registration._extract_from_hf_config(config, hub_info)
+    count = entry.get("parameterCount")
+    return count / 1e9 if count else None
