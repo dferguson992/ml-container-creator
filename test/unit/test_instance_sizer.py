@@ -324,6 +324,45 @@ class TestResolveModelParams:
     Validates: Requirements FR-10.3
     """
 
+    @pytest.fixture(autouse=True)
+    def _offline_hub_api(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Keep these tests offline: no HF Hub API (safetensors metadata) lookup."""
+        import catalog_registration
+
+        monkeypatch.setattr(catalog_registration, "_fetch_hub_info", lambda *a, **k: None)
+
+    def test_hub_safetensors_total_wins_over_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """The Hub API safetensors total is authoritative over config fields."""
+        import catalog_registration
+        import huggingface_hub
+
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({"num_parameters": 1_000_000_000}))
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **kwargs: str(config_file))
+        monkeypatch.setattr(
+            catalog_registration, "_fetch_hub_info",
+            lambda *a, **k: {"safetensors": {"parameters": {"BF16": 4_500_000_000}, "total": 4_500_000_000}},
+        )
+        assert resolve_model_params("some-org/hub-model") == 4.5
+
+    def test_multimodal_text_config_is_sized(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """A config nesting the LM under text_config must not resolve to None."""
+        import huggingface_hub
+
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "architectures": ["SomeForConditionalGeneration"],
+            "text_config": {"hidden_size": 2560, "num_hidden_layers": 32, "vocab_size": 248320,
+                            "tie_word_embeddings": True},
+        }))
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **kwargs: str(config_file))
+        result = resolve_model_params("some-org/vlm")
+        assert result is not None and result > 1.0
+
     def test_returns_params_from_num_parameters_field(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
@@ -346,10 +385,15 @@ class TestResolveModelParams:
     def test_estimates_from_architecture_dimensions(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        """When no num_parameters, estimates from hidden_size * num_hidden_layers * 12."""
+        """When no num_parameters, estimates layers * 12 * hidden^2 + embeddings.
+
+        (The old hidden * layers * 12 formula dropped a factor of hidden and
+        sized a Llama-3-8B-shaped config at ~0.0016B.)
+        """
         config_data = {
             "hidden_size": 4096,
             "num_hidden_layers": 32,
+            "vocab_size": 128256,
         }
         config_file = tmp_path / "config.json"
         config_file.write_text(json.dumps(config_data))
@@ -363,10 +407,9 @@ class TestResolveModelParams:
         )
 
         result = resolve_model_params("some-org/arch-model")
-        # 4096 * 32 * 12 = 1_572_864 params → 1_572_864 / 1e9 ≈ 0.001573
-        expected = (4096 * 32 * 12) / 1e9
+        published_b = 8.030261248  # safetensors total of meta-llama/Llama-3.1-8B (same shape)
         assert result is not None
-        assert abs(result - expected) < 1e-9
+        assert abs(result - published_b) / published_b < 0.15
 
     def test_returns_none_when_fields_missing(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path

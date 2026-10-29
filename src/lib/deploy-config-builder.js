@@ -157,14 +157,47 @@ async function callMcpTool(serverName, toolName, toolArgs, opts = {}) {
 
 // ── Instance sizing ──────────────────────────────────────────────────────────
 
-async function getInstanceRecommendations(modelName, _region, deploymentTarget) {
+/**
+ * Query the instance-sizer for VRAM-sized recommendations.
+ *
+ * `projectDir` is forwarded as context.projectDir so the sizer consults the
+ * project's .mlcc/model-sizes.json (written by do/stage). Without it the
+ * sizer falls back to its own cwd — the generator root, not the project.
+ *
+ * When the sizer cannot determine the model's size it returns
+ * `metadata.sizingUnavailable` with an explicit `metadata.error`; that is
+ * surfaced as `sizingMessage` (and no unsized list is offered as
+ * "recommendations"). A sized-but-nothing-fits result surfaces its
+ * `metadata.error` the same way.
+ *
+ * @returns {Promise<{single: object[], multi: object[], estimatedVram?: number, sizingMessage?: string}>}
+ */
+async function getInstanceRecommendations(modelName, _region, deploymentTarget, projectDir) {
     if (!modelName) return { single: [], multi: [] };
 
     const result = await callMcpTool('instance-sizer', 'get_instance_recommendation', {
         modelName,
         limit: 40,
-        context: { deploymentTarget: deploymentTarget || 'realtime-inference' }
+        context: {
+            deploymentTarget: deploymentTarget || 'realtime-inference',
+            ...(projectDir ? { projectDir } : {})
+        }
     }, { timeout: 60000 });
+
+    return summarizeSizerResult(result);
+}
+
+/**
+ * Turn a parsed instance-sizer response into the single/multi-GPU choice
+ * groups shown by promptInstanceType (pure; exported for unit tests).
+ *
+ * @param {object|null} result - Parsed get_instance_recommendation payload
+ * @returns {{single: object[], multi: object[], estimatedVram?: number, sizingMessage?: string}}
+ */
+function summarizeSizerResult(result) {
+    if (result?.metadata?.sizingUnavailable) {
+        return { single: [], multi: [], sizingMessage: result.metadata.error || result.metadata.warning };
+    }
 
     if (result?.choices?.instanceType?.length > 0) {
         const recs = result.metadata?.recommendations || [];
@@ -229,6 +262,9 @@ async function getInstanceRecommendations(modelName, _region, deploymentTarget) 
         }
 
         return { single, multi, estimatedVram };
+    }
+    if (result?.metadata?.error) {
+        return { single: [], multi: [], sizingMessage: result.metadata.error };
     }
     return { single: [], multi: [] };
 }
@@ -375,6 +411,8 @@ function resolveHpGpuCount({ selectedInstanceType, configInstanceType, existingG
 // templates/do/deploy.d/hyperpod-eks (_hp_detect_gpu_count) must stay in sync
 // with GPU_MAP.
 export { detectGpuCount, GPU_MAP, resolveHpGpuCount };
+// Exported for unit testing (instance-sizer realtime path).
+export { summarizeSizerResult };
 // Exported for unit testing (BL209).
 export { resolveImageDefaultAmi, resolveDeployInferenceAmi };
 
@@ -427,9 +465,9 @@ function resolveDeployInferenceAmi(config, instanceTypes, imageAmi) {
 
 // ── Instance type prompt with split display ──────────────────────────────────
 
-async function promptInstanceType(modelName, region, strategy, deploymentTarget) {
+async function promptInstanceType(modelName, region, strategy, deploymentTarget, projectDir) {
     const spinner = ora('Querying instance-sizer...').start();
-    const { single, multi, estimatedVram } = await getInstanceRecommendations(modelName, region, deploymentTarget);
+    const { single, multi, estimatedVram, sizingMessage } = await getInstanceRecommendations(modelName, region, deploymentTarget, projectDir);
     const totalRecs = single.length + multi.length;
     if (totalRecs > 0) {
         spinner.succeed(`${totalRecs} recommendation(s)`);
@@ -497,7 +535,12 @@ async function promptInstanceType(modelName, region, strategy, deploymentTarget)
             return selected;
         }
     } else {
-        spinner.warn('No MCP recommendations available');
+        if (sizingMessage) {
+            spinner.warn('No instance recommendation');
+            console.log(`   ⚠️  ${sizingMessage}`);
+        } else {
+            spinner.warn('No MCP recommendations available');
+        }
         return await input({
             message: 'Instance type (e.g. ml.g5.xlarge):',
             default: 'ml.g5.xlarge',
@@ -527,6 +570,10 @@ export async function run({ configFile, outputFile, preTarget, preInstanceType, 
         || (config.MODEL_NAME && !config.MODEL_NAME.startsWith('s3://') ? config.MODEL_NAME : '')
         || '';
     const projectName = config.PROJECT_NAME || 'project';
+    // The builder runs with cwd = generator root (for ESM resolution), so the
+    // project dir is derived from the config path (<project>/do/config) and
+    // passed to the instance-sizer explicitly (.mlcc/model-sizes.json lookup).
+    const projectDir = process.env.MLCC_PROJECT_DIR || dirname(dirname(configPath));
 
     console.log('');
     console.log('🚀  Deployment Configuration');
@@ -612,7 +659,7 @@ export async function run({ configFile, outputFile, preTarget, preInstanceType, 
                 if (selected === '__custom__') {
                     answers.smai_endpoint_name = await input({ message: 'Endpoint name:' });
                     // Custom endpoint — need instance type
-                    answers.instance_type = await promptInstanceType(modelName, region, 'new', target);
+                    answers.instance_type = await promptInstanceType(modelName, region, 'new', target, projectDir);
                 } else {
                     answers.smai_endpoint_name = selected;
                     // Instance type comes from the endpoint — no sizer needed
@@ -628,10 +675,10 @@ export async function run({ configFile, outputFile, preTarget, preInstanceType, 
                     default: `${projectName}-ep`
                 });
                 // No endpoint found — need instance type
-                answers.instance_type = await promptInstanceType(modelName, region, 'new', target);
+                answers.instance_type = await promptInstanceType(modelName, region, 'new', target, projectDir);
             }
         } else {
-            answers.instance_type = await promptInstanceType(modelName, region, answers.endpoint_strategy, target);
+            answers.instance_type = await promptInstanceType(modelName, region, answers.endpoint_strategy, target, projectDir);
         }
     } else {
         answers.instance_type = config.INSTANCE_TYPE;
@@ -749,7 +796,7 @@ export async function run({ configFile, outputFile, preTarget, preInstanceType, 
                 }
             } else {
                 // No cluster info available — fall back to sizer
-                answers.instance_type = await promptInstanceType(modelName, region, null, target);
+                answers.instance_type = await promptInstanceType(modelName, region, null, target, projectDir);
             }
         }
 
@@ -869,7 +916,7 @@ export async function run({ configFile, outputFile, preTarget, preInstanceType, 
                 }
             } else {
                 // No cluster selected (ambient kubectl) or no groups — generic sizer.
-                answers.instance_type = await promptInstanceType(modelName, region, null, target);
+                answers.instance_type = await promptInstanceType(modelName, region, null, target, projectDir);
             }
         } else if (preInstanceType) {
             answers.instance_type = preInstanceType;
