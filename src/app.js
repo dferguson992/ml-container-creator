@@ -183,7 +183,9 @@ export async function run(projectName, options) {
                 'http': 'ml.m5.large'
             };
             answers.instanceType = HEURISTIC_DEFAULTS[architecture] || 'ml.g5.xlarge';
-            console.log(`   • Instance type auto-sized: ${answers.instanceType} (from architecture: ${architecture || 'default'})`);
+            // This is an architecture heuristic, NOT a VRAM sizing of the model —
+            // say so, so a large model does not silently land on a small GPU.
+            console.log(`   • Instance type defaulted: ${answers.instanceType} (architecture heuristic for ${architecture || 'default'}, not sized to the model — pass --instance-type to choose)`);
         }
 
         // Infer modelSource from model name prefix if not set
