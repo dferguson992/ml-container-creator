@@ -18,6 +18,9 @@ import pytest
 _REPO = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..'))
 _WRITER = os.path.join(_REPO, 'templates', 'do', '.benchmark_writer.py')
 _STACK = os.path.join(_REPO, 'infra', 'bootstrap-modules', 'benchmark', 'stack.ts')
+# Legacy CI harness (BL219): creates the same mlcc_ci.benchmark_results table
+# when CreateBenchmarkInfra=true and its CodeBuild role runs the same writer.
+_CI_HARNESS_STACK = os.path.join(_REPO, 'infra', 'ci-harness', 'lib', 'ci-harness-stack.ts')
 _DDL = os.path.join(_REPO, 'docs', 'athena-benchmark-ddl.sql')
 
 _spec = importlib.util.spec_from_file_location('benchmark_writer_drift', _WRITER)
@@ -35,14 +38,21 @@ def _writer_columns():
     return {n: _KIND_TO_GLUE[k] for n, k in _writer.PARQUET_COLUMNS}
 
 
-def _stack_columns():
-    src = open(_STACK, encoding='utf-8').read()
-    start = src.index('columns: [')
+def _stack_columns(path=_STACK):
+    src = open(path, encoding='utf-8').read()
+    start = src.index('columns: [', src.index("'BenchmarkResultsTable'"))
     end = src.index('partitionKeys:', start)
     pairs = re.findall(r"\{\s*name:\s*'([a-z0-9_]+)',\s*type:\s*'([a-z]+)'", src[start:end])
     names = [n for n, _t in pairs]
     assert len(names) == len(set(names)), 'duplicate column in stack.ts'
     return dict(pairs)
+
+
+def _stack_partition_keys(path):
+    src = open(path, encoding='utf-8').read()
+    start = src.index('partitionKeys: [', src.index("'BenchmarkResultsTable'"))
+    end = src.index(']', start)
+    return re.findall(r"name:\s*'([a-z0-9_]+)'", src[start:end])
 
 
 def _ddl_columns():
@@ -57,6 +67,20 @@ def _ddl_columns():
 
 def test_writer_equals_stack():
     assert _stack_columns() == _writer_columns()
+
+
+def test_writer_equals_ci_harness_stack():
+    assert _stack_columns(_CI_HARNESS_STACK) == _writer_columns()
+
+
+def test_stacks_partition_by_the_writer_path_scheme():
+    # The writer's S3 key is results/model=.../instance=.../target=... .
+    src = open(_WRITER, encoding='utf-8').read()
+    scheme = re.search(r"results/((?:[a-z_]+=\{[^}]+\}/)+)", src).group(1)
+    path_keys = re.findall(r'([a-z_]+)=\{', scheme)
+    assert set(path_keys) == PARTITION_KEYS
+    for path in (_STACK, _CI_HARNESS_STACK):
+        assert _stack_partition_keys(path) == path_keys, path
 
 
 def test_writer_equals_ddl():
@@ -78,7 +102,7 @@ def test_wave9_columns_present():
 
 
 def test_cost_comments_no_longer_say_estimated():
-    for path in (_STACK, _DDL):
+    for path in (_STACK, _CI_HARNESS_STACK, _DDL):
         text = open(path, encoding='utf-8').read()
         line = next(ln for ln in text.splitlines()
                     if 'cost_per_1m_tokens' in ln and 'comment' in ln.lower())
