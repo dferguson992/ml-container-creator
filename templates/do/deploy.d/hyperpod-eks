@@ -886,14 +886,42 @@ if [ "${_HP_IEC_LIVE}" = "true" ]; then
         _HP_CAP_RC=0
         _HP_CAP_JSON="$(python3 "${SCRIPT_DIR}/lib/python/hyperpod_ops.py" rollout-capacity \
             --cluster "${HP_CLUSTER_NAME}" --namespace "${HP_NAMESPACE}" --project "${PROJECT_NAME}" \
-            --instance-type "${HP_INSTANCE_TYPE}" --gpus "${HP_GPU_COUNT:-1}")" || _HP_CAP_RC=$?
+            --instance-type "${HP_INSTANCE_TYPE}" --gpus "${HP_GPU_COUNT:-1}" \
+            --model-source "${HP_MODEL_SOURCE:-}" --purpose rollout)" || _HP_CAP_RC=$?
         if [ "${_HP_CAP_RC}" -eq 3 ]; then
             _HP_ROLLOUT_NEEDS_SURGE=true
             _HP_SURGE_GROUP="$(printf '%s' "${_HP_CAP_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("group") or "")' 2>/dev/null || echo "")"
-            _HP_CAP_REASON="$(printf '%s' "${_HP_CAP_JSON}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("%s (instance group %s: %s/%s instances)" % (d.get("reason",""), d.get("group") or "?", d.get("current_count"), d.get("target_count")))' 2>/dev/null || echo "")"
+            _HP_CAP_REASON="$(printf '%s' "${_HP_CAP_JSON}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("%s (instance group %s: %s/%s instances)%s" % (d.get("reason",""), d.get("group") or "?", d.get("current_count"), d.get("target_count"), ("\n   Other fixes: " + d["fix"]) if d.get("fix") else ""))' 2>/dev/null || echo "")"
         elif [ "${_HP_CAP_RC}" -ne 0 ]; then
             echo "⚠️  Could not determine rollout capacity; applying (the operator keeps the old pod serving if the new one cannot schedule)."
         fi
+    fi
+else
+    # BL236: a FIRST deploy needs room too. GPUs alone are not enough: the pod
+    # also needs a pod slot on the node, plus one for its Mountpoint-S3 pod when
+    # the model is mounted from S3. If GPUs are free but pod slots are not, the
+    # pod schedules and then hangs in ContainerCreating (FailedMount) because its
+    # Mountpoint pod is refused "Too many pods" — stop before applying. A GPU
+    # shortage alone only warns (unchanged: the pod waits Pending for a GPU).
+    _HP_CAP_RC=0
+    _HP_CAP_JSON="$(python3 "${SCRIPT_DIR}/lib/python/hyperpod_ops.py" rollout-capacity \
+        --cluster "${HP_CLUSTER_NAME}" --namespace "${HP_NAMESPACE}" --project "${PROJECT_NAME}" \
+        --instance-type "${HP_INSTANCE_TYPE}" --gpus "${HP_GPU_COUNT:-1}" \
+        --model-source "${HP_MODEL_SOURCE:-}" --purpose new)" || _HP_CAP_RC=$?
+    _HP_CAP_LIMIT="$(printf '%s' "${_HP_CAP_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("limit") or "")' 2>/dev/null || echo "")"
+    if [ "${_HP_CAP_RC}" -eq 3 ] && [ "${_HP_CAP_LIMIT}" = "pod-slots" ]; then
+        echo ""
+        echo "❌ The serving pod cannot start on ${HP_INSTANCE_TYPE}: no node has a free pod slot."
+        printf '%s' "${_HP_CAP_JSON}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("   " + d.get("reason", "")); print("   Fix: " + d.get("fix", ""))' 2>/dev/null || true
+        echo "   Nothing was applied."
+        rm -rf "${_HP_RENDER_DIR}"
+        _update_config "DEPLOYMENT_TARGET_HP_STATUS" "Failed"
+        exit 1
+    elif [ "${_HP_CAP_RC}" -eq 3 ]; then
+        echo "⚠️  $(printf '%s' "${_HP_CAP_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("reason", ""))' 2>/dev/null || echo "no node has free GPUs right now")"
+        echo "   Applying anyway; the pod stays Pending until a GPU frees up."
+    elif [ "${_HP_CAP_RC}" -ne 0 ]; then
+        echo "⚠️  Could not determine serving capacity (GPUs / pod slots); applying."
     fi
 fi
 

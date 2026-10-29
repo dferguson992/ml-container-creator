@@ -498,6 +498,12 @@ _logs_hyperpod_eks() {
 
     echo "   Found ${POD_COUNT} pod(s) matching selector"
     echo ""
+    # BL236: a pod stuck in ContainerCreating has no logs yet. If the S3 CSI
+    # driver reports FailedMount, name its Mountpoint pod's FailedScheduling
+    # reason (e.g. "Too many pods") instead of only "waiting to start".
+    # Read-only and optional: a failure here never stops the tail.
+    python3 "${SCRIPT_DIR}/lib/python/hyperpod_ops.py" mount-diagnose \
+        --namespace "${HP_NAMESPACE}" --selector "${POD_SELECTOR}" >/dev/null || true
     echo "   Press Ctrl+C to stop"
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

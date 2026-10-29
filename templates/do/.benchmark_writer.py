@@ -304,6 +304,51 @@ def _load_helper(name):
     return mod
 
 
+def _ic_hosting_targets(tm):
+    """Targets whose descriptor allows inference components (verbs.add-ic)."""
+    out = []
+    for t in tm.list_targets():
+        try:
+            if (tm.read_manifest(t).get('verbs') or {}).get('add-ic') is True:
+                out.append(t)
+        except Exception:  # noqa: BLE001 — a malformed descriptor is not ours to judge here
+            continue
+    return out
+
+
+def resolve_benchmarked_target(target, ic_name=None):
+    """BL213: the deployment target a benchmark row is labelled with.
+
+    ``target`` is do/benchmark's --deployment-target (else the config file's
+    DEPLOYMENT_TARGET); aliases resolve to the canonical name via targets.d. The
+    config value can be stale: one do/config holds a single DEPLOYMENT_TARGET
+    focus and a single ENDPOINT_NAME that several targets overwrite, so a run
+    against a realtime endpoint + inference component was labelled hyperpod-eks.
+    When the run benchmarked an inference component (``ic_name``), the target
+    must be one that hosts ICs (descriptor verbs.add-ic, never a literal list);
+    if the labelled one does not and exactly one target does, that one is used.
+    Returns '' when nothing is known (callers keep their existing default).
+    """
+    target = (target or '').strip()
+    try:
+        tm = _load_helper('target_manifest')
+    except Exception:  # noqa: BLE001 — no descriptors: keep the given label
+        return target
+    if target:
+        try:
+            target = tm.resolve_target(target)
+        except Exception:  # noqa: BLE001 — unknown target: keep it verbatim
+            pass
+    if ic_name:
+        hosts = _ic_hosting_targets(tm)
+        if target not in hosts and len(hosts) == 1:
+            if target:
+                print(f'⚠️  DEPLOYMENT_TARGET is {target}, but this run benchmarked inference component '
+                      f'{ic_name}: labelling the rows {hosts[0]}', file=sys.stderr)
+            target = hosts[0]
+    return target
+
+
 # ── BL128: curated AIPerf aggregates (R10) ───────────────────────────────────
 
 
@@ -2017,6 +2062,13 @@ def cmd_write(args):
 
     if getattr(args, 'instance_type', None):
         input_data['instance_type'] = args.instance_type
+    # BL213: label the row with the target actually benchmarked, not whatever
+    # DEPLOYMENT_TARGET the config file holds now.
+    _bench_target = resolve_benchmarked_target(
+        getattr(args, 'deployment_target', None) or input_data.get('deployment_target'),
+        getattr(args, 'ic_name', None))
+    if _bench_target:
+        input_data['deployment_target'] = _bench_target
 
     # ── Validate before any S3 interaction ────────────────────────────────
     errors = validate_benchmark_input(input_data)
@@ -2436,6 +2488,11 @@ def main():
     write_parser.add_argument(
         '--ic-name', dest='ic_name', default=None,
         help='Inference component name for per-IC CloudWatch GPU enrichment'
+    )
+    write_parser.add_argument(
+        '--deployment-target', dest='deployment_target', default=None,
+        help='The deployment target this run benchmarked (BL213; overrides the config file '
+             'DEPLOYMENT_TARGET, which can be stale; aliases resolve via targets.d)'
     )
 
     write_parser.add_argument(
